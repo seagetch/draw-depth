@@ -14,6 +14,7 @@ const gridYValueEl = document.querySelector("#gridYValue");
 const kernelSizeEl = document.querySelector("#kernelSize");
 const kernelSizeValueEl = document.querySelector("#kernelSizeValue");
 const interpModeEl = document.querySelector("#interpMode");
+const segmentListEl = document.querySelector("#segmentList");
 const colorThumbButtonEl = document.querySelector("#colorThumbButton");
 const depthThumbButtonEl = document.querySelector("#depthThumbButton");
 const colorThumbEl = document.querySelector("#colorThumb");
@@ -23,7 +24,12 @@ const depthFileInputEl = document.querySelector("#depthFileInput");
 
 const colorUrl = "./data/Midori-color.jpg";
 const depthUrl = "./data/Midori-depth.jpg";
+const segmentUrl = "./data/Midori-segment.jpg";
 const invalidDepthThreshold = 1 / 255;
+const segmentAnchorDistance = 36;
+const segmentMinAnchorPixels = 24;
+const segmentMinAnchorRatio = 0.00003;
+const segmentMergeThresholdRatio = 0.0008;
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -64,6 +70,14 @@ const renderState = {
   colorObjectUrl: null,
   depthObjectUrl: null,
   generatedDepthTexture: null,
+  segmentSourcePixels: null,
+  segmentMap: null,
+  segmentCount: 0,
+  segmentPalette: [],
+  segmentPixelCounts: [],
+  segmentVisibility: [],
+  segmentMaskData: null,
+  segmentMaskTexture: null,
 };
 
 const vertexShader = `
@@ -89,11 +103,12 @@ const vertexShader = `
 
 const fragmentShader = `
   uniform sampler2D uColorTexture;
+  uniform sampler2D uSegmentMaskTexture;
   varying vec2 vUv;
   varying float vDepthMask;
 
   void main() {
-    if (vDepthMask < 0.5) {
+    if (vDepthMask < 0.5 || texture2D(uSegmentMaskTexture, vUv).r < 0.5) {
       discard;
     }
 
@@ -108,10 +123,11 @@ init().catch((error) => {
 });
 
 async function init() {
-  const [colorTexture, depthTexture, depthPixels] = await Promise.all([
+  const [colorTexture, depthTexture, depthPixels, segmentImage] = await Promise.all([
     loadTexture(colorUrl),
     loadTexture(depthUrl),
     loadDepthPixels(depthUrl),
+    loadRgbPixels(segmentUrl),
   ]);
 
   const imageWidth = colorTexture.image.width;
@@ -119,6 +135,10 @@ async function init() {
 
   if (imageWidth !== depthTexture.image.width || imageHeight !== depthTexture.image.height) {
     throw new Error("Color and depth image sizes do not match.");
+  }
+
+  if (imageWidth !== segmentImage.width || imageHeight !== segmentImage.height) {
+    throw new Error("Segment image size must match the color/depth images.");
   }
 
   colorTexture.encoding = THREE.sRGBEncoding;
@@ -131,9 +151,11 @@ async function init() {
   renderState.colorTexture = colorTexture;
   renderState.sourceDepthTexture = depthTexture;
   renderState.sourceDepthPixels = depthPixels;
+  renderState.segmentSourcePixels = segmentImage.pixels;
   renderState.imageWidth = imageWidth;
   renderState.imageHeight = imageHeight;
 
+  rebuildSegments();
   rebuildDepthModeResources();
   buildMesh();
   wireControls();
@@ -260,6 +282,7 @@ function buildMesh() {
     uniforms: {
       uColorTexture: { value: renderState.colorTexture },
       uDepthTexture: { value: renderState.activeDepthTexture },
+      uSegmentMaskTexture: { value: renderState.segmentMaskTexture },
       uDepthScale: { value: Number(depthScaleEl.value) },
       uInvertDepth: { value: invertDepthEl.checked ? 1 : 0 },
     },
@@ -356,20 +379,41 @@ function loadTexture(url) {
 }
 
 async function loadDepthPixels(url) {
+  const pixels = await loadImagePixels(url);
+  const depth = new Uint8Array(pixels.width * pixels.height);
+
+  for (let i = 0, j = 0; i < pixels.data.length; i += 4, j += 1) {
+    depth[j] = pixels.data[i];
+  }
+
+  return depth;
+}
+
+async function loadRgbPixels(url) {
+  const pixels = await loadImagePixels(url);
+  const rgb = new Uint8Array(pixels.width * pixels.height * 3);
+
+  for (let i = 0, j = 0; i < pixels.data.length; i += 4, j += 3) {
+    rgb[j] = pixels.data[i];
+    rgb[j + 1] = pixels.data[i + 1];
+    rgb[j + 2] = pixels.data[i + 2];
+  }
+
+  return {
+    width: pixels.width,
+    height: pixels.height,
+    pixels: rgb,
+  };
+}
+
+async function loadImagePixels(url) {
   const image = await loadImage(url);
   const canvas = document.createElement("canvas");
   canvas.width = image.width;
   canvas.height = image.height;
   const context = canvas.getContext("2d", { willReadFrequently: true });
   context.drawImage(image, 0, 0);
-  const pixels = context.getImageData(0, 0, image.width, image.height).data;
-  const depth = new Uint8Array(image.width * image.height);
-
-  for (let i = 0, j = 0; i < pixels.length; i += 4, j += 1) {
-    depth[j] = pixels[i];
-  }
-
-  return depth;
+  return context.getImageData(0, 0, image.width, image.height);
 }
 
 function loadImage(url) {
@@ -440,6 +484,7 @@ async function replaceImage(kind, file) {
     renderState.sourceDepthTexture = texture;
     renderState.sourceDepthPixels = depthPixels;
     renderState.depthObjectUrl = objectUrl;
+    rebuildSegments();
     rebuildDepthModeResources();
     buildMesh();
     syncThumbs();
@@ -477,7 +522,8 @@ function refreshStatusCounts() {
   const modeLabel = depthModeEl.value === "raw"
     ? "raw"
     : `grid-${interpModeEl.value}`;
-  statusEl.textContent = `${renderState.imageWidth}x${renderState.imageHeight} | ${modeLabel} | vertices ${vertexCount.toLocaleString()} | triangles ${triangleCount.toLocaleString()}`;
+  const visibleSegments = renderState.segmentVisibility.filter(Boolean).length;
+  statusEl.textContent = `${renderState.imageWidth}x${renderState.imageHeight} | ${modeLabel} | segments ${visibleSegments}/${renderState.segmentCount} | vertices ${vertexCount.toLocaleString()} | triangles ${triangleCount.toLocaleString()}`;
 }
 
 function rebuildDepthModeResources() {
@@ -509,6 +555,481 @@ function disposeGeneratedDepthTexture() {
   if (renderState.generatedDepthTexture) {
     renderState.generatedDepthTexture.dispose();
     renderState.generatedDepthTexture = null;
+  }
+}
+
+function rebuildSegments() {
+  disposeSegmentMaskTexture();
+
+  const segmentation = clusterSegmentPixels(
+    renderState.segmentSourcePixels,
+    renderState.sourceDepthPixels,
+    renderState.imageWidth,
+    renderState.imageHeight,
+  );
+
+  renderState.segmentMap = segmentation.segmentMap;
+  renderState.segmentCount = segmentation.count;
+  renderState.segmentPalette = segmentation.palette;
+  renderState.segmentPixelCounts = segmentation.pixelCounts;
+  renderState.segmentVisibility = new Array(segmentation.count).fill(true);
+  renderState.segmentMaskData = new Uint8Array(renderState.imageWidth * renderState.imageHeight);
+  renderState.segmentMaskTexture = new THREE.DataTexture(
+    renderState.segmentMaskData,
+    renderState.imageWidth,
+    renderState.imageHeight,
+    THREE.LuminanceFormat,
+  );
+  renderState.segmentMaskTexture.flipY = true;
+  renderState.segmentMaskTexture.minFilter = THREE.NearestFilter;
+  renderState.segmentMaskTexture.magFilter = THREE.NearestFilter;
+  renderState.segmentMaskTexture.needsUpdate = true;
+
+  updateSegmentMaskTexture();
+  rebuildSegmentList();
+}
+
+function clusterSegmentPixels(segmentPixels, depthPixels, width, height) {
+  const totalPixels = width * height;
+  const histogram = new Map();
+
+  for (let index = 0; index < totalPixels; index += 1) {
+    const offset = index * 3;
+    const r = segmentPixels[offset];
+    const g = segmentPixels[offset + 1];
+    const b = segmentPixels[offset + 2];
+    const key = (r << 16) | (g << 8) | b;
+    const count = histogram.get(key) || 0;
+    histogram.set(key, count + 1);
+  }
+
+  const colorEntries = Array.from(histogram.entries())
+    .map(([key, count]) => ({
+      key,
+      count,
+      r: (key >> 16) & 255,
+      g: (key >> 8) & 255,
+      b: key & 255,
+    }))
+    .sort((a, b) => b.count - a.count);
+
+  const minAnchorPixels = Math.max(
+    segmentMinAnchorPixels,
+    Math.round(totalPixels * segmentMinAnchorRatio),
+  );
+  const anchors = [];
+
+  for (const entry of colorEntries) {
+    const nearest = findNearestPaletteColor(entry, anchors);
+    if (!nearest || nearest.distance2 > segmentAnchorDistance * segmentAnchorDistance) {
+      if (entry.count >= minAnchorPixels || anchors.length === 0) {
+        anchors.push({
+          r: entry.r,
+          g: entry.g,
+          b: entry.b,
+          count: 0,
+          sourceKeys: [entry.key],
+        });
+      }
+    }
+  }
+
+  if (anchors.length === 0) {
+    anchors.push({
+      r: colorEntries[0]?.r ?? 255,
+      g: colorEntries[0]?.g ?? 255,
+      b: colorEntries[0]?.b ?? 255,
+      count: colorEntries[0]?.count ?? totalPixels,
+      sourceKeys: colorEntries[0] ? [colorEntries[0].key] : [],
+    });
+  }
+
+  const colorToAnchor = new Map();
+
+  for (const entry of colorEntries) {
+    const nearest = findNearestPaletteColor(entry, anchors);
+    if (!nearest) {
+      continue;
+    }
+
+    colorToAnchor.set(entry.key, nearest.index);
+    nearest.anchor.count += entry.count;
+    nearest.anchor.sourceKeys.push(entry.key);
+  }
+
+  const rawCounts = new Uint32Array(anchors.length);
+  const rawAssignments = new Int16Array(totalPixels);
+  rawAssignments.fill(-1);
+
+  for (let index = 0; index < totalPixels; index += 1) {
+    const offset = index * 3;
+    const key = (segmentPixels[offset] << 16) | (segmentPixels[offset + 1] << 8) | segmentPixels[offset + 2];
+    const anchorIndex = colorToAnchor.get(key);
+    rawAssignments[index] = anchorIndex;
+    rawCounts[anchorIndex] += 1;
+  }
+
+  const minSegmentPixels = Math.max(16, Math.round(totalPixels * segmentMergeThresholdRatio));
+  const activeFlags = Array.from(rawCounts, (count) => count >= minSegmentPixels);
+
+  if (!activeFlags.some(Boolean)) {
+    activeFlags[rawCounts.indexOf(Math.max(...rawCounts))] = true;
+  }
+
+  const remap = anchors.map((anchor, index) => {
+    if (activeFlags[index]) {
+      return index;
+    }
+
+    const nearest = findNearestPaletteColor(anchor, anchors, activeFlags);
+    return nearest ? nearest.index : index;
+  });
+
+  const finalKeyToIndex = new Map();
+  const finalPalette = [];
+  const finalCounts = [];
+  const finalSums = [];
+  const segmentMap = new Int16Array(totalPixels);
+  segmentMap.fill(-1);
+
+  for (let index = 0; index < totalPixels; index += 1) {
+    const mergedIndex = remap[rawAssignments[index]];
+    let finalIndex = finalKeyToIndex.get(mergedIndex);
+    if (finalIndex === undefined) {
+      finalIndex = finalPalette.length;
+      finalKeyToIndex.set(mergedIndex, finalIndex);
+      finalPalette.push({ r: 0, g: 0, b: 0 });
+      finalCounts.push(0);
+      finalSums.push({ r: 0, g: 0, b: 0 });
+    }
+
+    const offset = index * 3;
+    finalSums[finalIndex].r += segmentPixels[offset];
+    finalSums[finalIndex].g += segmentPixels[offset + 1];
+    finalSums[finalIndex].b += segmentPixels[offset + 2];
+    finalCounts[finalIndex] += 1;
+    segmentMap[index] = finalIndex;
+  }
+
+  finalPalette.forEach((color, index) => {
+    color.r = Math.round(finalSums[index].r / Math.max(1, finalCounts[index]));
+    color.g = Math.round(finalSums[index].g / Math.max(1, finalCounts[index]));
+    color.b = Math.round(finalSums[index].b / Math.max(1, finalCounts[index]));
+  });
+
+  const splitSegments = splitDisconnectedSegments(
+    segmentMap,
+    width,
+    height,
+    finalPalette,
+  );
+  const filteredSegments = filterSegmentsWithoutDepth(
+    splitSegments.segmentMap,
+    splitSegments.palette,
+    splitSegments.pixelCounts,
+    depthPixels,
+  );
+  const cleanedSegments = filterSmallSegments(
+    filteredSegments.segmentMap,
+    filteredSegments.palette,
+    filteredSegments.pixelCounts,
+    2,
+  );
+
+  const order = cleanedSegments.palette
+    .map((_, index) => index)
+    .sort((a, b) => cleanedSegments.pixelCounts[b] - cleanedSegments.pixelCounts[a]);
+  const orderedPalette = order.map((index) => cleanedSegments.palette[index]);
+  const orderedCounts = order.map((index) => cleanedSegments.pixelCounts[index]);
+  const orderedMap = new Int16Array(totalPixels);
+  orderedMap.fill(-1);
+  const orderRemap = new Map(order.map((originalIndex, sortedIndex) => [originalIndex, sortedIndex]));
+
+  for (let index = 0; index < totalPixels; index += 1) {
+    if (cleanedSegments.segmentMap[index] < 0) {
+      continue;
+    }
+    orderedMap[index] = orderRemap.get(cleanedSegments.segmentMap[index]);
+  }
+
+  return {
+    count: orderedPalette.length,
+    palette: orderedPalette,
+    pixelCounts: orderedCounts,
+    segmentMap: orderedMap,
+  };
+}
+
+function splitDisconnectedSegments(segmentMap, width, height, palette) {
+  const totalPixels = width * height;
+  const visited = new Uint8Array(totalPixels);
+  const splitMap = new Int16Array(totalPixels);
+  splitMap.fill(-1);
+  const splitPalette = [];
+  const splitCounts = [];
+  const queue = new Int32Array(totalPixels);
+
+  for (let start = 0; start < totalPixels; start += 1) {
+    const sourceSegment = segmentMap[start];
+    if (sourceSegment < 0 || visited[start]) {
+      continue;
+    }
+
+    const nextSegmentIndex = splitPalette.length;
+    splitPalette.push({ ...palette[sourceSegment] });
+    splitCounts.push(0);
+    visited[start] = 1;
+    queue[0] = start;
+    let head = 0;
+    let tail = 1;
+
+    while (head < tail) {
+      const index = queue[head++];
+      splitMap[index] = nextSegmentIndex;
+      splitCounts[nextSegmentIndex] += 1;
+
+      const x = index % width;
+      const y = Math.floor(index / width);
+
+      if (x > 0) {
+        const left = index - 1;
+        if (!visited[left] && segmentMap[left] === sourceSegment) {
+          visited[left] = 1;
+          queue[tail++] = left;
+        }
+      }
+
+      if (x + 1 < width) {
+        const right = index + 1;
+        if (!visited[right] && segmentMap[right] === sourceSegment) {
+          visited[right] = 1;
+          queue[tail++] = right;
+        }
+      }
+
+      if (y > 0) {
+        const up = index - width;
+        if (!visited[up] && segmentMap[up] === sourceSegment) {
+          visited[up] = 1;
+          queue[tail++] = up;
+        }
+      }
+
+      if (y + 1 < height) {
+        const down = index + width;
+        if (!visited[down] && segmentMap[down] === sourceSegment) {
+          visited[down] = 1;
+          queue[tail++] = down;
+        }
+      }
+    }
+  }
+
+  return {
+    segmentMap: splitMap,
+    palette: splitPalette,
+    pixelCounts: splitCounts,
+  };
+}
+
+function filterSegmentsWithoutDepth(segmentMap, palette, pixelCounts, depthPixels) {
+  const hasDepth = new Uint8Array(palette.length);
+
+  for (let index = 0; index < segmentMap.length; index += 1) {
+    const segmentIndex = segmentMap[index];
+    if (segmentIndex < 0 || depthPixels[index] <= 0) {
+      continue;
+    }
+    hasDepth[segmentIndex] = 1;
+  }
+
+  const remap = new Int16Array(palette.length);
+  remap.fill(-1);
+  const filteredPalette = [];
+  const filteredCounts = [];
+
+  for (let index = 0; index < palette.length; index += 1) {
+    if (!hasDepth[index]) {
+      continue;
+    }
+
+    remap[index] = filteredPalette.length;
+    filteredPalette.push(palette[index]);
+    filteredCounts.push(pixelCounts[index]);
+  }
+
+  const filteredMap = new Int16Array(segmentMap.length);
+  filteredMap.fill(-1);
+
+  for (let index = 0; index < segmentMap.length; index += 1) {
+    const segmentIndex = segmentMap[index];
+    if (segmentIndex < 0) {
+      continue;
+    }
+    filteredMap[index] = remap[segmentIndex];
+  }
+
+  return {
+    segmentMap: filteredMap,
+    palette: filteredPalette,
+    pixelCounts: filteredCounts,
+  };
+}
+
+function filterSmallSegments(segmentMap, palette, pixelCounts, maxSegmentSize) {
+  const remap = new Int16Array(palette.length);
+  remap.fill(-1);
+  const filteredPalette = [];
+  const filteredCounts = [];
+
+  for (let index = 0; index < palette.length; index += 1) {
+    if (pixelCounts[index] <= maxSegmentSize) {
+      continue;
+    }
+
+    remap[index] = filteredPalette.length;
+    filteredPalette.push(palette[index]);
+    filteredCounts.push(pixelCounts[index]);
+  }
+
+  const filteredMap = new Int16Array(segmentMap.length);
+  filteredMap.fill(-1);
+
+  for (let index = 0; index < segmentMap.length; index += 1) {
+    const segmentIndex = segmentMap[index];
+    if (segmentIndex < 0) {
+      continue;
+    }
+    filteredMap[index] = remap[segmentIndex];
+  }
+
+  return {
+    segmentMap: filteredMap,
+    palette: filteredPalette,
+    pixelCounts: filteredCounts,
+  };
+}
+
+function findNearestPaletteColor(color, palette, activeFlags = null) {
+  if (palette.length === 0) {
+    return null;
+  }
+
+  let nearestIndex = -1;
+  let nearestDistance = Infinity;
+
+  for (let i = 0; i < palette.length; i += 1) {
+    if (activeFlags && !activeFlags[i]) {
+      continue;
+    }
+
+    const distance = colorDistanceSquared(color, palette[i]);
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearestIndex = i;
+    }
+  }
+
+  if (nearestIndex < 0) {
+    return null;
+  }
+
+  return {
+    index: nearestIndex,
+    distance2: nearestDistance,
+    anchor: palette[nearestIndex],
+  };
+}
+
+function colorDistanceSquared(a, b) {
+  const dr = a.r - b.r;
+  const dg = a.g - b.g;
+  const db = a.b - b.b;
+  return dr * dr + dg * dg + db * db;
+}
+
+function rebuildSegmentList() {
+  segmentListEl.textContent = "";
+
+  renderState.segmentPalette.forEach((color, index) => {
+    const row = document.createElement("div");
+    row.className = "segment-item";
+    row.dataset.segmentIndex = String(index);
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = true;
+    checkbox.dataset.segmentIndex = String(index);
+    checkbox.tabIndex = -1;
+    checkbox.style.pointerEvents = "none";
+
+    row.addEventListener("click", (event) => {
+      const segmentIndex = Number(row.dataset.segmentIndex);
+      applySegmentToggle(segmentIndex, event.shiftKey);
+    });
+
+    const swatch = document.createElement("span");
+    swatch.className = "segment-swatch";
+    swatch.style.backgroundColor = `rgb(${color.r}, ${color.g}, ${color.b})`;
+
+    const name = document.createElement("span");
+    name.className = "segment-name";
+    name.textContent = `Part ${index + 1}`;
+
+    const size = document.createElement("span");
+    size.className = "segment-size";
+    size.textContent = renderState.segmentPixelCounts[index].toLocaleString();
+
+    row.append(checkbox, swatch, name, size);
+    segmentListEl.appendChild(row);
+  });
+}
+
+function applySegmentToggle(segmentIndex, invertOthers) {
+  if (invertOthers) {
+    const nextTargetState = !renderState.segmentVisibility[segmentIndex];
+    renderState.segmentVisibility = renderState.segmentVisibility.map((_, index) => (
+      index === segmentIndex ? nextTargetState : !nextTargetState
+    ));
+  } else {
+    renderState.segmentVisibility[segmentIndex] = !renderState.segmentVisibility[segmentIndex];
+  }
+
+  syncSegmentCheckboxes();
+  updateSegmentMaskTexture();
+  refreshStatusCounts();
+}
+
+function syncSegmentCheckboxes() {
+  const checkboxes = segmentListEl.querySelectorAll('input[type="checkbox"]');
+  checkboxes.forEach((checkbox) => {
+    const index = Number(checkbox.dataset.segmentIndex);
+    checkbox.checked = renderState.segmentVisibility[index];
+  });
+}
+
+function updateSegmentMaskTexture() {
+  if (!renderState.segmentMaskData || !renderState.segmentMaskTexture) {
+    return;
+  }
+
+  for (let i = 0; i < renderState.segmentMap.length; i += 1) {
+    const segmentIndex = renderState.segmentMap[i];
+    renderState.segmentMaskData[i] = segmentIndex >= 0 && renderState.segmentVisibility[segmentIndex]
+      ? 255
+      : 0;
+  }
+
+  renderState.segmentMaskTexture.needsUpdate = true;
+  if (renderState.material) {
+    renderState.material.uniforms.uSegmentMaskTexture.value = renderState.segmentMaskTexture;
+  }
+}
+
+function disposeSegmentMaskTexture() {
+  if (renderState.segmentMaskTexture) {
+    renderState.segmentMaskTexture.dispose();
+    renderState.segmentMaskTexture = null;
   }
 }
 

@@ -49,6 +49,21 @@
         backdrop-filter: blur(14px);
       }
 
+      #segmentHud {
+        position: fixed;
+        top: 16px;
+        right: 16px;
+        z-index: 10;
+        width: min(320px, calc(100vw - 32px));
+        max-height: calc(100vh - 32px);
+        padding: 14px 14px 12px;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: var(--panel);
+        backdrop-filter: blur(14px);
+        overflow: hidden;
+      }
+
       h1 {
         margin: 0 0 8px;
         font-size: 15px;
@@ -147,6 +162,60 @@
         border-radius: 8px;
         background: rgba(255, 255, 255, 0.04);
         color: var(--text);
+      }
+
+      .segment-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 12px;
+        margin-bottom: 8px;
+      }
+
+      .segment-title {
+        font-size: 12px;
+        color: var(--text);
+      }
+
+      .segment-hint {
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      .segment-list {
+        display: grid;
+        gap: 6px;
+        max-height: min(34vh, 300px);
+        overflow: auto;
+        padding-right: 4px;
+      }
+
+      .segment-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 8px;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.03);
+      }
+
+      .segment-swatch {
+        width: 12px;
+        height: 12px;
+        flex: 0 0 12px;
+        border-radius: 999px;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+      }
+
+      .segment-name {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .segment-size {
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
       }
     </style>
   </head>
@@ -255,6 +324,13 @@
       </div>
 
       <div id="status">Loading...</div>
+    </section>
+    <section id="segmentHud">
+      <div class="segment-header">
+        <div class="segment-title">Segments</div>
+        <div class="segment-hint">Shift+click: invert target vs others</div>
+      </div>
+      <div class="segment-list" id="segmentList"></div>
     </section>
     <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
     <script src="https://unpkg.com/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
