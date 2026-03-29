@@ -217,6 +217,35 @@
         color: var(--muted);
         font-variant-numeric: tabular-nums;
       }
+
+      .segment-controls {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+      }
+
+      .segment-button {
+        width: 22px;
+        height: 22px;
+        padding: 0;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 6px;
+        background: rgba(255, 255, 255, 0.05);
+        color: var(--text);
+        cursor: pointer;
+      }
+
+      .segment-button:hover {
+        background: rgba(255, 255, 255, 0.1);
+      }
+
+      .segment-metrics {
+        min-width: 86px;
+        color: var(--muted);
+        font-size: 11px;
+        font-variant-numeric: tabular-nums;
+        text-align: right;
+      }
     </style>
   </head>
   <body>

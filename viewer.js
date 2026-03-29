@@ -61,6 +61,11 @@ const renderState = {
   colorTexture: null,
   sourceDepthTexture: null,
   sourceDepthPixels: null,
+  processedDepthTexture: null,
+  processedDepthPixels: null,
+  baseDepthTexture: null,
+  baseDepthPixels: null,
+  adjustedDepthTexture: null,
   activeDepthTexture: null,
   activeDepthPixels: null,
   imageWidth: 0,
@@ -76,9 +81,19 @@ const renderState = {
   segmentPalette: [],
   segmentPixelCounts: [],
   segmentVisibility: [],
+  segmentDepthOffsets: [],
+  segmentDepthScales: [],
+  segmentPixels: [],
+  segmentBounds: [],
+  segmentData: [],
   segmentMaskData: null,
   segmentMaskTexture: null,
 };
+
+const gaussianKernelCache = new Map();
+const depthBlurKernelCache = new Map();
+const segmentDepthOffsetStep = 6;
+const segmentDepthScaleStep = 0.1;
 
 const vertexShader = `
   uniform sampler2D uDepthTexture;
@@ -528,17 +543,19 @@ function refreshStatusCounts() {
 
 function rebuildDepthModeResources() {
   disposeGeneratedDepthTexture();
+  disposeAdjustedDepthTexture();
 
   if (depthModeEl.value === "raw") {
-    renderState.activeDepthTexture = renderState.sourceDepthTexture;
-    renderState.activeDepthPixels = renderState.sourceDepthPixels;
+    renderState.baseDepthTexture = renderState.processedDepthTexture;
+    renderState.baseDepthPixels = renderState.processedDepthPixels;
+    applySegmentDepthAdjustments();
     return;
   }
 
-  const generated = createGridDepthResources(
+  const generated = createSegmentedGridDepthResources(
     renderState.imageWidth,
     renderState.imageHeight,
-    renderState.sourceDepthPixels,
+    renderState.segmentData,
     gridSpecModeEl.value,
     Number(gridXEl.value),
     Number(gridYEl.value),
@@ -547,14 +564,29 @@ function rebuildDepthModeResources() {
   );
 
   renderState.generatedDepthTexture = generated.texture;
-  renderState.activeDepthTexture = generated.texture;
-  renderState.activeDepthPixels = generated.pixels;
+  renderState.baseDepthTexture = generated.texture;
+  renderState.baseDepthPixels = generated.pixels;
+  applySegmentDepthAdjustments();
 }
 
 function disposeGeneratedDepthTexture() {
   if (renderState.generatedDepthTexture) {
     renderState.generatedDepthTexture.dispose();
     renderState.generatedDepthTexture = null;
+  }
+}
+
+function disposeAdjustedDepthTexture() {
+  if (renderState.adjustedDepthTexture) {
+    renderState.adjustedDepthTexture.dispose();
+    renderState.adjustedDepthTexture = null;
+  }
+}
+
+function disposeProcessedDepthTexture() {
+  if (renderState.processedDepthTexture) {
+    renderState.processedDepthTexture.dispose();
+    renderState.processedDepthTexture = null;
   }
 }
 
@@ -573,6 +605,12 @@ function rebuildSegments() {
   renderState.segmentPalette = segmentation.palette;
   renderState.segmentPixelCounts = segmentation.pixelCounts;
   renderState.segmentVisibility = new Array(segmentation.count).fill(true);
+  renderState.segmentDepthOffsets = new Array(segmentation.count).fill(0);
+  renderState.segmentDepthScales = new Array(segmentation.count).fill(1);
+  renderState.segmentPixels = segmentation.segmentPixels;
+  renderState.segmentBounds = segmentation.segmentBounds;
+  renderState.segmentData = segmentation.segmentData;
+  rebuildProcessedDepthData();
   renderState.segmentMaskData = new Uint8Array(renderState.imageWidth * renderState.imageHeight);
   renderState.segmentMaskTexture = new THREE.DataTexture(
     renderState.segmentMaskData,
@@ -587,6 +625,20 @@ function rebuildSegments() {
 
   updateSegmentMaskTexture();
   rebuildSegmentList();
+}
+
+function rebuildProcessedDepthData() {
+  disposeProcessedDepthTexture();
+
+  const processed = preprocessSegmentDepths(
+    renderState.imageWidth,
+    renderState.imageHeight,
+    renderState.segmentData,
+  );
+
+  renderState.segmentData = processed.segmentData;
+  renderState.processedDepthPixels = processed.pixels;
+  renderState.processedDepthTexture = processed.texture;
 }
 
 function clusterSegmentPixels(segmentPixels, depthPixels, width, height) {
@@ -757,7 +809,519 @@ function clusterSegmentPixels(segmentPixels, depthPixels, width, height) {
     palette: orderedPalette,
     pixelCounts: orderedCounts,
     segmentMap: orderedMap,
+    segmentPixels: buildSegmentPixelLists(orderedMap, orderedPalette.length),
+    segmentBounds: buildSegmentBounds(orderedMap, orderedPalette.length, width, height),
+    segmentData: buildSegmentLocalData(
+      orderedMap,
+      orderedPalette.length,
+      width,
+      height,
+      depthPixels,
+    ),
   };
+}
+
+function buildSegmentPixelLists(segmentMap, segmentCount) {
+  const lists = Array.from({ length: segmentCount }, () => []);
+
+  for (let index = 0; index < segmentMap.length; index += 1) {
+    const segmentIndex = segmentMap[index];
+    if (segmentIndex < 0) {
+      continue;
+    }
+    lists[segmentIndex].push(index);
+  }
+
+  return lists.map((indices) => Int32Array.from(indices));
+}
+
+function buildSegmentBounds(segmentMap, segmentCount, width, height) {
+  const bounds = Array.from({ length: segmentCount }, () => ({
+    minX: width,
+    minY: height,
+    maxX: -1,
+    maxY: -1,
+  }));
+
+  for (let index = 0; index < segmentMap.length; index += 1) {
+    const segmentIndex = segmentMap[index];
+    if (segmentIndex < 0) {
+      continue;
+    }
+
+    const x = index % width;
+    const y = Math.floor(index / width);
+    const bound = bounds[segmentIndex];
+    bound.minX = Math.min(bound.minX, x);
+    bound.minY = Math.min(bound.minY, y);
+    bound.maxX = Math.max(bound.maxX, x);
+    bound.maxY = Math.max(bound.maxY, y);
+  }
+
+  return bounds.map((bound) => (
+    bound.maxX < 0
+      ? { minX: 0, minY: 0, maxX: -1, maxY: -1 }
+      : bound
+  ));
+}
+
+function buildSegmentLocalData(segmentMap, segmentCount, width, height, depthPixels) {
+  const pixelLists = buildSegmentPixelLists(segmentMap, segmentCount);
+  const bounds = buildSegmentBounds(segmentMap, segmentCount, width, height);
+
+  return pixelLists.map((indices, segmentIndex) => {
+    const boundsForSegment = bounds[segmentIndex];
+    if (!indices.length || boundsForSegment.maxX < boundsForSegment.minX) {
+      return {
+        indices,
+        bounds: boundsForSegment,
+        localWidth: 0,
+        localHeight: 0,
+        localDepthPixels: new Uint8Array(0),
+        localMask: new Uint8Array(0),
+        processedLocalDepthPixels: new Uint8Array(0),
+        hasSourceDepth: false,
+      };
+    }
+
+    const localWidth = boundsForSegment.maxX - boundsForSegment.minX + 1;
+    const localHeight = boundsForSegment.maxY - boundsForSegment.minY + 1;
+    const localDepthPixels = new Uint8Array(localWidth * localHeight);
+    const localMask = new Uint8Array(localWidth * localHeight);
+    let hasSourceDepth = false;
+
+    for (let i = 0; i < indices.length; i += 1) {
+      const pixelIndex = indices[i];
+      const x = pixelIndex % width;
+      const y = Math.floor(pixelIndex / width);
+      const localIndex = (y - boundsForSegment.minY) * localWidth + (x - boundsForSegment.minX);
+      const depth = depthPixels[pixelIndex];
+      localMask[localIndex] = 1;
+      localDepthPixels[localIndex] = depth;
+      if (depth > 0) {
+        hasSourceDepth = true;
+      }
+    }
+
+    return {
+      indices,
+      bounds: boundsForSegment,
+      localWidth,
+      localHeight,
+      localDepthPixels,
+      localMask,
+      processedLocalDepthPixels: localDepthPixels.slice(),
+      hasSourceDepth,
+    };
+  });
+}
+
+function preprocessSegmentDepths(width, height, segmentData) {
+  const processedPixels = new Uint8Array(width * height);
+  const nextSegmentData = segmentData.map((segment) => {
+    if (!segment.hasSourceDepth || !segment.localDepthPixels.length) {
+      return segment;
+    }
+
+    const processedLocalDepthPixels = preprocessSegmentLocalDepth(
+      segment.localDepthPixels,
+      segment.localMask,
+      segment.localWidth,
+      segment.localHeight,
+    );
+
+    for (let i = 0; i < segment.indices.length; i += 1) {
+      const pixelIndex = segment.indices[i];
+      const x = pixelIndex % width;
+      const y = Math.floor(pixelIndex / width);
+      const localIndex = (y - segment.bounds.minY) * segment.localWidth + (x - segment.bounds.minX);
+      processedPixels[pixelIndex] = processedLocalDepthPixels[localIndex];
+    }
+
+    return {
+      ...segment,
+      processedLocalDepthPixels,
+    };
+  });
+
+  const resources = createDepthTextureResources(width, height, processedPixels);
+  return {
+    segmentData: nextSegmentData,
+    pixels: processedPixels,
+    texture: resources.texture,
+  };
+}
+
+function preprocessSegmentLocalDepth(sourcePixels, mask, width, height) {
+  const boundaryCorrected = correctSegmentBoundaryDepthLeakage(sourcePixels, mask, width, height);
+  const median = applyMaskedMedianFilter(boundaryCorrected, mask, width, height, 1);
+  const blurKernel = getDepthBlurKernel(1);
+  const blurred = applyMaskedBlurFilter(median, mask, width, height, 1, blurKernel);
+  const sharpened = applyMaskedUnsharpFilter(median, blurred, mask, 0.65);
+  const despiked = suppressMaskedDepthSpikes(sharpened, mask, width, height, 2);
+  return enforceMaskedDepthContinuity(despiked, mask, width, height, 3);
+}
+
+function correctSegmentBoundaryDepthLeakage(sourcePixels, mask, width, height) {
+  const output = sourcePixels.slice();
+  const boundaryMask = buildBoundaryMask(mask, width, height);
+  let trustedMask = erodeMask(mask, width, height, 2);
+
+  if (!trustedMask.some(Boolean)) {
+    trustedMask = erodeMask(mask, width, height, 1);
+  }
+  if (!trustedMask.some(Boolean)) {
+    trustedMask = mask;
+  }
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (!boundaryMask[index]) {
+        continue;
+      }
+
+      const stats = sampleMaskedDepthStats(sourcePixels, trustedMask, width, height, x, y, 3);
+      if (!stats) {
+        continue;
+      }
+
+      const currentDepth = sourcePixels[index];
+      const deviationLimit = Math.max(10, stats.mad * 3 + 6);
+      if (currentDepth <= 0 || Math.abs(currentDepth - stats.median) > deviationLimit) {
+        output[index] = stats.median;
+      }
+    }
+  }
+
+  return output;
+}
+
+function buildBoundaryMask(mask, width, height) {
+  const boundary = new Uint8Array(mask.length);
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (!mask[index]) {
+        continue;
+      }
+
+      if (
+        x === 0 ||
+        y === 0 ||
+        x === width - 1 ||
+        y === height - 1 ||
+        !mask[index - 1] ||
+        !mask[index + 1] ||
+        !mask[index - width] ||
+        !mask[index + width]
+      ) {
+        boundary[index] = 1;
+      }
+    }
+  }
+
+  return boundary;
+}
+
+function erodeMask(mask, width, height, iterations) {
+  let current = mask.slice();
+
+  for (let iteration = 0; iteration < iterations; iteration += 1) {
+    const next = new Uint8Array(mask.length);
+
+    for (let y = 1; y < height - 1; y += 1) {
+      for (let x = 1; x < width - 1; x += 1) {
+        const index = y * width + x;
+        if (
+          current[index] &&
+          current[index - 1] &&
+          current[index + 1] &&
+          current[index - width] &&
+          current[index + width]
+        ) {
+          next[index] = 1;
+        }
+      }
+    }
+
+    current = next;
+  }
+
+  return current;
+}
+
+function sampleMaskedDepthStats(sourcePixels, mask, width, height, centerX, centerY, radius) {
+  const samples = [];
+
+  for (let oy = -radius; oy <= radius; oy += 1) {
+    const y = centerY + oy;
+    if (y < 0 || y >= height) {
+      continue;
+    }
+
+    for (let ox = -radius; ox <= radius; ox += 1) {
+      const x = centerX + ox;
+      if (x < 0 || x >= width) {
+        continue;
+      }
+
+      const index = y * width + x;
+      if (!mask[index] || sourcePixels[index] <= 0) {
+        continue;
+      }
+      samples.push(sourcePixels[index]);
+    }
+  }
+
+  if (samples.length === 0) {
+    return null;
+  }
+
+  samples.sort((a, b) => a - b);
+  const median = samples[(samples.length - 1) >> 1];
+  const deviations = samples.map((value) => Math.abs(value - median)).sort((a, b) => a - b);
+  const mad = deviations[(deviations.length - 1) >> 1];
+
+  return { median, mad };
+}
+
+function suppressMaskedDepthSpikes(sourcePixels, mask, width, height, passes) {
+  let current = sourcePixels.slice();
+
+  for (let pass = 0; pass < passes; pass += 1) {
+    const next = current.slice();
+
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const index = y * width + x;
+        if (!mask[index] || current[index] <= 0) {
+          continue;
+        }
+
+        const stats = sampleMaskedDepthStats(current, mask, width, height, x, y, 1);
+        if (!stats) {
+          continue;
+        }
+
+        const edgeAwareStats = sampleMaskedDepthStats(current, mask, width, height, x, y, 2) || stats;
+        const deviation = Math.abs(current[index] - stats.median);
+        const localLimit = Math.max(8, stats.mad * 2 + 4, edgeAwareStats.mad * 2 + 4);
+
+        if (deviation > localLimit) {
+          next[index] = stats.median;
+        }
+      }
+    }
+
+    current = next;
+  }
+
+  return current;
+}
+
+function enforceMaskedDepthContinuity(sourcePixels, mask, width, height, passes) {
+  let current = sourcePixels.slice();
+
+  for (let pass = 0; pass < passes; pass += 1) {
+    const next = current.slice();
+
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const index = y * width + x;
+        if (!mask[index] || current[index] <= 0) {
+          continue;
+        }
+
+        const neighbors = collectMaskedNeighborDepths(current, mask, width, height, x, y);
+        if (neighbors.length < 2) {
+          continue;
+        }
+
+        neighbors.sort((a, b) => a - b);
+        const neighborMedian = neighbors[(neighbors.length - 1) >> 1];
+        const deviations = neighbors.map((value) => Math.abs(value - neighborMedian)).sort((a, b) => a - b);
+        const neighborMad = deviations[(deviations.length - 1) >> 1];
+        const maxStep = Math.max(6, neighborMad * 2 + 3);
+        const currentDepth = current[index];
+        const delta = currentDepth - neighborMedian;
+
+        if (Math.abs(delta) > maxStep) {
+          next[index] = clamp(Math.round(neighborMedian + Math.sign(delta) * maxStep), 0, 255);
+          continue;
+        }
+
+        const minNeighbor = neighbors[0];
+        const maxNeighbor = neighbors[neighbors.length - 1];
+        if (currentDepth < minNeighbor - maxStep || currentDepth > maxNeighbor + maxStep) {
+          next[index] = clamp(Math.round(neighborMedian), 0, 255);
+        }
+      }
+    }
+
+    current = next;
+  }
+
+  return current;
+}
+
+function collectMaskedNeighborDepths(sourcePixels, mask, width, height, x, y) {
+  const neighbors = [];
+  const offsets = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+    [-1, -1],
+    [1, -1],
+    [-1, 1],
+    [1, 1],
+  ];
+
+  for (const [dx, dy] of offsets) {
+    const sx = x + dx;
+    const sy = y + dy;
+    if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+      continue;
+    }
+
+    const sampleIndex = sy * width + sx;
+    if (!mask[sampleIndex] || sourcePixels[sampleIndex] <= 0) {
+      continue;
+    }
+    neighbors.push(sourcePixels[sampleIndex]);
+  }
+
+  return neighbors;
+}
+
+function applyMaskedMedianFilter(sourcePixels, mask, width, height, radius) {
+  const output = new Uint8Array(sourcePixels.length);
+  const samples = [];
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (!mask[index]) {
+        continue;
+      }
+
+      if (sourcePixels[index] <= 0) {
+        output[index] = 0;
+        continue;
+      }
+
+      samples.length = 0;
+      for (let oy = -radius; oy <= radius; oy += 1) {
+        const sy = y + oy;
+        if (sy < 0 || sy >= height) {
+          continue;
+        }
+
+        for (let ox = -radius; ox <= radius; ox += 1) {
+          const sx = x + ox;
+          if (sx < 0 || sx >= width) {
+            continue;
+          }
+
+          const sampleIndex = sy * width + sx;
+          if (!mask[sampleIndex] || sourcePixels[sampleIndex] <= 0) {
+            continue;
+          }
+          samples.push(sourcePixels[sampleIndex]);
+        }
+      }
+
+      if (samples.length === 0) {
+        output[index] = sourcePixels[index];
+        continue;
+      }
+
+      samples.sort((a, b) => a - b);
+      output[index] = samples[(samples.length - 1) >> 1];
+    }
+  }
+
+  return output;
+}
+
+function applyMaskedBlurFilter(sourcePixels, mask, width, height, radius, kernel) {
+  const output = new Uint8Array(sourcePixels.length);
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (!mask[index]) {
+        continue;
+      }
+
+      if (sourcePixels[index] <= 0) {
+        output[index] = 0;
+        continue;
+      }
+
+      let weightedSum = 0;
+      let weightTotal = 0;
+
+      for (let oy = -radius; oy <= radius; oy += 1) {
+        const sy = y + oy;
+        if (sy < 0 || sy >= height) {
+          continue;
+        }
+
+        for (let ox = -radius; ox <= radius; ox += 1) {
+          const sx = x + ox;
+          if (sx < 0 || sx >= width) {
+            continue;
+          }
+
+          const sampleIndex = sy * width + sx;
+          if (!mask[sampleIndex] || sourcePixels[sampleIndex] <= 0) {
+            continue;
+          }
+
+          const kernelIndex = (oy + radius) * (radius * 2 + 1) + (ox + radius);
+          const weight = kernel[kernelIndex];
+          weightedSum += sourcePixels[sampleIndex] * weight;
+          weightTotal += weight;
+        }
+      }
+
+      output[index] = weightTotal > 0
+        ? Math.round(weightedSum / weightTotal)
+        : sourcePixels[index];
+    }
+  }
+
+  return output;
+}
+
+function applyMaskedUnsharpFilter(basePixels, blurredPixels, mask, amount) {
+  const output = new Uint8Array(basePixels.length);
+
+  for (let index = 0; index < basePixels.length; index += 1) {
+    if (!mask[index] || basePixels[index] <= 0) {
+      output[index] = basePixels[index];
+      continue;
+    }
+
+    const enhanced = basePixels[index] + (basePixels[index] - blurredPixels[index]) * amount;
+    output[index] = clamp(Math.round(enhanced), 0, 255);
+  }
+
+  return output;
+}
+
+function getDepthBlurKernel(radius) {
+  const cached = depthBlurKernelCache.get(radius);
+  if (cached) {
+    return cached;
+  }
+
+  const kernel = createGaussianKernel(radius);
+  depthBlurKernelCache.set(radius, kernel);
+  return kernel;
 }
 
 function splitDisconnectedSegments(segmentMap, width, height, palette) {
@@ -980,9 +1544,38 @@ function rebuildSegmentList() {
     size.className = "segment-size";
     size.textContent = renderState.segmentPixelCounts[index].toLocaleString();
 
-    row.append(checkbox, swatch, name, size);
+    const controls = document.createElement("div");
+    controls.className = "segment-controls";
+
+    const offsetDown = createSegmentControlButton("-", "offset-down", index);
+    const offsetUp = createSegmentControlButton("+", "offset-up", index);
+    const scaleDown = createSegmentControlButton("<", "scale-down", index);
+    const scaleUp = createSegmentControlButton(">", "scale-up", index);
+    const metrics = document.createElement("span");
+    metrics.className = "segment-metrics";
+    metrics.dataset.segmentMetrics = String(index);
+
+    controls.append(offsetDown, offsetUp, scaleDown, scaleUp, metrics);
+
+    row.append(checkbox, swatch, name, size, controls);
     segmentListEl.appendChild(row);
   });
+
+  syncSegmentAdjustmentLabels();
+}
+
+function createSegmentControlButton(label, action, segmentIndex) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "segment-button";
+  button.textContent = label;
+  button.dataset.segmentAction = action;
+  button.dataset.segmentIndex = String(segmentIndex);
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    applySegmentDepthAdjustment(action, segmentIndex);
+  });
+  return button;
 }
 
 function applySegmentToggle(segmentIndex, invertOthers) {
@@ -1006,6 +1599,68 @@ function syncSegmentCheckboxes() {
     const index = Number(checkbox.dataset.segmentIndex);
     checkbox.checked = renderState.segmentVisibility[index];
   });
+}
+
+function syncSegmentAdjustmentLabels() {
+  const labels = segmentListEl.querySelectorAll("[data-segment-metrics]");
+  labels.forEach((label) => {
+    const index = Number(label.dataset.segmentMetrics);
+    label.textContent = `o${renderState.segmentDepthOffsets[index]} s${renderState.segmentDepthScales[index].toFixed(2)}`;
+  });
+}
+
+function applySegmentDepthAdjustment(action, segmentIndex) {
+  if (action === "offset-down") {
+    renderState.segmentDepthOffsets[segmentIndex] -= segmentDepthOffsetStep;
+  } else if (action === "offset-up") {
+    renderState.segmentDepthOffsets[segmentIndex] += segmentDepthOffsetStep;
+  } else if (action === "scale-down") {
+    renderState.segmentDepthScales[segmentIndex] = Math.max(
+      0.1,
+      Number((renderState.segmentDepthScales[segmentIndex] - segmentDepthScaleStep).toFixed(2)),
+    );
+  } else if (action === "scale-up") {
+    renderState.segmentDepthScales[segmentIndex] = Number(
+      (renderState.segmentDepthScales[segmentIndex] + segmentDepthScaleStep).toFixed(2),
+    );
+  }
+
+  syncSegmentAdjustmentLabels();
+  applySegmentDepthAdjustments();
+  buildMesh();
+}
+
+function applySegmentDepthAdjustments() {
+  disposeAdjustedDepthTexture();
+
+  if (!renderState.baseDepthPixels) {
+    return;
+  }
+
+  const adjustedPixels = new Uint8Array(renderState.baseDepthPixels.length);
+
+  for (let index = 0; index < renderState.baseDepthPixels.length; index += 1) {
+    const baseDepth = renderState.baseDepthPixels[index];
+    const segmentIndex = renderState.segmentMap[index];
+    if (baseDepth <= 0 || segmentIndex < 0) {
+      adjustedPixels[index] = 0;
+      continue;
+    }
+
+    const scaled = baseDepth * renderState.segmentDepthScales[segmentIndex];
+    const shifted = scaled + renderState.segmentDepthOffsets[segmentIndex];
+    adjustedPixels[index] = clamp(Math.round(shifted), 1, 255);
+  }
+
+  const adjusted = createDepthTextureResources(
+    renderState.imageWidth,
+    renderState.imageHeight,
+    adjustedPixels,
+  );
+
+  renderState.adjustedDepthTexture = adjusted.texture;
+  renderState.activeDepthTexture = adjusted.texture;
+  renderState.activeDepthPixels = adjusted.pixels;
 }
 
 function updateSegmentMaskTexture() {
@@ -1033,14 +1688,47 @@ function disposeSegmentMaskTexture() {
   }
 }
 
-function createGridDepthResources(width, height, sourcePixels, specMode, gridX, gridY, kernelSize, interpMode) {
+function createSegmentedGridDepthResources(
+  width,
+  height,
+  segmentData,
+  specMode,
+  gridX,
+  gridY,
+  kernelSize,
+  interpMode,
+) {
   const pixels = new Uint8Array(width * height);
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  const context = canvas.getContext("2d");
-  const imageData = context.createImageData(width, height);
+  const gridSpec = createGridSpec(width, height, specMode, gridX, gridY, kernelSize);
+  const kernel = createGaussianKernel(gridSpec.radius);
 
+  for (let segmentIndex = 0; segmentIndex < segmentData.length; segmentIndex += 1) {
+    const segment = segmentData[segmentIndex];
+    if (!segment || !segment.indices.length || !segment.hasSourceDepth) {
+      continue;
+    }
+
+    writeSegmentGridDepthPixels(
+      width,
+      segment,
+      gridSpec,
+      kernel,
+      interpMode,
+      pixels,
+    );
+  }
+
+  return createDepthTextureResources(width, height, pixels);
+}
+
+function createGridDepthResources(width, height, sourcePixels, specMode, gridX, gridY, kernelSize, interpMode) {
+  const gridSpec = createGridSpec(width, height, specMode, gridX, gridY, kernelSize);
+  const kernel = createGaussianKernel(gridSpec.radius);
+  const pixels = createGridDepthPixels(width, height, sourcePixels, gridSpec, kernel, interpMode);
+  return createDepthTextureResources(width, height, pixels);
+}
+
+function createGridSpec(width, height, specMode, gridX, gridY, kernelSize) {
   const gridWidth = specMode === "size"
     ? Math.max(2, Math.ceil((width - 1) / Math.max(1, gridX)) + 1)
     : Math.max(2, gridX + 1);
@@ -1048,15 +1736,24 @@ function createGridDepthResources(width, height, sourcePixels, specMode, gridX, 
     ? Math.max(2, Math.ceil((height - 1) / Math.max(1, gridY)) + 1)
     : Math.max(2, gridY + 1);
 
+  return {
+    gridWidth,
+    gridHeight,
+    radius: Math.max(1, Math.floor(kernelSize / 2)),
+  };
+}
+
+function createGridDepthPixels(width, height, sourcePixels, gridSpec, kernel, interpMode) {
+  const pixels = new Uint8Array(width * height);
+  const { gridWidth, gridHeight, radius } = gridSpec;
   const controlValues = new Float32Array(gridWidth * gridHeight);
   const controlValid = new Uint8Array(gridWidth * gridHeight);
-  const radius = Math.max(1, Math.floor(kernelSize / 2));
 
   for (let gy = 0; gy < gridHeight; gy += 1) {
     const py = sampleGridPosition(gy, gridHeight, height);
     for (let gx = 0; gx < gridWidth; gx += 1) {
       const px = sampleGridPosition(gx, gridWidth, width);
-      const sample = convolveDepthAt(sourcePixels, width, height, px, py, radius);
+      const sample = convolveDepthAt(sourcePixels, width, height, px, py, radius, kernel);
       const index = gy * gridWidth + gx;
       controlValues[index] = sample.value;
       controlValid[index] = sample.valid ? 1 : 0;
@@ -1072,13 +1769,103 @@ function createGridDepthResources(width, height, sourcePixels, specMode, gridX, 
         : sampleLinearGrid(controlValues, controlValid, gridWidth, gridHeight, fx, fy);
       const rounded = Math.max(0, Math.min(255, Math.round(value)));
       const pixelIndex = y * width + x;
-      const imageIndex = pixelIndex * 4;
       pixels[pixelIndex] = rounded;
-      imageData.data[imageIndex] = rounded;
-      imageData.data[imageIndex + 1] = rounded;
-      imageData.data[imageIndex + 2] = rounded;
-      imageData.data[imageIndex + 3] = rounded > 0 ? 255 : 0;
     }
+  }
+
+  return pixels;
+}
+
+function writeSegmentGridDepthPixels(
+  imageWidth,
+  segment,
+  gridSpec,
+  kernel,
+  interpMode,
+  outputPixels,
+) {
+  const {
+    indices,
+    bounds,
+    localWidth,
+    localHeight,
+    processedLocalDepthPixels,
+  } = segment;
+  const { gridWidth, gridHeight, radius } = gridSpec;
+  const controlValues = new Float32Array(gridWidth * gridHeight);
+  const controlValid = new Uint8Array(gridWidth * gridHeight);
+
+  for (let gy = 0; gy < gridHeight; gy += 1) {
+    const py = sampleGridPositionInBounds(gy, gridHeight, bounds.minY, bounds.maxY);
+    for (let gx = 0; gx < gridWidth; gx += 1) {
+      const px = sampleGridPositionInBounds(gx, gridWidth, bounds.minX, bounds.maxX);
+      const sample = convolveDepthAtBounds(
+        processedLocalDepthPixels,
+        localWidth,
+        localHeight,
+        px - bounds.minX,
+        py - bounds.minY,
+        radius,
+        kernel,
+      );
+      const index = gy * gridWidth + gx;
+      controlValues[index] = sample.value;
+      controlValid[index] = sample.valid ? 1 : 0;
+    }
+  }
+
+  const boundWidth = Math.max(1, bounds.maxX - bounds.minX);
+  const boundHeight = Math.max(1, bounds.maxY - bounds.minY);
+
+  for (let i = 0; i < indices.length; i += 1) {
+    const pixelIndex = indices[i];
+    const x = pixelIndex % imageWidth;
+    const y = Math.floor(pixelIndex / imageWidth);
+    const fx = ((x - bounds.minX) / boundWidth) * (gridWidth - 1);
+    const fy = ((y - bounds.minY) / boundHeight) * (gridHeight - 1);
+    const value = interpMode === "cubic"
+      ? sampleCubicGrid(controlValues, controlValid, gridWidth, gridHeight, fx, fy)
+      : sampleLinearGrid(controlValues, controlValid, gridWidth, gridHeight, fx, fy);
+    outputPixels[pixelIndex] = Math.max(0, Math.min(255, Math.round(value)));
+  }
+}
+
+function createGaussianKernel(radius) {
+  const cached = gaussianKernelCache.get(radius);
+  if (cached) {
+    return cached;
+  }
+
+  const size = radius * 2 + 1;
+  const kernel = new Float32Array(size * size);
+  const sigma = Math.max(1, radius * 0.5);
+  let index = 0;
+
+  for (let y = -radius; y <= radius; y += 1) {
+    for (let x = -radius; x <= radius; x += 1) {
+      const distance2 = x * x + y * y;
+      kernel[index++] = Math.exp(-distance2 / (2 * sigma * sigma));
+    }
+  }
+
+  gaussianKernelCache.set(radius, kernel);
+  return kernel;
+}
+
+function createDepthTextureResources(width, height, pixels) {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  const imageData = context.createImageData(width, height);
+
+  for (let pixelIndex = 0; pixelIndex < pixels.length; pixelIndex += 1) {
+    const rounded = pixels[pixelIndex];
+    const imageIndex = pixelIndex * 4;
+    imageData.data[imageIndex] = rounded;
+    imageData.data[imageIndex + 1] = rounded;
+    imageData.data[imageIndex + 2] = rounded;
+    imageData.data[imageIndex + 3] = rounded > 0 ? 255 : 0;
   }
 
   context.putImageData(imageData, 0, 0);
@@ -1099,22 +1886,72 @@ function sampleGridPosition(index, count, extent) {
   return Math.round((index / (count - 1)) * (extent - 1));
 }
 
-function convolveDepthAt(sourcePixels, width, height, centerX, centerY, radius) {
+function sampleGridPositionInBounds(index, count, min, max) {
+  if (count <= 1 || max <= min) {
+    return min;
+  }
+
+  return Math.round(min + (index / (count - 1)) * (max - min));
+}
+
+function convolveDepthAt(sourcePixels, width, height, centerX, centerY, radius, kernel) {
   let weightedSum = 0;
   let weightTotal = 0;
 
-  for (let y = Math.max(0, centerY - radius); y <= Math.min(height - 1, centerY + radius); y += 1) {
-    for (let x = Math.max(0, centerX - radius); x <= Math.min(width - 1, centerX + radius); x += 1) {
+  for (let oy = -radius; oy <= radius; oy += 1) {
+    const y = centerY + oy;
+    if (y < 0 || y >= height) {
+      continue;
+    }
+
+    for (let ox = -radius; ox <= radius; ox += 1) {
+      const x = centerX + ox;
+      if (x < 0 || x >= width) {
+        continue;
+      }
+
       const value = sourcePixels[y * width + x];
       if (value <= 0) {
         continue;
       }
 
-      const dx = x - centerX;
-      const dy = y - centerY;
-      const distance2 = dx * dx + dy * dy;
-      const sigma = Math.max(1, radius * 0.5);
-      const weight = Math.exp(-distance2 / (2 * sigma * sigma));
+      const kernelIndex = (oy + radius) * (radius * 2 + 1) + (ox + radius);
+      const weight = kernel[kernelIndex];
+      weightedSum += value * weight;
+      weightTotal += weight;
+    }
+  }
+
+  if (weightTotal === 0) {
+    return { value: 0, valid: false };
+  }
+
+  return { value: weightedSum / weightTotal, valid: true };
+}
+
+function convolveDepthAtBounds(sourcePixels, width, height, centerX, centerY, radius, kernel) {
+  let weightedSum = 0;
+  let weightTotal = 0;
+
+  for (let oy = -radius; oy <= radius; oy += 1) {
+    const y = centerY + oy;
+    if (y < 0 || y >= height) {
+      continue;
+    }
+
+    for (let ox = -radius; ox <= radius; ox += 1) {
+      const x = centerX + ox;
+      if (x < 0 || x >= width) {
+        continue;
+      }
+
+      const value = sourcePixels[y * width + x];
+      if (value <= 0) {
+        continue;
+      }
+
+      const kernelIndex = (oy + radius) * (radius * 2 + 1) + (ox + radius);
+      const weight = kernel[kernelIndex];
       weightedSum += value * weight;
       weightTotal += weight;
     }
