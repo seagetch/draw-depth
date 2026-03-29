@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Depth Draw Viewer</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0d1117;
+        --panel: rgba(13, 17, 23, 0.84);
+        --line: rgba(240, 246, 252, 0.12);
+        --text: #e6edf3;
+        --muted: #8b949e;
+        --accent: #4ac26b;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background:
+          radial-gradient(circle at top, rgba(74, 194, 107, 0.12), transparent 32%),
+          linear-gradient(180deg, #11161c 0%, var(--bg) 60%);
+        color: var(--text);
+        font: 13px/1.4 "Segoe UI", sans-serif;
+      }
+
+      #app {
+        width: 100%;
+        height: 100%;
+      }
+
+      #hud {
+        position: fixed;
+        top: 16px;
+        left: 16px;
+        z-index: 10;
+        width: min(320px, calc(100vw - 32px));
+        padding: 14px 14px 12px;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: var(--panel);
+        backdrop-filter: blur(14px);
+      }
+
+      h1 {
+        margin: 0 0 8px;
+        font-size: 15px;
+      }
+
+      p {
+        margin: 0 0 12px;
+        color: var(--muted);
+      }
+
+      .control {
+        display: grid;
+        gap: 6px;
+        margin-bottom: 10px;
+      }
+
+      .control-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+      }
+
+      label {
+        color: var(--text);
+      }
+
+      input[type="range"] {
+        width: 100%;
+      }
+
+      input[type="checkbox"] {
+        accent-color: var(--accent);
+      }
+
+      .value {
+        min-width: 44px;
+        text-align: right;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+
+      #status {
+        margin-top: 2px;
+        color: var(--muted);
+      }
+
+      a {
+        color: inherit;
+      }
+
+      .thumb-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+        margin-top: 12px;
+      }
+
+      .thumb-card {
+        display: grid;
+        gap: 6px;
+      }
+
+      .thumb-button {
+        display: block;
+        padding: 0;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        background: rgba(255, 255, 255, 0.03);
+        cursor: pointer;
+      }
+
+      .thumb-button img {
+        display: block;
+        width: 100%;
+        height: auto;
+        object-fit: cover;
+        background: rgba(255, 255, 255, 0.03);
+      }
+
+      .thumb-label {
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .hidden-input {
+        display: none;
+      }
+
+      select,
+      input[type="number"] {
+        width: 100%;
+        padding: 6px 8px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.04);
+        color: var(--text);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <section id="hud">
+      <h1>Depth Draw Viewer</h1>
+      <p>`depth == 0` is treated as invalid and is not rendered.</p>
+
+      <div class="control">
+        <div class="control-row">
+          <label for="depthScale">Depth scale</label>
+          <output class="value" id="depthScaleValue">0.22</output>
+        </div>
+        <input id="depthScale" type="range" min="0.02" max="0.75" step="0.01" value="0.22">
+      </div>
+
+      <div class="control">
+        <div class="control-row">
+          <label for="meshDetail">Mesh detail</label>
+          <output class="value" id="meshDetailValue">2</output>
+        </div>
+        <input id="meshDetail" type="range" min="1" max="6" step="1" value="2">
+      </div>
+
+      <div class="control-row">
+        <label for="invertDepth">Invert depth</label>
+        <input id="invertDepth" type="checkbox">
+      </div>
+
+      <div class="control">
+        <div class="control-row">
+          <label for="depthMode">Depth mode</label>
+        </div>
+        <select id="depthMode">
+          <option value="raw">Raw depth</option>
+          <option value="grid">Grid interpolated depth</option>
+        </select>
+      </div>
+
+      <div class="control">
+        <div class="control-row">
+          <label for="gridSpecMode">Grid spec</label>
+        </div>
+        <select id="gridSpecMode">
+          <option value="size">Cell size (px)</option>
+          <option value="divisions">Divisions</option>
+        </select>
+      </div>
+
+      <div class="control">
+        <div class="control-row">
+          <label for="gridX">Grid X</label>
+          <output class="value" id="gridXValue">24</output>
+        </div>
+        <input id="gridX" type="range" min="2" max="128" step="1" value="24">
+      </div>
+
+      <div class="control">
+        <div class="control-row">
+          <label for="gridY">Grid Y</label>
+          <output class="value" id="gridYValue">24</output>
+        </div>
+        <input id="gridY" type="range" min="2" max="128" step="1" value="24">
+      </div>
+
+      <div class="control">
+        <div class="control-row">
+          <label for="kernelSize">Kernel size</label>
+          <output class="value" id="kernelSizeValue">15</output>
+        </div>
+        <input id="kernelSize" type="range" min="3" max="65" step="2" value="15">
+      </div>
+
+      <div class="control">
+        <div class="control-row">
+          <label for="interpMode">Interpolation</label>
+        </div>
+        <select id="interpMode">
+          <option value="linear">Linear</option>
+          <option value="cubic">Cubic</option>
+        </select>
+      </div>
+
+      <p>
+        Left drag: orbit<br>
+        Right drag: pan<br>
+        Wheel: zoom
+      </p>
+
+      <div class="thumb-grid">
+        <div class="thumb-card">
+          <div class="thumb-label">Color image</div>
+          <button class="thumb-button" id="colorThumbButton" type="button">
+            <img id="colorThumb" alt="Color thumbnail">
+          </button>
+          <input class="hidden-input" id="colorFileInput" type="file" accept="image/*">
+        </div>
+        <div class="thumb-card">
+          <div class="thumb-label">Depth image</div>
+          <button class="thumb-button" id="depthThumbButton" type="button">
+            <img id="depthThumb" alt="Depth thumbnail">
+          </button>
+          <input class="hidden-input" id="depthFileInput" type="file" accept="image/*">
+        </div>
+      </div>
+
+      <div id="status">Loading...</div>
+    </section>
+    <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
+    <script src="https://unpkg.com/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="./viewer.js"></script>
+  </body>
+</html>
