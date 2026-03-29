@@ -288,6 +288,7 @@ function buildMesh() {
     renderState.imageWidth,
     renderState.imageHeight,
     renderState.activeDepthPixels,
+    renderState.segmentMap,
     step,
   );
 
@@ -316,7 +317,7 @@ function buildMesh() {
   refreshStatusCounts();
 }
 
-function buildMaskedPlaneGeometry(width, height, depthPixels, step) {
+function buildMaskedPlaneGeometry(width, height, depthPixels, segmentMap, step) {
   const cols = Math.floor((width - 1) / step) + 1;
   const rows = Math.floor((height - 1) / step) + 1;
   const positions = new Float32Array(cols * rows * 3);
@@ -365,6 +366,23 @@ function buildMaskedPlaneGeometry(width, height, depthPixels, step) {
         continue;
       }
 
+      const segmentA = getSegmentIndex(segmentMap, width, x0, y0);
+      const segmentB = getSegmentIndex(segmentMap, width, x1, y0);
+      const segmentC = getSegmentIndex(segmentMap, width, x0, y1);
+      const segmentD = getSegmentIndex(segmentMap, width, x1, y1);
+
+      if (
+        segmentA < 0 ||
+        segmentB < 0 ||
+        segmentC < 0 ||
+        segmentD < 0 ||
+        segmentA !== segmentB ||
+        segmentA !== segmentC ||
+        segmentA !== segmentD
+      ) {
+        continue;
+      }
+
       const a = y * cols + x;
       const b = a + 1;
       const c = a + cols;
@@ -385,6 +403,10 @@ function buildMaskedPlaneGeometry(width, height, depthPixels, step) {
 
 function isValidDepth(depthPixels, width, x, y) {
   return depthPixels[y * width + x] > 0;
+}
+
+function getSegmentIndex(segmentMap, width, x, y) {
+  return segmentMap[y * width + x];
 }
 
 function loadTexture(url) {
