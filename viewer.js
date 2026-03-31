@@ -4,7 +4,10 @@ const depthScaleEl = document.querySelector("#depthScale");
 const depthScaleValueEl = document.querySelector("#depthScaleValue");
 const meshDetailEl = document.querySelector("#meshDetail");
 const meshDetailValueEl = document.querySelector("#meshDetailValue");
+const depthDiscontinuityEl = document.querySelector("#depthDiscontinuity");
+const depthDiscontinuityValueEl = document.querySelector("#depthDiscontinuityValue");
 const invertDepthEl = document.querySelector("#invertDepth");
+const contourRepairEl = document.querySelector("#contourRepair");
 const depthModeEl = document.querySelector("#depthMode");
 const gridSpecModeEl = document.querySelector("#gridSpecMode");
 const gridXEl = document.querySelector("#gridX");
@@ -17,14 +20,21 @@ const interpModeEl = document.querySelector("#interpMode");
 const segmentListEl = document.querySelector("#segmentList");
 const colorThumbButtonEl = document.querySelector("#colorThumbButton");
 const depthThumbButtonEl = document.querySelector("#depthThumbButton");
+const segmentThumbButtonEl = document.querySelector("#segmentThumbButton");
 const colorThumbEl = document.querySelector("#colorThumb");
 const depthThumbEl = document.querySelector("#depthThumb");
+const segmentThumbEl = document.querySelector("#segmentThumb");
 const colorFileInputEl = document.querySelector("#colorFileInput");
 const depthFileInputEl = document.querySelector("#depthFileInput");
+const segmentFileInputEl = document.querySelector("#segmentFileInput");
 
 const colorUrl = "./data/Midori-color.jpg";
 const depthUrl = "./data/Midori-depth.jpg";
 const segmentUrl = "./data/Midori-segment.jpg";
+const cacheBustToken = `${Date.now()}`;
+const defaultColorUrl = withCacheBust(colorUrl);
+const defaultDepthUrl = withCacheBust(depthUrl);
+const defaultSegmentUrl = withCacheBust(segmentUrl);
 const invalidDepthThreshold = 1 / 255;
 const segmentAnchorDistance = 36;
 const segmentMinAnchorPixels = 24;
@@ -63,17 +73,29 @@ const renderState = {
   sourceDepthPixels: null,
   processedDepthTexture: null,
   processedDepthPixels: null,
+  rawDepthTexture: null,
+  rawDepthPixels: null,
   baseDepthTexture: null,
   baseDepthPixels: null,
+  repairedBaseDepthTexture: null,
+  repairedBaseDepthPixels: null,
+  repairedBaseGapMask: null,
   adjustedDepthTexture: null,
   activeDepthTexture: null,
   activeDepthPixels: null,
+  meshDepthTexture: null,
+  meshDepthPixels: null,
+  meshGapMask: null,
   imageWidth: 0,
   imageHeight: 0,
   mesh: null,
   material: null,
+  edgePoints: null,
+  edgePointMaterial: null,
   colorObjectUrl: null,
   depthObjectUrl: null,
+  segmentObjectUrl: null,
+  segmentThumbUrl: "",
   generatedDepthTexture: null,
   segmentSourcePixels: null,
   segmentMap: null,
@@ -83,15 +105,19 @@ const renderState = {
   segmentVisibility: [],
   segmentDepthOffsets: [],
   segmentDepthScales: [],
+  segmentDepthMeans: [],
   segmentPixels: [],
   segmentBounds: [],
   segmentData: [],
+  rawSegmentData: [],
   segmentMaskData: null,
   segmentMaskTexture: null,
 };
 
 const gaussianKernelCache = new Map();
 const depthBlurKernelCache = new Map();
+const relativeDepthFactor = 0.12;
+const relativeDepthFloor = 24;
 const segmentDepthOffsetStep = 6;
 const segmentDepthScaleStep = 0.1;
 
@@ -132,6 +158,49 @@ const fragmentShader = `
   }
 `;
 
+const pointVertexShader = `
+  uniform sampler2D uDepthTexture;
+  uniform float uDepthScale;
+  uniform float uInvertDepth;
+  uniform float uPointSize;
+  varying vec2 vUv;
+  varying float vDepthMask;
+
+  void main() {
+    vUv = uv;
+
+    float rawDepth = texture2D(uDepthTexture, uv).r;
+    vDepthMask = step(${invalidDepthThreshold.toFixed(8)}, rawDepth);
+
+    float depthValue = mix(rawDepth, 1.0 - rawDepth, uInvertDepth);
+    vec3 displaced = position;
+    displaced.z += depthValue * uDepthScale * vDepthMask;
+
+    vec4 mvPosition = modelViewMatrix * vec4(displaced, 1.0);
+    gl_Position = projectionMatrix * mvPosition;
+    gl_PointSize = uPointSize;
+  }
+`;
+
+const pointFragmentShader = `
+  uniform sampler2D uSegmentMaskTexture;
+  varying vec2 vUv;
+  varying float vDepthMask;
+
+  void main() {
+    if (vDepthMask < 0.5 || texture2D(uSegmentMaskTexture, vUv).r < 0.5) {
+      discard;
+    }
+
+    vec2 centered = gl_PointCoord - vec2(0.5);
+    if (dot(centered, centered) > 0.25) {
+      discard;
+    }
+
+    gl_FragColor = vec4(1.0, 0.1, 0.1, 1.0);
+  }
+`;
+
 init().catch((error) => {
   console.error(error);
   statusEl.textContent = `Failed: ${error.message}`;
@@ -139,10 +208,10 @@ init().catch((error) => {
 
 async function init() {
   const [colorTexture, depthTexture, depthPixels, segmentImage] = await Promise.all([
-    loadTexture(colorUrl),
-    loadTexture(depthUrl),
-    loadDepthPixels(depthUrl),
-    loadRgbPixels(segmentUrl),
+    loadTexture(defaultColorUrl),
+    loadTexture(defaultDepthUrl),
+    loadDepthPixels(defaultDepthUrl),
+    loadRgbPixels(defaultSegmentUrl),
   ]);
 
   const imageWidth = colorTexture.image.width;
@@ -169,6 +238,11 @@ async function init() {
   renderState.segmentSourcePixels = segmentImage.pixels;
   renderState.imageWidth = imageWidth;
   renderState.imageHeight = imageHeight;
+  renderState.segmentThumbUrl = createSegmentThumbDataUrl(
+    renderState.segmentSourcePixels,
+    imageWidth,
+    imageHeight,
+  );
 
   rebuildSegments();
   rebuildDepthModeResources();
@@ -182,6 +256,7 @@ async function init() {
 function wireControls() {
   depthScaleValueEl.textContent = Number(depthScaleEl.value).toFixed(2);
   meshDetailValueEl.textContent = meshDetailEl.value;
+  depthDiscontinuityValueEl.textContent = depthDiscontinuityEl.value;
   gridXValueEl.textContent = gridXEl.value;
   gridYValueEl.textContent = gridYEl.value;
   kernelSizeValueEl.textContent = kernelSizeEl.value;
@@ -189,18 +264,38 @@ function wireControls() {
   depthScaleEl.addEventListener("input", () => {
     depthScaleValueEl.textContent = Number(depthScaleEl.value).toFixed(2);
     renderState.material.uniforms.uDepthScale.value = Number(depthScaleEl.value);
+    if (renderState.edgePointMaterial) {
+      renderState.edgePointMaterial.uniforms.uDepthScale.value = Number(depthScaleEl.value);
+    }
   });
 
   meshDetailEl.addEventListener("input", () => {
     meshDetailValueEl.textContent = meshDetailEl.value;
   });
 
+  depthDiscontinuityEl.addEventListener("input", () => {
+    depthDiscontinuityValueEl.textContent = depthDiscontinuityEl.value;
+  });
+
   meshDetailEl.addEventListener("change", () => {
+    buildMesh();
+  });
+
+  depthDiscontinuityEl.addEventListener("change", () => {
+    rebuildDepthModeResources();
     buildMesh();
   });
 
   invertDepthEl.addEventListener("change", () => {
     renderState.material.uniforms.uInvertDepth.value = invertDepthEl.checked ? 1 : 0;
+    if (renderState.edgePointMaterial) {
+      renderState.edgePointMaterial.uniforms.uInvertDepth.value = invertDepthEl.checked ? 1 : 0;
+    }
+  });
+
+  contourRepairEl.addEventListener("change", () => {
+    rebuildDepthModeResources();
+    buildMesh();
   });
 
   depthModeEl.addEventListener("change", () => {
@@ -252,6 +347,9 @@ function wireControls() {
   depthThumbButtonEl.addEventListener("click", () => {
     depthFileInputEl.click();
   });
+  segmentThumbButtonEl.addEventListener("click", () => {
+    segmentFileInputEl.click();
+  });
 
   colorFileInputEl.addEventListener("change", async (event) => {
     const file = event.target.files[0];
@@ -273,22 +371,44 @@ function wireControls() {
     depthFileInputEl.value = "";
   });
 
+  segmentFileInputEl.addEventListener("change", async (event) => {
+    const file = event.target.files[0];
+    if (!file) {
+      return;
+    }
+
+    await replaceImage("segment", file);
+    segmentFileInputEl.value = "";
+  });
+
   window.addEventListener("resize", onResize);
 }
 
 function buildMesh() {
+  disposeMeshDepthTexture();
+
   if (renderState.mesh) {
     scene.remove(renderState.mesh);
     renderState.mesh.geometry.dispose();
     renderState.material.dispose();
   }
+  if (renderState.edgePoints) {
+    scene.remove(renderState.edgePoints);
+    renderState.edgePoints.geometry.dispose();
+    renderState.edgePointMaterial.dispose();
+  }
 
   const step = Number(meshDetailEl.value);
+  renderState.meshDepthTexture = renderState.activeDepthTexture;
+  renderState.meshDepthPixels = renderState.activeDepthPixels;
+  renderState.meshGapMask = renderState.repairedBaseGapMask || new Uint8Array(renderState.imageWidth * renderState.imageHeight);
   const geometry = buildMaskedPlaneGeometry(
     renderState.imageWidth,
     renderState.imageHeight,
-    renderState.activeDepthPixels,
+    renderState.meshDepthPixels,
     renderState.segmentMap,
+    renderState.segmentDepthMeans,
+    renderState.meshGapMask,
     step,
   );
 
@@ -297,7 +417,7 @@ function buildMesh() {
   const material = new THREE.ShaderMaterial({
     uniforms: {
       uColorTexture: { value: renderState.colorTexture },
-      uDepthTexture: { value: renderState.activeDepthTexture },
+      uDepthTexture: { value: renderState.meshDepthTexture },
       uSegmentMaskTexture: { value: renderState.segmentMaskTexture },
       uDepthScale: { value: Number(depthScaleEl.value) },
       uInvertDepth: { value: invertDepthEl.checked ? 1 : 0 },
@@ -311,17 +431,44 @@ function buildMesh() {
   const mesh = new THREE.Mesh(geometry, material);
   scene.add(mesh);
 
+  const edgeGeometry = buildRenderedBoundaryPointGeometry(
+    renderState.imageWidth,
+    renderState.imageHeight,
+    renderState.meshDepthPixels,
+    renderState.segmentMap,
+    renderState.meshGapMask,
+    step,
+  );
+  const edgePointMaterial = new THREE.ShaderMaterial({
+    uniforms: {
+      uDepthTexture: { value: renderState.meshDepthTexture },
+      uSegmentMaskTexture: { value: renderState.segmentMaskTexture },
+      uDepthScale: { value: Number(depthScaleEl.value) },
+      uInvertDepth: { value: invertDepthEl.checked ? 1 : 0 },
+      uPointSize: { value: 2.2 },
+    },
+    vertexShader: pointVertexShader,
+    fragmentShader: pointFragmentShader,
+    transparent: true,
+    depthWrite: false,
+  });
+  const edgePoints = new THREE.Points(edgeGeometry, edgePointMaterial);
+  scene.add(edgePoints);
+
   renderState.mesh = mesh;
   renderState.material = material;
+  renderState.edgePoints = edgePoints;
+  renderState.edgePointMaterial = edgePointMaterial;
 
   refreshStatusCounts();
 }
 
-function buildMaskedPlaneGeometry(width, height, depthPixels, segmentMap, step) {
+function buildMaskedPlaneGeometry(width, height, depthPixels, segmentMap, segmentDepthMeans, gapMask, step) {
   const cols = Math.floor((width - 1) / step) + 1;
   const rows = Math.floor((height - 1) / step) + 1;
   const positions = new Float32Array(cols * rows * 3);
   const uvs = new Float32Array(cols * rows * 2);
+  const vertexValid = new Uint8Array(cols * rows);
   const aspect = width / height;
   const halfWidth = aspect * 0.5;
   const halfHeight = 0.5;
@@ -338,6 +485,7 @@ function buildMaskedPlaneGeometry(width, height, depthPixels, segmentMap, step) 
       const px = Math.min(x * step, width - 1);
       const u = px / (width - 1);
       const sx = THREE.MathUtils.lerp(-halfWidth, halfWidth, u);
+      const index = y * cols + x;
 
       positions[p++] = sx;
       positions[p++] = sy;
@@ -345,6 +493,8 @@ function buildMaskedPlaneGeometry(width, height, depthPixels, segmentMap, step) 
 
       uvs[t++] = u;
       uvs[t++] = 1 - v;
+
+      vertexValid[index] = isValidDepth(depthPixels, width, px, py) && !gapMask[py * width + px] ? 1 : 0;
     }
   }
 
@@ -357,12 +507,12 @@ function buildMaskedPlaneGeometry(width, height, depthPixels, segmentMap, step) 
       const y0 = Math.min(y * step, height - 1);
       const y1 = Math.min((y + 1) * step, height - 1);
 
-      if (
-        !isValidDepth(depthPixels, width, x0, y0) ||
-        !isValidDepth(depthPixels, width, x1, y0) ||
-        !isValidDepth(depthPixels, width, x0, y1) ||
-        !isValidDepth(depthPixels, width, x1, y1)
-      ) {
+      const a = y * cols + x;
+      const b = a + 1;
+      const c = a + cols;
+      const d = c + 1;
+
+      if (!vertexValid[a] || !vertexValid[b] || !vertexValid[c] || !vertexValid[d]) {
         continue;
       }
 
@@ -370,6 +520,10 @@ function buildMaskedPlaneGeometry(width, height, depthPixels, segmentMap, step) 
       const segmentB = getSegmentIndex(segmentMap, width, x1, y0);
       const segmentC = getSegmentIndex(segmentMap, width, x0, y1);
       const segmentD = getSegmentIndex(segmentMap, width, x1, y1);
+      const depthA = depthPixels[y0 * width + x0];
+      const depthB = depthPixels[y0 * width + x1];
+      const depthC = depthPixels[y1 * width + x0];
+      const depthD = depthPixels[y1 * width + x1];
 
       if (
         segmentA < 0 ||
@@ -382,11 +536,6 @@ function buildMaskedPlaneGeometry(width, height, depthPixels, segmentMap, step) 
       ) {
         continue;
       }
-
-      const a = y * cols + x;
-      const b = a + 1;
-      const c = a + cols;
-      const d = c + 1;
 
       indices.push(a, c, b);
       indices.push(b, c, d);
@@ -401,6 +550,141 @@ function buildMaskedPlaneGeometry(width, height, depthPixels, segmentMap, step) 
   return geometry;
 }
 
+function buildRenderedBoundaryPointGeometry(width, height, depthPixels, segmentMap, gapMask, step) {
+  const cols = Math.floor((width - 1) / step) + 1;
+  const rows = Math.floor((height - 1) / step) + 1;
+  const aspect = width / height;
+  const halfWidth = aspect * 0.5;
+  const halfHeight = 0.5;
+  const vertexValid = new Uint8Array(cols * rows);
+  let pointCount = 0;
+
+  for (let gy = 0; gy < rows; gy += 1) {
+    const py = Math.min(gy * step, height - 1);
+    for (let gx = 0; gx < cols; gx += 1) {
+      const px = Math.min(gx * step, width - 1);
+      const index = gy * cols + gx;
+      vertexValid[index] = isValidDepth(depthPixels, width, px, py) && !gapMask[py * width + px] ? 1 : 0;
+    }
+  }
+
+  for (let gy = 0; gy < rows; gy += 1) {
+    for (let gx = 0; gx < cols; gx += 1) {
+      if (!isRenderedBoundaryVertex(gx, gy, cols, rows, width, height, step, segmentMap, vertexValid)) {
+        continue;
+      }
+      pointCount += 1;
+    }
+  }
+
+  const positions = new Float32Array(pointCount * 3);
+  const uvs = new Float32Array(pointCount * 2);
+  let p = 0;
+  let t = 0;
+
+  for (let gy = 0; gy < rows; gy += 1) {
+    const py = Math.min(gy * step, height - 1);
+    const v = py / (height - 1);
+    const sy = THREE.MathUtils.lerp(halfHeight, -halfHeight, v);
+
+    for (let gx = 0; gx < cols; gx += 1) {
+      if (!isRenderedBoundaryVertex(gx, gy, cols, rows, width, height, step, segmentMap, vertexValid)) {
+        continue;
+      }
+
+      const px = Math.min(gx * step, width - 1);
+      const u = px / (width - 1);
+      const sx = THREE.MathUtils.lerp(-halfWidth, halfWidth, u);
+
+      positions[p++] = sx;
+      positions[p++] = sy;
+      positions[p++] = 0;
+
+      uvs[t++] = u;
+      uvs[t++] = 1 - v;
+    }
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
+  return geometry;
+}
+
+function isRenderedBoundaryVertex(gridX, gridY, cols, rows, width, height, step, segmentMap, vertexValid) {
+  const vertexIndex = gridY * cols + gridX;
+  if (!vertexValid[vertexIndex]) {
+    return false;
+  }
+
+  const px = Math.min(gridX * step, width - 1);
+  const py = Math.min(gridY * step, height - 1);
+  const segmentIndex = segmentMap[py * width + px];
+  if (segmentIndex < 0) {
+    return false;
+  }
+
+  const offsets = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+  ];
+
+  for (let i = 0; i < offsets.length; i += 1) {
+    const [dx, dy] = offsets[i];
+    const ngx = gridX + dx;
+    const ngy = gridY + dy;
+    if (ngx < 0 || ngx >= cols || ngy < 0 || ngy >= rows) {
+      return true;
+    }
+
+    const neighborVertexIndex = ngy * cols + ngx;
+    if (!vertexValid[neighborVertexIndex]) {
+      return true;
+    }
+
+    const npx = Math.min(ngx * step, width - 1);
+    const npy = Math.min(ngy * step, height - 1);
+    if (segmentMap[npy * width + npx] !== segmentIndex) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isSegmentContourPixel(segmentMap, width, height, index) {
+  const segmentIndex = segmentMap[index];
+  if (segmentIndex < 0) {
+    return false;
+  }
+
+  const x = index % width;
+  const y = Math.floor(index / width);
+  const offsets = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+  ];
+
+  for (let i = 0; i < offsets.length; i += 1) {
+    const [dx, dy] = offsets[i];
+    const sx = x + dx;
+    const sy = y + dy;
+    if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+      return true;
+    }
+
+    if (segmentMap[sy * width + sx] !== segmentIndex) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function isValidDepth(depthPixels, width, x, y) {
   return depthPixels[y * width + x] > 0;
 }
@@ -409,10 +693,1145 @@ function getSegmentIndex(segmentMap, width, x, y) {
   return segmentMap[y * width + x];
 }
 
+function computeSegmentDepthMeans(depthPixels, segmentMap, segmentCount) {
+  const sums = new Float32Array(segmentCount);
+  const counts = new Uint32Array(segmentCount);
+
+  for (let index = 0; index < depthPixels.length; index += 1) {
+    const segmentIndex = segmentMap[index];
+    const depth = depthPixels[index];
+    if (segmentIndex < 0 || depth <= 0) {
+      continue;
+    }
+    sums[segmentIndex] += depth;
+    counts[segmentIndex] += 1;
+  }
+
+  const means = new Float32Array(segmentCount);
+  for (let i = 0; i < segmentCount; i += 1) {
+    means[i] = counts[i] > 0 ? sums[i] / counts[i] : 0;
+  }
+  return means;
+}
+
+function repairDepthDiscontinuities(sourcePixels, segmentMap, segmentDepthMeans, width, height, threshold) {
+  let contourAligned = sourcePixels;
+  if (contourRepairEl.checked) {
+    const contourBandMask = buildSegmentContourBandMask(segmentMap, width, height, 2);
+    const contourFilled = inpaintSegmentDepthGaps(
+      sourcePixels,
+      segmentMap,
+      segmentDepthMeans,
+      width,
+      height,
+      contourBandMask,
+    );
+    contourAligned = alignContourDepthsToInterior(
+      contourFilled,
+      segmentMap,
+      width,
+      height,
+      threshold,
+    );
+  }
+  const repairedMeans = computeSegmentDepthMeans(
+    contourAligned,
+    segmentMap,
+    segmentDepthMeans.length,
+  );
+  const edgeMask = detectSegmentDepthEdges(
+    contourAligned,
+    segmentMap,
+    repairedMeans,
+    width,
+    height,
+    threshold,
+  );
+  const gapMask = detectSegmentDiscontinuityGaps(
+    contourAligned,
+    segmentMap,
+    repairedMeans,
+    width,
+    height,
+    threshold,
+  );
+  const inpainted = inpaintSegmentDepthGaps(
+    contourAligned,
+    segmentMap,
+    repairedMeans,
+    width,
+    height,
+    gapMask,
+  );
+
+  const resources = createDepthTextureResources(width, height, inpainted);
+  return {
+    ...resources,
+    edgeMask,
+    gapMask,
+  };
+}
+
+function buildSegmentContourBandMask(segmentMap, width, height, passes) {
+  const contourMask = new Uint8Array(segmentMap.length);
+  const mask = new Uint8Array(segmentMap.length);
+
+  for (let index = 0; index < segmentMap.length; index += 1) {
+    if (isSegmentContourPixel(segmentMap, width, height, index)) {
+      contourMask[index] = 1;
+    }
+  }
+
+  mask.set(contourMask);
+  expandGapMaskWithinSegment(mask, segmentMap, width, height, passes);
+
+  for (let index = 0; index < mask.length; index += 1) {
+    if (contourMask[index]) {
+      mask[index] = 0;
+    }
+  }
+
+  return mask;
+}
+
+function alignContourDepthsToInterior(sourcePixels, segmentMap, width, height, threshold) {
+  const aligned = sourcePixels.slice();
+
+  for (let index = 0; index < aligned.length; index += 1) {
+    if (!isSegmentContourPixel(segmentMap, width, height, index) || aligned[index] <= 0) {
+      continue;
+    }
+
+    const segmentIndex = segmentMap[index];
+    if (segmentIndex < 0) {
+      continue;
+    }
+
+    const interiorDepths = collectSegmentInteriorRayDepths(
+      aligned,
+      segmentMap,
+      width,
+      height,
+      index,
+      segmentIndex,
+      6,
+    );
+    if (interiorDepths.length < 3) {
+      continue;
+    }
+
+    interiorDepths.sort((a, b) => a - b);
+    const median = interiorDepths[(interiorDepths.length - 1) >> 1];
+    const deviations = interiorDepths.map((value) => Math.abs(value - median)).sort((a, b) => a - b);
+    const mad = deviations[(deviations.length - 1) >> 1];
+    const localThreshold = Math.max(2, threshold * 0.28, mad * 1.35 + 1);
+    const depthDelta = aligned[index] - median;
+
+    if (Math.abs(depthDelta) > localThreshold) {
+      aligned[index] = median;
+    }
+  }
+
+  return aligned;
+}
+
+function detectSegmentDepthEdges(sourcePixels, segmentMap, segmentDepthMeans, width, height, threshold) {
+  const edgeMask = new Uint8Array(sourcePixels.length);
+  const offsets = [
+    [1, 0],
+    [0, 1],
+    [1, 1],
+    [-1, 1],
+    [2, 0],
+    [0, 2],
+  ];
+  const edgeThreshold = Math.max(2, threshold * 0.55);
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      const depth = sourcePixels[index];
+      const segmentIndex = segmentMap[index];
+      if (depth <= 0 || segmentIndex < 0) {
+        continue;
+      }
+
+      const mean = segmentDepthMeans[segmentIndex];
+      for (let i = 0; i < offsets.length; i += 1) {
+        const [dx, dy] = offsets[i];
+        const sx = x + dx;
+        const sy = y + dy;
+        if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+          continue;
+        }
+
+        const sampleIndex = sy * width + sx;
+        if (segmentMap[sampleIndex] !== segmentIndex) {
+          continue;
+        }
+
+        const sampleDepth = sourcePixels[sampleIndex];
+        if (sampleDepth <= 0) {
+          continue;
+        }
+
+        if (!depthDifferenceWithinThreshold(depth, sampleDepth, edgeThreshold, mean, mean)) {
+          edgeMask[index] = 1;
+          edgeMask[sampleIndex] = 1;
+        }
+      }
+    }
+  }
+
+  return edgeMask;
+}
+
+function detectSegmentDiscontinuityGaps(sourcePixels, segmentMap, segmentDepthMeans, width, height, threshold) {
+  const gapMask = new Uint8Array(sourcePixels.length);
+  const visited = new Uint8Array(sourcePixels.length);
+  const linkThreshold = Math.max(2, threshold * 0.55);
+
+  for (let segmentIndex = 0; segmentIndex < renderState.segmentPixels.length; segmentIndex += 1) {
+    const segmentPixels = renderState.segmentPixels[segmentIndex];
+    if (!segmentPixels || segmentPixels.length === 0) {
+      continue;
+    }
+
+    markContourDepthOutliers(
+      gapMask,
+      sourcePixels,
+      segmentMap,
+      width,
+      height,
+      segmentIndex,
+      segmentPixels,
+      threshold,
+    );
+
+    const components = collectSegmentDepthComponents(
+      sourcePixels,
+      segmentMap,
+      segmentDepthMeans,
+      width,
+      height,
+      segmentIndex,
+      segmentPixels,
+      visited,
+      linkThreshold,
+    );
+
+    if (components.length <= 1) {
+      continue;
+    }
+
+    const stats = computeSegmentAdjustedDepthStats(
+      sourcePixels,
+      segmentDepthMeans[segmentIndex],
+      segmentPixels,
+    );
+    const targetAdjustedDepth = stats.median;
+    const targetThreshold = Math.max(4, threshold * 0.65, stats.mad * 2 + 2);
+
+    let dominant = components[0];
+    let dominantScore = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < components.length; i += 1) {
+      const component = components[i];
+      const distance = Math.abs(component.adjustedMean - targetAdjustedDepth);
+      const score = distance - component.size * 0.002;
+      if (score < dominantScore) {
+        dominantScore = score;
+        dominant = component;
+      }
+    }
+
+    for (let i = 0; i < components.length; i += 1) {
+      const component = components[i];
+      if (component === dominant) {
+        continue;
+      }
+
+      const adjustedDistance = Math.abs(component.adjustedMean - targetAdjustedDepth);
+      const isSmall = component.size <= Math.max(8, dominant.size * 0.35);
+      const isFar = adjustedDistance > targetThreshold;
+
+      if (!isSmall && !isFar) {
+        continue;
+      }
+
+      for (let j = 0; j < component.indices.length; j += 1) {
+        gapMask[component.indices[j]] = 1;
+      }
+    }
+  }
+
+  expandGapMaskWithinSegment(gapMask, segmentMap, width, height, 1);
+  return gapMask;
+}
+
+function markContourDepthOutliers(gapMask, sourcePixels, segmentMap, width, height, segmentIndex, segmentPixels, threshold) {
+  for (let i = 0; i < segmentPixels.length; i += 1) {
+    const index = segmentPixels[i];
+    const depth = sourcePixels[index];
+    if (depth <= 0 || !isSegmentContourPixel(segmentMap, width, height, index)) {
+      continue;
+    }
+
+    const interiorDepths = collectSegmentInteriorRayDepths(
+      sourcePixels,
+      segmentMap,
+      width,
+      height,
+      index,
+      segmentIndex,
+      6,
+    );
+
+    if (interiorDepths.length < 3) {
+      continue;
+    }
+
+    interiorDepths.sort((a, b) => a - b);
+    const median = interiorDepths[(interiorDepths.length - 1) >> 1];
+    const deviations = interiorDepths.map((value) => Math.abs(value - median)).sort((a, b) => a - b);
+    const mad = deviations[(deviations.length - 1) >> 1];
+    const localThreshold = Math.max(3, threshold * 0.45, mad * 1.75 + 1.5);
+
+    if (depth - median > localThreshold) {
+      gapMask[index] = 1;
+    }
+  }
+}
+
+function collectSegmentInteriorRayDepths(sourcePixels, segmentMap, width, height, centerIndex, segmentIndex, radius) {
+  const x = centerIndex % width;
+  const y = Math.floor(centerIndex / width);
+  const values = [];
+  const inwardDirections = [];
+  const cardinalOffsets = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+  ];
+
+  for (let i = 0; i < cardinalOffsets.length; i += 1) {
+    const [dx, dy] = cardinalOffsets[i];
+    const outsideX = x + dx;
+    const outsideY = y + dy;
+    if (
+      outsideX >= 0 &&
+      outsideX < width &&
+      outsideY >= 0 &&
+      outsideY < height &&
+      segmentMap[outsideY * width + outsideX] === segmentIndex
+    ) {
+      continue;
+    }
+
+    const insideX = x - dx;
+    const insideY = y - dy;
+    if (
+      insideX < 0 ||
+      insideX >= width ||
+      insideY < 0 ||
+      insideY >= height
+    ) {
+      continue;
+    }
+
+    if (segmentMap[insideY * width + insideX] === segmentIndex) {
+      inwardDirections.push([-dx, -dy]);
+    }
+  }
+
+  if (inwardDirections.length === 0) {
+    for (let i = 0; i < cardinalOffsets.length; i += 1) {
+      const [dx, dy] = cardinalOffsets[i];
+      const sx = x + dx;
+      const sy = y + dy;
+      if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+        continue;
+      }
+      if (segmentMap[sy * width + sx] === segmentIndex) {
+        inwardDirections.push([dx, dy]);
+      }
+    }
+  }
+
+  if (inwardDirections.length === 0) {
+    return values;
+  }
+
+  for (let i = 0; i < inwardDirections.length; i += 1) {
+    const [dx, dy] = inwardDirections[i];
+    let collectedOnRay = 0;
+    for (let step = 1; step <= radius; step += 1) {
+      const sx = x + dx * step;
+      const sy = y + dy * step;
+      if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+        break;
+      }
+
+      const sampleIndex = sy * width + sx;
+      if (segmentMap[sampleIndex] !== segmentIndex) {
+        break;
+      }
+      if (isSegmentContourPixel(segmentMap, width, height, sampleIndex)) {
+        continue;
+      }
+
+      const sampleDepth = sourcePixels[sampleIndex];
+      if (sampleDepth <= 0) {
+        continue;
+      }
+
+      values.push(sampleDepth);
+      collectedOnRay += 1;
+      if (collectedOnRay >= 3) {
+        break;
+      }
+    }
+  }
+
+  return values;
+}
+
+function computeSegmentAdjustedDepthStats(sourcePixels, segmentMean, segmentPixels) {
+  const adjusted = [];
+
+  for (let i = 0; i < segmentPixels.length; i += 1) {
+    const depth = sourcePixels[segmentPixels[i]];
+    if (depth <= 0) {
+      continue;
+    }
+    adjusted.push(depth - segmentMean);
+  }
+
+  if (adjusted.length === 0) {
+    return { median: 0, mad: 0 };
+  }
+
+  adjusted.sort((a, b) => a - b);
+  const median = adjusted[(adjusted.length - 1) >> 1];
+  const deviations = adjusted.map((value) => Math.abs(value - median)).sort((a, b) => a - b);
+  const mad = deviations[(deviations.length - 1) >> 1];
+  return { median, mad };
+}
+
+function collectSegmentDepthComponents(sourcePixels, segmentMap, segmentDepthMeans, width, height, segmentIndex, segmentPixels, visited, linkThreshold) {
+  const components = [];
+  const queue = new Int32Array(segmentPixels.length);
+  const segmentMean = segmentDepthMeans[segmentIndex];
+
+  for (let i = 0; i < segmentPixels.length; i += 1) {
+    const startIndex = segmentPixels[i];
+    if (visited[startIndex] || sourcePixels[startIndex] <= 0) {
+      continue;
+    }
+
+    visited[startIndex] = 1;
+    queue[0] = startIndex;
+    let head = 0;
+    let tail = 1;
+    const indices = [];
+    let adjustedSum = 0;
+
+    while (head < tail) {
+      const index = queue[head++];
+      indices.push(index);
+      adjustedSum += sourcePixels[index] - segmentMean;
+
+      const x = index % width;
+      const y = Math.floor(index / width);
+      const neighbors = [
+        [x - 1, y],
+        [x + 1, y],
+        [x, y - 1],
+        [x, y + 1],
+      ];
+
+      for (let n = 0; n < neighbors.length; n += 1) {
+        const [nx, ny] = neighbors[n];
+        if (nx < 0 || nx >= width || ny < 0 || ny >= height) {
+          continue;
+        }
+
+        const neighborIndex = ny * width + nx;
+        if (segmentMap[neighborIndex] !== segmentIndex || visited[neighborIndex]) {
+          continue;
+        }
+
+        const neighborDepth = sourcePixels[neighborIndex];
+        if (neighborDepth <= 0) {
+          continue;
+        }
+
+        const currentBoundary = isSegmentBoundaryPixel(segmentMap, width, height, index, segmentIndex);
+        const neighborBoundary = isSegmentBoundaryPixel(segmentMap, width, height, neighborIndex, segmentIndex);
+        const localLinkThreshold = currentBoundary || neighborBoundary
+          ? Math.max(1.5, linkThreshold * 0.35)
+          : linkThreshold;
+
+        if (!depthDifferenceWithinThreshold(sourcePixels[index], neighborDepth, localLinkThreshold, segmentMean, segmentMean)) {
+          continue;
+        }
+
+        if ((currentBoundary || neighborBoundary) && !hasSharedSegmentDepthSupport(
+          sourcePixels,
+          segmentMap,
+          width,
+          height,
+          index,
+          neighborIndex,
+          segmentIndex,
+          segmentMean,
+          localLinkThreshold,
+        )) {
+          continue;
+        }
+
+        visited[neighborIndex] = 1;
+        queue[tail++] = neighborIndex;
+      }
+    }
+
+    components.push({
+      indices,
+      size: indices.length,
+      adjustedMean: adjustedSum / Math.max(1, indices.length),
+    });
+  }
+
+  return components;
+}
+
+function isSegmentBoundaryPixel(segmentMap, width, height, index, segmentIndex) {
+  const x = index % width;
+  const y = Math.floor(index / width);
+  const offsets = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+  ];
+
+  for (let i = 0; i < offsets.length; i += 1) {
+    const [dx, dy] = offsets[i];
+    const sx = x + dx;
+    const sy = y + dy;
+    if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+      continue;
+    }
+
+    if (segmentMap[sy * width + sx] !== segmentIndex) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function hasSharedSegmentDepthSupport(sourcePixels, segmentMap, width, height, indexA, indexB, segmentIndex, segmentMean, threshold) {
+  const ax = indexA % width;
+  const ay = Math.floor(indexA / width);
+  const bx = indexB % width;
+  const by = Math.floor(indexB / width);
+  const centerDepth = 0.5 * (sourcePixels[indexA] + sourcePixels[indexB]);
+  let support = 0;
+
+  for (let sy = Math.max(0, Math.min(ay, by) - 1); sy <= Math.min(height - 1, Math.max(ay, by) + 1); sy += 1) {
+    for (let sx = Math.max(0, Math.min(ax, bx) - 1); sx <= Math.min(width - 1, Math.max(ax, bx) + 1); sx += 1) {
+      const sampleIndex = sy * width + sx;
+      if (sampleIndex === indexA || sampleIndex === indexB || segmentMap[sampleIndex] !== segmentIndex) {
+        continue;
+      }
+
+      const sampleDepth = sourcePixels[sampleIndex];
+      if (sampleDepth <= 0) {
+        continue;
+      }
+
+      if (depthDifferenceWithinThreshold(sampleDepth, centerDepth, threshold, segmentMean, segmentMean)) {
+        support += 1;
+        if (support >= 2) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+function expandGapMaskWithinSegment(gapMask, segmentMap, width, height, passes) {
+  const offsets = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+    [-1, -1],
+    [1, -1],
+    [-1, 1],
+    [1, 1],
+  ];
+
+  for (let pass = 0; pass < passes; pass += 1) {
+    const next = gapMask.slice();
+
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const index = y * width + x;
+        if (gapMask[index]) {
+          continue;
+        }
+
+        const segmentIndex = segmentMap[index];
+        if (segmentIndex < 0) {
+          continue;
+        }
+
+        for (const [dx, dy] of offsets) {
+          const sx = x + dx;
+          const sy = y + dy;
+          if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+            continue;
+          }
+
+          const sampleIndex = sy * width + sx;
+          if (gapMask[sampleIndex] && segmentMap[sampleIndex] === segmentIndex) {
+            next[index] = 1;
+            break;
+          }
+        }
+      }
+    }
+
+    gapMask.set(next);
+  }
+}
+
+function inpaintSegmentDepthGaps(sourcePixels, segmentMap, segmentDepthMeans, width, height, gapMask) {
+  const filled = sourcePixels.slice();
+  const totalPixels = width * height;
+  const queued = new Uint8Array(totalPixels);
+  const queue = new Int32Array(totalPixels);
+  let head = 0;
+  let tail = 0;
+  let remaining = 0;
+
+  for (let index = 0; index < filled.length; index += 1) {
+    if (gapMask[index]) {
+      filled[index] = 0;
+      remaining += 1;
+    }
+  }
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (!gapMask[index]) {
+        continue;
+      }
+
+      const segmentIndex = segmentMap[index];
+      if (segmentIndex < 0) {
+        continue;
+      }
+
+      if (hasFilledSegmentNeighbor(filled, segmentMap, width, height, x, y, segmentIndex)) {
+        queue[tail++] = index;
+        queued[index] = 1;
+      }
+    }
+  }
+
+  while (head < tail && remaining > 0) {
+    const index = queue[head++];
+    if (!gapMask[index] || filled[index] > 0) {
+      continue;
+    }
+
+    const x = index % width;
+    const y = Math.floor(index / width);
+    const segmentIndex = segmentMap[index];
+    if (segmentIndex < 0) {
+      continue;
+    }
+
+    const replacement = sampleSegmentNeighborDepth(
+      filled,
+      segmentMap,
+      segmentDepthMeans,
+      width,
+      height,
+      x,
+      y,
+      segmentIndex,
+    );
+
+    if (replacement <= 0) {
+      continue;
+    }
+
+    filled[index] = replacement;
+    remaining -= 1;
+    tail = enqueueGapNeighbors(queue, queued, gapMask, segmentMap, width, height, x, y, segmentIndex, tail);
+  }
+
+  if (remaining > 0) {
+    for (let index = 0; index < totalPixels; index += 1) {
+      if (!gapMask[index] || filled[index] > 0) {
+        continue;
+      }
+
+      const segmentIndex = segmentMap[index];
+      if (segmentIndex < 0) {
+        continue;
+      }
+
+      const replacement = sampleSegmentNeighborDepth(
+        filled,
+        segmentMap,
+        segmentDepthMeans,
+        width,
+        height,
+        index % width,
+        Math.floor(index / width),
+        segmentIndex,
+      );
+
+      filled[index] = replacement > 0
+        ? replacement
+        : sampleSegmentMeanDepth(sourcePixels, segmentMap, segmentDepthMeans, width, height, index % width, Math.floor(index / width), segmentIndex);
+    }
+  }
+
+  return filled;
+}
+
+function enqueueGapNeighbors(queue, queued, gapMask, segmentMap, width, height, x, y, segmentIndex, tail) {
+  const offsets = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+    [-1, -1],
+    [1, -1],
+    [-1, 1],
+    [1, 1],
+  ];
+
+  let nextTail = tail;
+
+  for (const [dx, dy] of offsets) {
+    const sx = x + dx;
+    const sy = y + dy;
+    if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+      continue;
+    }
+
+    const sampleIndex = sy * width + sx;
+    if (!gapMask[sampleIndex] || queued[sampleIndex] || segmentMap[sampleIndex] !== segmentIndex) {
+      continue;
+    }
+
+    queue[nextTail++] = sampleIndex;
+    queued[sampleIndex] = 1;
+  }
+
+  return nextTail;
+}
+
+function hasFilledSegmentNeighbor(sourcePixels, segmentMap, width, height, x, y, segmentIndex) {
+  const offsets = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+    [-1, -1],
+    [1, -1],
+    [-1, 1],
+    [1, 1],
+  ];
+
+  for (const [dx, dy] of offsets) {
+    const sx = x + dx;
+    const sy = y + dy;
+    if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+      continue;
+    }
+
+    const sampleIndex = sy * width + sx;
+    if (segmentMap[sampleIndex] === segmentIndex && sourcePixels[sampleIndex] > 0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function pixelHasDepthJump(depthPixels, segmentMap, segmentDepthMeans, width, height, px, py, threshold) {
+  const center = depthPixels[py * width + px];
+  if (center <= 0) {
+    return true;
+  }
+
+  const centerSegmentIndex = segmentMap[py * width + px];
+  if (centerSegmentIndex < 0) {
+    return true;
+  }
+
+  const centerMean = segmentDepthMeans[centerSegmentIndex];
+  const offsets = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+    [-1, -1],
+    [1, -1],
+    [-1, 1],
+    [1, 1],
+    [-2, 0],
+    [2, 0],
+    [0, -2],
+    [0, 2],
+  ];
+
+  let minDepth = center;
+  let maxDepth = center;
+  let minMean = centerMean;
+  let maxMean = centerMean;
+  let comparableNeighbors = 0;
+
+  for (const [dx, dy] of offsets) {
+    const x = px + dx;
+    const y = py + dy;
+    if (x < 0 || x >= width || y < 0 || y >= height) {
+      continue;
+    }
+
+    const sampleIndex = y * width + x;
+    if (segmentMap[sampleIndex] !== centerSegmentIndex) {
+      continue;
+    }
+
+    const depth = depthPixels[sampleIndex];
+    if (depth <= 0) {
+      continue;
+    }
+
+    const sampleMean = segmentDepthMeans[centerSegmentIndex];
+    comparableNeighbors += 1;
+
+    if (depth - sampleMean < minDepth - minMean) {
+      minDepth = depth;
+      minMean = sampleMean;
+    }
+    if (depth - sampleMean > maxDepth - maxMean) {
+      maxDepth = depth;
+      maxMean = sampleMean;
+    }
+
+    if (!depthDifferenceWithinThreshold(depth, center, threshold, sampleMean, centerMean)) {
+      return true;
+    }
+  }
+
+  if (comparableNeighbors < 2) {
+    return false;
+  }
+
+  return !depthDifferenceWithinThreshold(maxDepth, minDepth, threshold, maxMean, minMean);
+}
+
+function sampleSegmentNeighborDepth(sourcePixels, segmentMap, segmentDepthMeans, width, height, x, y, segmentIndex) {
+  const centerMean = segmentDepthMeans[segmentIndex];
+  let weightSum = 0;
+  let adjustedDepthSum = 0;
+  let sampleCount = 0;
+  const offsets = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+    [-1, -1],
+    [1, -1],
+    [-1, 1],
+    [1, 1],
+  ];
+
+  for (const [ox, oy] of offsets) {
+    const sx = x + ox;
+    const sy = y + oy;
+    if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+      continue;
+    }
+
+    const sampleIndex = sy * width + sx;
+    if (segmentMap[sampleIndex] !== segmentIndex) {
+      continue;
+    }
+
+    const sampleDepth = sourcePixels[sampleIndex];
+    if (sampleDepth <= 0) {
+      continue;
+    }
+
+    const distanceSq = ox * ox + oy * oy;
+    const weight = 1 / Math.max(1, distanceSq);
+    adjustedDepthSum += (sampleDepth - centerMean) * weight;
+    weightSum += weight;
+    sampleCount += 1;
+  }
+
+  if (sampleCount < 1 || weightSum <= 0) {
+    return 0;
+  }
+
+  const depth = Math.round(centerMean + adjustedDepthSum / weightSum);
+  return THREE.MathUtils.clamp(depth, 1, 255);
+}
+
+function sampleSegmentMeanDepth(sourcePixels, segmentMap, segmentDepthMeans, width, height, x, y, segmentIndex) {
+  const centerMean = segmentDepthMeans[segmentIndex];
+  const segmentPixels = renderState.segmentPixels[segmentIndex] || [];
+  const maxSamples = 192;
+  const stride = Math.max(1, Math.ceil(segmentPixels.length / maxSamples));
+  let weightSum = 0;
+  let adjustedDepthSum = 0;
+  let sampleCount = 0;
+
+  for (let i = 0; i < segmentPixels.length; i += stride) {
+    const sampleIndex = segmentPixels[i];
+    const sampleDepth = sourcePixels[sampleIndex];
+    if (sampleDepth <= 0) {
+      continue;
+    }
+
+    const sx = sampleIndex % width;
+    const sy = Math.floor(sampleIndex / width);
+    const dx = sx - x;
+    const dy = sy - y;
+    const distanceSq = dx * dx + dy * dy;
+    const weight = 1 / Math.max(1, distanceSq);
+    adjustedDepthSum += (sampleDepth - centerMean) * weight;
+    weightSum += weight;
+    sampleCount += 1;
+  }
+
+  if (sampleCount > 0 && weightSum > 0) {
+    return THREE.MathUtils.clamp(Math.round(centerMean + adjustedDepthSum / weightSum), 1, 255);
+  }
+
+  return centerMean > 0 ? THREE.MathUtils.clamp(Math.round(centerMean), 1, 255) : 0;
+}
+
+function findSegmentDepthReplacement(sourcePixels, segmentMap, segmentDepthMeans, width, height, x, y, segmentIndex, centerDepth, threshold, closeTolerance) {
+  const similar = [];
+  const different = [];
+
+  for (let oy = -2; oy <= 2; oy += 1) {
+    for (let ox = -2; ox <= 2; ox += 1) {
+      if (ox === 0 && oy === 0) {
+        continue;
+      }
+
+      const sx = x + ox;
+      const sy = y + oy;
+      if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+        continue;
+      }
+
+      const sampleIndex = sy * width + sx;
+      if (segmentMap[sampleIndex] !== segmentIndex) {
+        continue;
+      }
+
+      const sampleDepth = sourcePixels[sampleIndex];
+      if (sampleDepth <= 0) {
+        continue;
+      }
+
+      if (
+        depthDifferenceWithinThreshold(
+          sampleDepth,
+          centerDepth,
+          closeTolerance,
+          segmentDepthMeans[segmentIndex],
+          segmentDepthMeans[segmentIndex],
+        )
+      ) {
+        similar.push(sampleDepth);
+      } else if (
+        !depthDifferenceWithinThreshold(
+          sampleDepth,
+          centerDepth,
+          threshold,
+          segmentDepthMeans[segmentIndex],
+          segmentDepthMeans[segmentIndex],
+        )
+      ) {
+        different.push(sampleDepth);
+      }
+    }
+  }
+
+  if (similar.length >= 3 || different.length < 3) {
+    return 0;
+  }
+
+  different.sort((a, b) => a - b);
+  return different[(different.length - 1) >> 1];
+}
+
+function depthDifferenceWithinThreshold(a, b, absThreshold, meanA = 0, meanB = 0) {
+  const adjustedA = a - meanA;
+  const adjustedB = b - meanB;
+  const scale = Math.max(relativeDepthFloor, Math.abs(adjustedA), Math.abs(adjustedB));
+  return Math.abs(adjustedA - adjustedB) <= absThreshold + scale * relativeDepthFactor;
+}
+
+function isDepthContinuous(a, b, threshold, meanA = 0, meanB = 0) {
+  return depthDifferenceWithinThreshold(a, b, threshold, meanA, meanB);
+}
+
+function invalidateDiscontinuousVertices(depthPixels, segmentMap, segmentDepthMeans, gapMask, width, height, cols, rows, step, threshold, vertexValid) {
+  for (let y = 0; y < rows; y += 1) {
+    for (let x = 0; x < cols; x += 1) {
+      const px = Math.min(x * step, width - 1);
+      const py = Math.min(y * step, height - 1);
+      const index = y * cols + x;
+
+      if (!vertexValid[index]) {
+        continue;
+      }
+
+      if (gapMask[py * width + px]) {
+        continue;
+      }
+
+      if (vertexHasDepthJump(depthPixels, segmentMap, segmentDepthMeans, width, height, px, py, threshold)) {
+        vertexValid[index] = 0;
+      }
+    }
+  }
+}
+
+function vertexHasDepthJump(depthPixels, segmentMap, segmentDepthMeans, width, height, px, py, threshold) {
+  return pixelHasDepthJump(depthPixels, segmentMap, segmentDepthMeans, width, height, px, py, threshold);
+}
+
+function isTriangleDepthContinuous(depthPixels, segmentMap, segmentDepthMeans, gapMask, width, ax, ay, bx, by, cx, cy, edgeThreshold, centerThreshold) {
+  if (
+    gapMask[ay * width + ax] ||
+    gapMask[by * width + bx] ||
+    gapMask[cy * width + cx]
+  ) {
+    return true;
+  }
+
+  const depthA = depthPixels[ay * width + ax];
+  const depthB = depthPixels[by * width + bx];
+  const depthC = depthPixels[cy * width + cx];
+  const meanA = getSegmentDepthMean(segmentMap, segmentDepthMeans, width, ax, ay);
+  const meanB = getSegmentDepthMean(segmentMap, segmentDepthMeans, width, bx, by);
+  const meanC = getSegmentDepthMean(segmentMap, segmentDepthMeans, width, cx, cy);
+
+  if (
+    !isDepthContinuous(depthA, depthB, edgeThreshold, meanA, meanB) ||
+    !isDepthContinuous(depthB, depthC, edgeThreshold, meanB, meanC) ||
+    !isDepthContinuous(depthC, depthA, edgeThreshold, meanC, meanA)
+  ) {
+    return false;
+  }
+
+  if (
+    depthLineHasDiscontinuity(depthPixels, segmentMap, segmentDepthMeans, width, ax, ay, bx, by, edgeThreshold) ||
+    depthLineHasDiscontinuity(depthPixels, segmentMap, segmentDepthMeans, width, bx, by, cx, cy, edgeThreshold) ||
+    depthLineHasDiscontinuity(depthPixels, segmentMap, segmentDepthMeans, width, cx, cy, ax, ay, edgeThreshold)
+  ) {
+    return false;
+  }
+
+  const centerX = Math.round((ax + bx + cx) / 3);
+  const centerY = Math.round((ay + by + cy) / 3);
+  if (gapMask[centerY * width + centerX]) {
+    return true;
+  }
+  const centerDepth = depthPixels[centerY * width + centerX];
+  const centerMean = getSegmentDepthMean(segmentMap, segmentDepthMeans, width, centerX, centerY);
+  if (
+    centerDepth <= 0 ||
+    !isDepthContinuous(centerDepth, depthA, centerThreshold, centerMean, meanA) ||
+    !isDepthContinuous(centerDepth, depthB, centerThreshold, centerMean, meanB) ||
+    !isDepthContinuous(centerDepth, depthC, centerThreshold, centerMean, meanC)
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function getSegmentDepthMean(segmentMap, segmentDepthMeans, width, x, y) {
+  const segmentIndex = segmentMap[y * width + x];
+  return segmentIndex >= 0 ? segmentDepthMeans[segmentIndex] : 0;
+}
+
+function depthLineHasDiscontinuity(depthPixels, segmentMap, segmentDepthMeans, width, x0, y0, x1, y1, threshold) {
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  const steps = Math.max(Math.abs(dx), Math.abs(dy));
+  let prevDepth = depthPixels[y0 * width + x0];
+  let prevMean = getSegmentDepthMean(segmentMap, segmentDepthMeans, width, x0, y0);
+  let minDepth = prevDepth;
+  let maxDepth = prevDepth;
+  let minMean = prevMean;
+  let maxMean = prevMean;
+
+  for (let step = 1; step <= steps; step += 1) {
+    const t = step / steps;
+    const x = Math.round(x0 + dx * t);
+    const y = Math.round(y0 + dy * t);
+    const depth = depthPixels[y * width + x];
+    if (depth <= 0) {
+      return true;
+    }
+
+    minDepth = Math.min(minDepth, depth);
+    maxDepth = Math.max(maxDepth, depth);
+    const currentMean = getSegmentDepthMean(segmentMap, segmentDepthMeans, width, x, y);
+    if (depth - currentMean < minDepth - minMean) {
+      minDepth = depth;
+      minMean = currentMean;
+    }
+    if (depth - currentMean > maxDepth - maxMean) {
+      maxDepth = depth;
+      maxMean = currentMean;
+    }
+
+    if (
+      !depthDifferenceWithinThreshold(depth, prevDepth, threshold, currentMean, prevMean) ||
+      !depthDifferenceWithinThreshold(maxDepth, minDepth, threshold, maxMean, minMean)
+    ) {
+      return true;
+    }
+
+    prevDepth = depth;
+    prevMean = currentMean;
+  }
+
+  return false;
+}
+
 function loadTexture(url) {
   return new Promise((resolve, reject) => {
     loader.load(url, resolve, undefined, reject);
   });
+}
+
+function withCacheBust(url) {
+  const separator = url.includes("?") ? "&" : "?";
+  return `${url}${separator}v=${cacheBustToken}`;
 }
 
 async function loadDepthPixels(url) {
@@ -498,29 +1917,53 @@ async function replaceImage(kind, file) {
       return;
     }
 
-    const [texture, depthPixels] = await Promise.all([
-      loadTexture(objectUrl),
-      loadDepthPixels(objectUrl),
-    ]);
+    if (kind === "depth") {
+      const [texture, depthPixels] = await Promise.all([
+        loadTexture(objectUrl),
+        loadDepthPixels(objectUrl),
+      ]);
 
+      if (
+        texture.image.width !== renderState.imageWidth ||
+        texture.image.height !== renderState.imageHeight
+      ) {
+        throw new Error("Depth image size must match the current color image.");
+      }
+
+      texture.minFilter = THREE.LinearFilter;
+      texture.magFilter = THREE.LinearFilter;
+
+      if (renderState.sourceDepthTexture) {
+        renderState.sourceDepthTexture.dispose();
+      }
+
+      revokeObjectUrl("depth");
+      renderState.sourceDepthTexture = texture;
+      renderState.sourceDepthPixels = depthPixels;
+      renderState.depthObjectUrl = objectUrl;
+      rebuildSegments();
+      rebuildDepthModeResources();
+      buildMesh();
+      syncThumbs();
+      return;
+    }
+
+    const segmentImage = await loadRgbPixels(objectUrl);
     if (
-      texture.image.width !== renderState.imageWidth ||
-      texture.image.height !== renderState.imageHeight
+      segmentImage.width !== renderState.imageWidth ||
+      segmentImage.height !== renderState.imageHeight
     ) {
-      throw new Error("Depth image size must match the current color image.");
+      throw new Error("Segment image size must match the current color/depth image.");
     }
 
-    texture.minFilter = THREE.LinearFilter;
-    texture.magFilter = THREE.LinearFilter;
-
-    if (renderState.sourceDepthTexture) {
-      renderState.sourceDepthTexture.dispose();
-    }
-
-    revokeObjectUrl("depth");
-    renderState.sourceDepthTexture = texture;
-    renderState.sourceDepthPixels = depthPixels;
-    renderState.depthObjectUrl = objectUrl;
+    revokeObjectUrl("segment");
+    renderState.segmentSourcePixels = segmentImage.pixels;
+    renderState.segmentObjectUrl = objectUrl;
+    renderState.segmentThumbUrl = createSegmentThumbDataUrl(
+      renderState.segmentSourcePixels,
+      renderState.imageWidth,
+      renderState.imageHeight,
+    );
     rebuildSegments();
     rebuildDepthModeResources();
     buildMesh();
@@ -533,8 +1976,31 @@ async function replaceImage(kind, file) {
 }
 
 function syncThumbs() {
-  colorThumbEl.src = renderState.colorObjectUrl || colorUrl;
-  depthThumbEl.src = renderState.depthObjectUrl || depthUrl;
+  colorThumbEl.src = renderState.colorObjectUrl || defaultColorUrl;
+  depthThumbEl.src = renderState.depthObjectUrl || defaultDepthUrl;
+  segmentThumbEl.src = renderState.segmentThumbUrl || renderState.segmentObjectUrl || defaultSegmentUrl;
+}
+
+function createSegmentThumbDataUrl(rgbPixels, width, height) {
+  if (!rgbPixels || !width || !height) {
+    return "";
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  const imageData = context.createImageData(width, height);
+
+  for (let src = 0, dst = 0; src < rgbPixels.length; src += 3, dst += 4) {
+    imageData.data[dst] = rgbPixels[src];
+    imageData.data[dst + 1] = rgbPixels[src + 1];
+    imageData.data[dst + 2] = rgbPixels[src + 2];
+    imageData.data[dst + 3] = 255;
+  }
+
+  context.putImageData(imageData, 0, 0);
+  return canvas.toDataURL("image/png");
 }
 
 function revokeObjectUrl(kind) {
@@ -546,6 +2012,11 @@ function revokeObjectUrl(kind) {
   if (kind === "depth" && renderState.depthObjectUrl) {
     URL.revokeObjectURL(renderState.depthObjectUrl);
     renderState.depthObjectUrl = null;
+  }
+
+  if (kind === "segment" && renderState.segmentObjectUrl) {
+    URL.revokeObjectURL(renderState.segmentObjectUrl);
+    renderState.segmentObjectUrl = null;
   }
 }
 
@@ -566,18 +2037,19 @@ function refreshStatusCounts() {
 function rebuildDepthModeResources() {
   disposeGeneratedDepthTexture();
   disposeAdjustedDepthTexture();
+  disposeRepairedBaseDepthTexture();
 
   if (depthModeEl.value === "raw") {
-    renderState.baseDepthTexture = renderState.processedDepthTexture;
-    renderState.baseDepthPixels = renderState.processedDepthPixels;
-    applySegmentDepthAdjustments();
+    renderState.baseDepthTexture = renderState.rawDepthTexture;
+    renderState.baseDepthPixels = renderState.rawDepthPixels;
+    rebuildRepairedBaseDepth();
     return;
   }
 
   const generated = createSegmentedGridDepthResources(
     renderState.imageWidth,
     renderState.imageHeight,
-    renderState.segmentData,
+    renderState.rawSegmentData,
     gridSpecModeEl.value,
     Number(gridXEl.value),
     Number(gridYEl.value),
@@ -588,7 +2060,7 @@ function rebuildDepthModeResources() {
   renderState.generatedDepthTexture = generated.texture;
   renderState.baseDepthTexture = generated.texture;
   renderState.baseDepthPixels = generated.pixels;
-  applySegmentDepthAdjustments();
+  rebuildRepairedBaseDepth();
 }
 
 function disposeGeneratedDepthTexture() {
@@ -605,10 +2077,37 @@ function disposeAdjustedDepthTexture() {
   }
 }
 
+function disposeRepairedBaseDepthTexture() {
+  if (renderState.repairedBaseDepthTexture) {
+    renderState.repairedBaseDepthTexture.dispose();
+    renderState.repairedBaseDepthTexture = null;
+    renderState.repairedBaseDepthPixels = null;
+    renderState.repairedBaseGapMask = null;
+  }
+}
+
+function disposeMeshDepthTexture() {
+  if (renderState.meshDepthTexture) {
+    if (renderState.meshDepthTexture !== renderState.activeDepthTexture) {
+      renderState.meshDepthTexture.dispose();
+    }
+    renderState.meshDepthTexture = null;
+    renderState.meshDepthPixels = null;
+  }
+}
+
 function disposeProcessedDepthTexture() {
   if (renderState.processedDepthTexture) {
     renderState.processedDepthTexture.dispose();
     renderState.processedDepthTexture = null;
+  }
+}
+
+function disposeRawDepthTexture() {
+  if (renderState.rawDepthTexture) {
+    renderState.rawDepthTexture.dispose();
+    renderState.rawDepthTexture = null;
+    renderState.rawDepthPixels = null;
   }
 }
 
@@ -629,6 +2128,7 @@ function rebuildSegments() {
   renderState.segmentVisibility = new Array(segmentation.count).fill(true);
   renderState.segmentDepthOffsets = new Array(segmentation.count).fill(0);
   renderState.segmentDepthScales = new Array(segmentation.count).fill(1);
+  renderState.rawSegmentData = segmentation.segmentData;
   renderState.segmentPixels = segmentation.segmentPixels;
   renderState.segmentBounds = segmentation.segmentBounds;
   renderState.segmentData = segmentation.segmentData;
@@ -650,17 +2150,53 @@ function rebuildSegments() {
 }
 
 function rebuildProcessedDepthData() {
+  disposeRawDepthTexture();
   disposeProcessedDepthTexture();
+
+  const raw = composeSegmentDepthResources(
+    renderState.imageWidth,
+    renderState.imageHeight,
+    renderState.rawSegmentData,
+    "localDepthPixels",
+  );
+  renderState.rawDepthPixels = raw.pixels;
+  renderState.rawDepthTexture = raw.texture;
 
   const processed = preprocessSegmentDepths(
     renderState.imageWidth,
     renderState.imageHeight,
-    renderState.segmentData,
+    renderState.rawSegmentData,
   );
 
   renderState.segmentData = processed.segmentData;
   renderState.processedDepthPixels = processed.pixels;
   renderState.processedDepthTexture = processed.texture;
+}
+
+function composeSegmentDepthResources(width, height, segmentData, depthKey) {
+  const pixels = new Uint8Array(width * height);
+
+  for (let segmentIndex = 0; segmentIndex < segmentData.length; segmentIndex += 1) {
+    const segment = segmentData[segmentIndex];
+    if (!segment || !segment.indices.length || !segment.hasSourceDepth) {
+      continue;
+    }
+
+    const localPixels = segment[depthKey];
+    if (!localPixels || !localPixels.length) {
+      continue;
+    }
+
+    for (let i = 0; i < segment.indices.length; i += 1) {
+      const pixelIndex = segment.indices[i];
+      const x = pixelIndex % width;
+      const y = Math.floor(pixelIndex / width);
+      const localIndex = (y - segment.bounds.minY) * segment.localWidth + (x - segment.bounds.minX);
+      pixels[pixelIndex] = localPixels[localIndex];
+    }
+  }
+
+  return createDepthTextureResources(width, height, pixels);
 }
 
 function clusterSegmentPixels(segmentPixels, depthPixels, width, height) {
@@ -785,6 +2321,34 @@ function clusterSegmentPixels(segmentPixels, depthPixels, width, height) {
     segmentMap[index] = finalIndex;
   }
 
+  refineAntialiasedSegmentBoundaries(
+    segmentMap,
+    finalPalette,
+    segmentPixels,
+    width,
+    height,
+    2,
+  );
+
+  finalCounts.fill(0);
+  for (let i = 0; i < finalSums.length; i += 1) {
+    finalSums[i].r = 0;
+    finalSums[i].g = 0;
+    finalSums[i].b = 0;
+  }
+
+  for (let index = 0; index < totalPixels; index += 1) {
+    const finalIndex = segmentMap[index];
+    if (finalIndex < 0) {
+      continue;
+    }
+    const offset = index * 3;
+    finalSums[finalIndex].r += segmentPixels[offset];
+    finalSums[finalIndex].g += segmentPixels[offset + 1];
+    finalSums[finalIndex].b += segmentPixels[offset + 2];
+    finalCounts[finalIndex] += 1;
+  }
+
   finalPalette.forEach((color, index) => {
     color.r = Math.round(finalSums[index].r / Math.max(1, finalCounts[index]));
     color.g = Math.round(finalSums[index].g / Math.max(1, finalCounts[index]));
@@ -841,6 +2405,75 @@ function clusterSegmentPixels(segmentPixels, depthPixels, width, height) {
       depthPixels,
     ),
   };
+}
+
+function refineAntialiasedSegmentBoundaries(segmentMap, palette, segmentPixels, width, height, passes) {
+  const offsets = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+    [-1, -1],
+    [1, -1],
+    [-1, 1],
+    [1, 1],
+  ];
+
+  for (let pass = 0; pass < passes; pass += 1) {
+    const next = segmentMap.slice();
+
+    for (let y = 1; y < height - 1; y += 1) {
+      for (let x = 1; x < width - 1; x += 1) {
+        const index = y * width + x;
+        const current = segmentMap[index];
+        if (current < 0) {
+          continue;
+        }
+
+        const counts = new Map();
+        for (let i = 0; i < offsets.length; i += 1) {
+          const [dx, dy] = offsets[i];
+          const neighbor = segmentMap[(y + dy) * width + (x + dx)];
+          if (neighbor < 0) {
+            continue;
+          }
+          counts.set(neighbor, (counts.get(neighbor) || 0) + 1);
+        }
+
+        if (counts.size < 2) {
+          continue;
+        }
+
+        let dominant = current;
+        let dominantCount = counts.get(current) || 0;
+        for (const [segmentIndex, count] of counts.entries()) {
+          if (count > dominantCount) {
+            dominant = segmentIndex;
+            dominantCount = count;
+          }
+        }
+
+        if (dominant === current || dominantCount < 4) {
+          continue;
+        }
+
+        const offset = index * 3;
+        const color = {
+          r: segmentPixels[offset],
+          g: segmentPixels[offset + 1],
+          b: segmentPixels[offset + 2],
+        };
+        const currentDistance = colorDistanceSquared(color, palette[current]);
+        const dominantDistance = colorDistanceSquared(color, palette[dominant]);
+
+        if (dominantDistance <= currentDistance * 1.15 || (counts.get(current) || 0) <= 1) {
+          next[index] = dominant;
+        }
+      }
+    }
+
+    segmentMap.set(next);
+  }
 }
 
 function buildSegmentPixelLists(segmentMap, segmentCount) {
@@ -975,13 +2608,164 @@ function preprocessSegmentDepths(width, height, segmentData) {
 }
 
 function preprocessSegmentLocalDepth(sourcePixels, mask, width, height) {
-  const boundaryCorrected = correctSegmentBoundaryDepthLeakage(sourcePixels, mask, width, height);
+  const filtered = rejectMaskedDepthOutliers(sourcePixels, mask, width, height);
+  const holeFilled = fillMaskedDepthHoles(filtered, mask, width, height, 12);
+  const boundaryCorrected = correctSegmentBoundaryDepthLeakage(holeFilled, mask, width, height);
   const median = applyMaskedMedianFilter(boundaryCorrected, mask, width, height, 1);
   const blurKernel = getDepthBlurKernel(1);
   const blurred = applyMaskedBlurFilter(median, mask, width, height, 1, blurKernel);
   const sharpened = applyMaskedUnsharpFilter(median, blurred, mask, 0.65);
   const despiked = suppressMaskedDepthSpikes(sharpened, mask, width, height, 2);
   return enforceMaskedDepthContinuity(despiked, mask, width, height, 3);
+}
+
+function rejectMaskedDepthOutliers(sourcePixels, mask, width, height) {
+  const output = sourcePixels.slice();
+  const rowStats = computeMaskedAxisStats(sourcePixels, mask, width, height, "row");
+  const colStats = computeMaskedAxisStats(sourcePixels, mask, width, height, "col");
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      const depth = sourcePixels[index];
+      if (!mask[index] || depth <= 0) {
+        continue;
+      }
+
+      const localStats = sampleMaskedDepthStats(sourcePixels, mask, width, height, x, y, 2);
+      const rowVote = axisOutlierVote(depth, rowStats, y, 2.5, 8);
+      const colVote = axisOutlierVote(depth, colStats, x, 2.5, 8);
+      const localVote = statsOutlierVote(depth, localStats, 2.25, 6);
+      const similarNeighbors = countSimilarNeighbors(sourcePixels, mask, width, height, x, y, depth, localStats);
+
+      const votes = rowVote + colVote + localVote;
+      if (votes >= 2 && similarNeighbors <= 1) {
+        output[index] = 0;
+      }
+    }
+  }
+
+  return output;
+}
+
+function computeMaskedAxisStats(sourcePixels, mask, width, height, axis) {
+  const lineCount = axis === "row" ? height : width;
+  const lineSpan = axis === "row" ? width : height;
+  const medians = new Float32Array(lineCount);
+  const mads = new Float32Array(lineCount);
+  const valid = new Uint8Array(lineCount);
+  const samples = [];
+
+  for (let line = 0; line < lineCount; line += 1) {
+    samples.length = 0;
+
+    for (let step = 0; step < lineSpan; step += 1) {
+      const x = axis === "row" ? step : line;
+      const y = axis === "row" ? line : step;
+      const index = y * width + x;
+      if (!mask[index] || sourcePixels[index] <= 0) {
+        continue;
+      }
+      samples.push(sourcePixels[index]);
+    }
+
+    if (samples.length < 3) {
+      continue;
+    }
+
+    samples.sort((a, b) => a - b);
+    const median = samples[(samples.length - 1) >> 1];
+    const deviations = samples.map((value) => Math.abs(value - median)).sort((a, b) => a - b);
+    medians[line] = median;
+    mads[line] = deviations[(deviations.length - 1) >> 1];
+    valid[line] = 1;
+  }
+
+  return { medians, mads, valid };
+}
+
+function axisOutlierVote(depth, axisStats, lineIndex, madScale, floor) {
+  if (!axisStats.valid[lineIndex]) {
+    return 0;
+  }
+
+  const median = axisStats.medians[lineIndex];
+  const mad = axisStats.mads[lineIndex];
+  const limit = Math.max(floor, mad * madScale + floor * 0.5);
+  return Math.abs(depth - median) > limit ? 1 : 0;
+}
+
+function statsOutlierVote(depth, stats, madScale, floor) {
+  if (!stats) {
+    return 0;
+  }
+
+  const limit = Math.max(floor, stats.mad * madScale + floor * 0.5);
+  return Math.abs(depth - stats.median) > limit ? 1 : 0;
+}
+
+function countSimilarNeighbors(sourcePixels, mask, width, height, x, y, depth, localStats) {
+  const tolerance = localStats ? Math.max(8, localStats.mad * 2 + 4) : 10;
+  let count = 0;
+
+  for (let oy = -1; oy <= 1; oy += 1) {
+    for (let ox = -1; ox <= 1; ox += 1) {
+      if (ox === 0 && oy === 0) {
+        continue;
+      }
+
+      const sx = x + ox;
+      const sy = y + oy;
+      if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+        continue;
+      }
+
+      const index = sy * width + sx;
+      if (!mask[index] || sourcePixels[index] <= 0) {
+        continue;
+      }
+
+      if (Math.abs(sourcePixels[index] - depth) <= tolerance) {
+        count += 1;
+      }
+    }
+  }
+
+  return count;
+}
+
+function fillMaskedDepthHoles(sourcePixels, mask, width, height, passes) {
+  let current = sourcePixels.slice();
+
+  for (let pass = 0; pass < passes; pass += 1) {
+    const next = current.slice();
+    let filled = 0;
+
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const index = y * width + x;
+        if (!mask[index] || current[index] > 0) {
+          continue;
+        }
+
+        const neighbors = collectMaskedNeighborDepths(current, mask, width, height, x, y);
+        if (neighbors.length < 2) {
+          continue;
+        }
+
+        neighbors.sort((a, b) => a - b);
+        next[index] = neighbors[(neighbors.length - 1) >> 1];
+        filled += 1;
+      }
+    }
+
+    current = next;
+    if (filled === 0) {
+      break;
+    }
+  }
+
+  return current;
 }
 
 function correctSegmentBoundaryDepthLeakage(sourcePixels, mask, width, height) {
@@ -1655,14 +3439,14 @@ function applySegmentDepthAdjustment(action, segmentIndex) {
 function applySegmentDepthAdjustments() {
   disposeAdjustedDepthTexture();
 
-  if (!renderState.baseDepthPixels) {
+  if (!renderState.repairedBaseDepthPixels) {
     return;
   }
 
   const adjustedPixels = new Uint8Array(renderState.baseDepthPixels.length);
 
-  for (let index = 0; index < renderState.baseDepthPixels.length; index += 1) {
-    const baseDepth = renderState.baseDepthPixels[index];
+  for (let index = 0; index < renderState.repairedBaseDepthPixels.length; index += 1) {
+    const baseDepth = renderState.repairedBaseDepthPixels[index];
     const segmentIndex = renderState.segmentMap[index];
     if (baseDepth <= 0 || segmentIndex < 0) {
       adjustedPixels[index] = 0;
@@ -1683,6 +3467,32 @@ function applySegmentDepthAdjustments() {
   renderState.adjustedDepthTexture = adjusted.texture;
   renderState.activeDepthTexture = adjusted.texture;
   renderState.activeDepthPixels = adjusted.pixels;
+}
+
+function rebuildRepairedBaseDepth() {
+  const baseSegmentDepthMeans = computeSegmentDepthMeans(
+    renderState.baseDepthPixels,
+    renderState.segmentMap,
+    renderState.segmentCount,
+  );
+  const repaired = repairDepthDiscontinuities(
+    renderState.baseDepthPixels,
+    renderState.segmentMap,
+    baseSegmentDepthMeans,
+    renderState.imageWidth,
+    renderState.imageHeight,
+    Number(depthDiscontinuityEl.value),
+  );
+
+  renderState.repairedBaseDepthTexture = repaired.texture;
+  renderState.repairedBaseDepthPixels = repaired.pixels;
+  renderState.repairedBaseGapMask = repaired.gapMask;
+  renderState.segmentDepthMeans = computeSegmentDepthMeans(
+    repaired.pixels,
+    renderState.segmentMap,
+    renderState.segmentCount,
+  );
+  applySegmentDepthAdjustments();
 }
 
 function updateSegmentMaskTexture() {

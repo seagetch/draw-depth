@@ -117,7 +117,7 @@
 
       .thumb-grid {
         display: grid;
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: 1fr 1fr 1fr;
         gap: 10px;
         margin-top: 12px;
       }
@@ -270,9 +270,22 @@
         <input id="meshDetail" type="range" min="1" max="6" step="1" value="2">
       </div>
 
+      <div class="control">
+        <div class="control-row">
+          <label for="depthDiscontinuity">Depth cutoff</label>
+          <output class="value" id="depthDiscontinuityValue">18</output>
+        </div>
+        <input id="depthDiscontinuity" type="range" min="2" max="64" step="1" value="18">
+      </div>
+
       <div class="control-row">
         <label for="invertDepth">Invert depth</label>
         <input id="invertDepth" type="checkbox">
+      </div>
+
+      <div class="control-row">
+        <label for="contourRepair">Repair contour band</label>
+        <input id="contourRepair" type="checkbox" checked>
       </div>
 
       <div class="control">
@@ -349,6 +362,13 @@
             <img id="depthThumb" alt="Depth thumbnail">
           </button>
           <input class="hidden-input" id="depthFileInput" type="file" accept="image/*">
+        </div>
+        <div class="thumb-card">
+          <div class="thumb-label">Segment image</div>
+          <button class="thumb-button" id="segmentThumbButton" type="button">
+            <img id="segmentThumb" alt="Segment thumbnail">
+          </button>
+          <input class="hidden-input" id="segmentFileInput" type="file" accept="image/*">
         </div>
       </div>
 
