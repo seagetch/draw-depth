@@ -1,0 +1,23 @@
+{
+  "name": "depth-draw",
+  "version": "1.0.0",
+  "description": "Minimal 3D viewer for `data/Midori-color.jpg` and `data/Midori-depth.jpg`.",
+  "main": "viewer.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/seagetch/draw-depth.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/seagetch/draw-depth/issues"
+  },
+  "homepage": "https://github.com/seagetch/draw-depth#readme",
+  "dependencies": {
+    "ag-psd": "^30.1.0"
+  }
+}

@@ -7,6 +7,7 @@ const meshDetailValueEl = document.querySelector("#meshDetailValue");
 const depthDiscontinuityEl = document.querySelector("#depthDiscontinuity");
 const depthDiscontinuityValueEl = document.querySelector("#depthDiscontinuityValue");
 const invertDepthEl = document.querySelector("#invertDepth");
+const sourceModeEl = document.querySelector("#sourceMode");
 const contourRepairEl = document.querySelector("#contourRepair");
 const depthModeEl = document.querySelector("#depthMode");
 const gridSpecModeEl = document.querySelector("#gridSpecMode");
@@ -18,6 +19,7 @@ const kernelSizeEl = document.querySelector("#kernelSize");
 const kernelSizeValueEl = document.querySelector("#kernelSizeValue");
 const interpModeEl = document.querySelector("#interpMode");
 const segmentListEl = document.querySelector("#segmentList");
+const segmentHudEl = document.querySelector("#segmentHud");
 const colorThumbButtonEl = document.querySelector("#colorThumbButton");
 const depthThumbButtonEl = document.querySelector("#depthThumbButton");
 const segmentThumbButtonEl = document.querySelector("#segmentThumbButton");
@@ -31,10 +33,14 @@ const segmentFileInputEl = document.querySelector("#segmentFileInput");
 const colorUrl = "./data/Midori-color.jpg";
 const depthUrl = "./data/Midori-depth.jpg";
 const segmentUrl = "./data/Midori-segment.jpg";
+const psdColorUrl = "./data/Midori-color.psd";
+const psdDepthUrl = "./data/Midori-color_depth.psd";
 const cacheBustToken = `${Date.now()}`;
 const defaultColorUrl = withCacheBust(colorUrl);
 const defaultDepthUrl = withCacheBust(depthUrl);
 const defaultSegmentUrl = withCacheBust(segmentUrl);
+const defaultPsdColorUrl = withCacheBust(psdColorUrl);
+const defaultPsdDepthUrl = withCacheBust(psdDepthUrl);
 const invalidDepthThreshold = 1 / 255;
 const segmentAnchorDistance = 36;
 const segmentMinAnchorPixels = 24;
@@ -66,6 +72,7 @@ controls.screenSpacePanning = true;
 controls.target.set(0, 0, 0);
 
 const loader = new THREE.TextureLoader();
+initializePsdSupport();
 
 const renderState = {
   colorTexture: null,
@@ -88,6 +95,8 @@ const renderState = {
   meshGapMask: null,
   imageWidth: 0,
   imageHeight: 0,
+  rasterImageWidth: 0,
+  rasterImageHeight: 0,
   mesh: null,
   material: null,
   edgePoints: null,
@@ -98,6 +107,7 @@ const renderState = {
   segmentThumbUrl: "",
   generatedDepthTexture: null,
   segmentSourcePixels: null,
+  sourceMode: "raster",
   segmentMap: null,
   segmentCount: 0,
   segmentPalette: [],
@@ -112,6 +122,17 @@ const renderState = {
   rawSegmentData: [],
   segmentMaskData: null,
   segmentMaskTexture: null,
+  psdColorDocument: null,
+  psdDepthDocument: null,
+  psdLayerEntries: [],
+  psdLayerMeshes: [],
+  psdLayerVisibility: [],
+  psdLayerDepthOffsets: [],
+  psdLayerDepthScales: [],
+  psdColorPreviewUrl: "",
+  psdDepthPreviewUrl: "",
+  pendingPsdColorBuffer: null,
+  pendingPsdDepthBuffer: null,
 };
 
 const gaussianKernelCache = new Map();
@@ -201,6 +222,48 @@ const pointFragmentShader = `
   }
 `;
 
+const psdLayerVertexShader = `
+  uniform sampler2D uDepthTexture;
+  uniform float uDepthScale;
+  uniform float uInvertDepth;
+  varying vec2 vUv;
+
+  void main() {
+    vUv = uv;
+    float rawDepth = texture2D(uDepthTexture, uv).r;
+    float depthValue = mix(1.0 - rawDepth, rawDepth, uInvertDepth);
+    vec3 displaced = position;
+    displaced.z += depthValue * uDepthScale;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(displaced, 1.0);
+  }
+`;
+
+const psdLayerFragmentShader = `
+  uniform sampler2D uColorTexture;
+  varying vec2 vUv;
+
+  void main() {
+    vec4 color = texture2D(uColorTexture, vUv);
+    if (color.a < 0.01) {
+      discard;
+    }
+    gl_FragColor = color;
+  }
+`;
+
+function initializePsdSupport() {
+  if (typeof agPsd === "undefined" || typeof agPsd.initializeCanvas !== "function") {
+    return;
+  }
+
+  agPsd.initializeCanvas((width, height) => {
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    return canvas;
+  });
+}
+
 init().catch((error) => {
   console.error(error);
   statusEl.textContent = `Failed: ${error.message}`;
@@ -238,6 +301,8 @@ async function init() {
   renderState.segmentSourcePixels = segmentImage.pixels;
   renderState.imageWidth = imageWidth;
   renderState.imageHeight = imageHeight;
+  renderState.rasterImageWidth = imageWidth;
+  renderState.rasterImageHeight = imageHeight;
   renderState.segmentThumbUrl = createSegmentThumbDataUrl(
     renderState.segmentSourcePixels,
     imageWidth,
@@ -246,8 +311,10 @@ async function init() {
 
   rebuildSegments();
   rebuildDepthModeResources();
+  renderState.sourceMode = sourceModeEl.value;
   buildMesh();
   wireControls();
+  syncViewerModeUi();
   syncThumbs();
   onResize();
   animate();
@@ -263,9 +330,18 @@ function wireControls() {
 
   depthScaleEl.addEventListener("input", () => {
     depthScaleValueEl.textContent = Number(depthScaleEl.value).toFixed(2);
-    renderState.material.uniforms.uDepthScale.value = Number(depthScaleEl.value);
+    if (renderState.material) {
+      renderState.material.uniforms.uDepthScale.value = Number(depthScaleEl.value);
+    }
     if (renderState.edgePointMaterial) {
       renderState.edgePointMaterial.uniforms.uDepthScale.value = Number(depthScaleEl.value);
+    }
+    for (let i = 0; i < renderState.psdLayerMeshes.length; i += 1) {
+      const layerIndex = renderState.psdLayerMeshes[i].layerIndex;
+      renderState.psdLayerMeshes[i].mesh.material.uniforms.uDepthScale.value =
+        Number(depthScaleEl.value) * renderState.psdLayerDepthScales[layerIndex];
+      renderState.psdLayerMeshes[i].mesh.position.z =
+        renderState.psdLayerDepthOffsets[layerIndex] / 255 * Number(depthScaleEl.value);
     }
   });
 
@@ -287,9 +363,41 @@ function wireControls() {
   });
 
   invertDepthEl.addEventListener("change", () => {
-    renderState.material.uniforms.uInvertDepth.value = invertDepthEl.checked ? 1 : 0;
+    if (renderState.material) {
+      renderState.material.uniforms.uInvertDepth.value = invertDepthEl.checked ? 1 : 0;
+    }
     if (renderState.edgePointMaterial) {
       renderState.edgePointMaterial.uniforms.uInvertDepth.value = invertDepthEl.checked ? 1 : 0;
+    }
+    for (let i = 0; i < renderState.psdLayerMeshes.length; i += 1) {
+      renderState.psdLayerMeshes[i].mesh.material.uniforms.uInvertDepth.value = invertDepthEl.checked ? 1 : 0;
+    }
+  });
+
+  sourceModeEl.addEventListener("change", async () => {
+    try {
+      renderState.sourceMode = sourceModeEl.value;
+      if (renderState.sourceMode === "psd") {
+        statusEl.textContent = "Loading PSD pair...";
+        await ensureDefaultPsdPairLoaded();
+      } else {
+        renderState.imageWidth = renderState.rasterImageWidth;
+        renderState.imageHeight = renderState.rasterImageHeight;
+      }
+      syncViewerModeUi();
+      rebuildSegmentList();
+      buildMesh();
+      syncThumbs();
+    } catch (error) {
+      console.error(error);
+      renderState.sourceMode = "raster";
+      sourceModeEl.value = "raster";
+      renderState.imageWidth = renderState.rasterImageWidth;
+      renderState.imageHeight = renderState.rasterImageHeight;
+      syncViewerModeUi();
+      buildMesh();
+      syncThumbs();
+      statusEl.textContent = `Failed: ${error.message}`;
     }
   });
 
@@ -386,16 +494,12 @@ function wireControls() {
 
 function buildMesh() {
   disposeMeshDepthTexture();
+  clearSceneVisuals();
 
-  if (renderState.mesh) {
-    scene.remove(renderState.mesh);
-    renderState.mesh.geometry.dispose();
-    renderState.material.dispose();
-  }
-  if (renderState.edgePoints) {
-    scene.remove(renderState.edgePoints);
-    renderState.edgePoints.geometry.dispose();
-    renderState.edgePointMaterial.dispose();
+  if (renderState.sourceMode === "psd") {
+    buildPsdLayerMeshes();
+    refreshStatusCounts();
+    return;
   }
 
   const step = Number(meshDetailEl.value);
@@ -461,6 +565,69 @@ function buildMesh() {
   renderState.edgePointMaterial = edgePointMaterial;
 
   refreshStatusCounts();
+}
+
+function clearSceneVisuals() {
+  if (renderState.mesh) {
+    scene.remove(renderState.mesh);
+    renderState.mesh.geometry.dispose();
+    renderState.material.dispose();
+    renderState.mesh = null;
+    renderState.material = null;
+  }
+
+  if (renderState.edgePoints) {
+    scene.remove(renderState.edgePoints);
+    renderState.edgePoints.geometry.dispose();
+    renderState.edgePointMaterial.dispose();
+    renderState.edgePoints = null;
+    renderState.edgePointMaterial = null;
+  }
+
+  if (renderState.psdLayerMeshes.length) {
+    for (let i = 0; i < renderState.psdLayerMeshes.length; i += 1) {
+      const entry = renderState.psdLayerMeshes[i];
+      scene.remove(entry.mesh);
+      entry.mesh.geometry.dispose();
+      entry.mesh.material.dispose();
+    }
+    renderState.psdLayerMeshes = [];
+  }
+}
+
+function buildPsdLayerMeshes() {
+  const layers = renderState.psdLayerEntries || [];
+  for (let i = 0; i < layers.length; i += 1) {
+    const layer = layers[i];
+    if (!renderState.psdLayerVisibility[i]) {
+      continue;
+    }
+
+    const geometry = buildPsdLayerGeometry(
+      renderState.imageWidth,
+      renderState.imageHeight,
+      layer,
+      Number(meshDetailEl.value),
+    );
+    const material = new THREE.ShaderMaterial({
+      uniforms: {
+        uColorTexture: { value: layer.colorTexture },
+        uDepthTexture: { value: layer.depthTexture },
+        uDepthScale: { value: Number(depthScaleEl.value) * renderState.psdLayerDepthScales[i] },
+        uInvertDepth: { value: invertDepthEl.checked ? 1 : 0 },
+      },
+      vertexShader: psdLayerVertexShader,
+      fragmentShader: psdLayerFragmentShader,
+      side: THREE.DoubleSide,
+      transparent: true,
+      depthWrite: true,
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.renderOrder = i;
+    mesh.position.z += renderState.psdLayerDepthOffsets[i] / 255 * Number(depthScaleEl.value);
+    scene.add(mesh);
+    renderState.psdLayerMeshes.push({ mesh, layerIndex: i });
+  }
 }
 
 function buildMaskedPlaneGeometry(width, height, depthPixels, segmentMap, segmentDepthMeans, gapMask, step) {
@@ -652,6 +819,59 @@ function isRenderedBoundaryVertex(gridX, gridY, cols, rows, width, height, step,
   }
 
   return false;
+}
+
+function buildPsdLayerGeometry(imageWidth, imageHeight, layer, step) {
+  const cols = Math.floor((layer.width - 1) / step) + 1;
+  const rows = Math.floor((layer.height - 1) / step) + 1;
+  const positions = new Float32Array(cols * rows * 3);
+  const uvs = new Float32Array(cols * rows * 2);
+  const indices = [];
+  const aspect = imageWidth / imageHeight;
+  const halfWidth = aspect * 0.5;
+  const halfHeight = 0.5;
+  let p = 0;
+  let t = 0;
+
+  for (let y = 0; y < rows; y += 1) {
+    const py = Math.min(y * step, layer.height - 1);
+    const imageY = layer.top + py;
+    const v = py / Math.max(1, layer.height - 1);
+    const globalV = imageY / Math.max(1, imageHeight - 1);
+    const sy = THREE.MathUtils.lerp(halfHeight, -halfHeight, globalV);
+
+    for (let x = 0; x < cols; x += 1) {
+      const px = Math.min(x * step, layer.width - 1);
+      const imageX = layer.left + px;
+      const u = px / Math.max(1, layer.width - 1);
+      const globalU = imageX / Math.max(1, imageWidth - 1);
+      const sx = THREE.MathUtils.lerp(-halfWidth, halfWidth, globalU);
+
+      positions[p++] = sx;
+      positions[p++] = sy;
+      positions[p++] = 0;
+      uvs[t++] = u;
+      uvs[t++] = 1 - v;
+    }
+  }
+
+  for (let y = 0; y < rows - 1; y += 1) {
+    for (let x = 0; x < cols - 1; x += 1) {
+      const a = y * cols + x;
+      const b = a + 1;
+      const c = a + cols;
+      const d = c + 1;
+      indices.push(a, c, b);
+      indices.push(b, c, d);
+    }
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  return geometry;
 }
 
 function isSegmentContourPixel(segmentMap, width, height, index) {
@@ -1882,18 +2102,205 @@ function loadImage(url) {
   });
 }
 
+async function ensureDefaultPsdPairLoaded() {
+  if (renderState.psdLayerEntries.length) {
+    return;
+  }
+
+  if (!renderState.pendingPsdColorBuffer || !renderState.pendingPsdDepthBuffer) {
+    const [colorBuffer, depthBuffer] = await Promise.all([
+      fetchArrayBuffer(defaultPsdColorUrl),
+      fetchArrayBuffer(defaultPsdDepthUrl),
+    ]);
+    renderState.pendingPsdColorBuffer = colorBuffer;
+    renderState.pendingPsdDepthBuffer = depthBuffer;
+  }
+
+  loadPsdPair(renderState.pendingPsdColorBuffer, renderState.pendingPsdDepthBuffer);
+}
+
+async function fetchArrayBuffer(url) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to load ${url}`);
+  }
+  return response.arrayBuffer();
+}
+
+function loadPsdPair(colorBuffer, depthBuffer) {
+  disposePsdLayerTextures();
+  const colorPsd = agPsd.readPsd(colorBuffer);
+  const depthPsd = agPsd.readPsd(depthBuffer);
+  const layerEntries = createPsdLayerEntries(colorPsd, depthPsd);
+
+  renderState.psdColorDocument = colorPsd;
+  renderState.psdDepthDocument = depthPsd;
+  renderState.psdLayerEntries = layerEntries;
+  renderState.psdLayerVisibility = new Array(layerEntries.length).fill(true);
+  renderState.psdLayerDepthOffsets = new Array(layerEntries.length).fill(0);
+  renderState.psdLayerDepthScales = new Array(layerEntries.length).fill(1);
+  renderState.imageWidth = colorPsd.width;
+  renderState.imageHeight = colorPsd.height;
+  renderState.psdColorPreviewUrl = colorPsd.canvas ? colorPsd.canvas.toDataURL("image/png") : "";
+  renderState.psdDepthPreviewUrl = depthPsd.canvas ? depthPsd.canvas.toDataURL("image/png") : "";
+  rebuildSegmentList();
+}
+
+function disposePsdLayerTextures() {
+  for (let i = 0; i < renderState.psdLayerEntries.length; i += 1) {
+    const layer = renderState.psdLayerEntries[i];
+    if (layer.colorTexture) {
+      layer.colorTexture.dispose();
+    }
+    if (layer.depthTexture) {
+      layer.depthTexture.dispose();
+    }
+  }
+  renderState.psdLayerEntries = [];
+}
+
+function createPsdLayerEntries(colorPsd, depthPsd) {
+  const colorLayers = flattenPsdLayers(colorPsd.children || []);
+  const depthLayers = flattenPsdLayers(depthPsd.children || []);
+  const depthByName = new Map();
+
+  for (let i = 0; i < depthLayers.length; i += 1) {
+    const layer = depthLayers[i];
+    const key = layer.name || `#${i}`;
+    if (!depthByName.has(key)) {
+      depthByName.set(key, []);
+    }
+    depthByName.get(key).push(layer);
+  }
+
+  const entries = [];
+
+  for (let i = 0; i < colorLayers.length; i += 1) {
+    const colorLayer = colorLayers[i];
+    const key = colorLayer.name || `#${i}`;
+    let depthLayer = null;
+
+    if (depthByName.has(key) && depthByName.get(key).length) {
+      depthLayer = depthByName.get(key).shift();
+    } else if (depthLayers[i]) {
+      depthLayer = depthLayers[i];
+    }
+
+    if (!depthLayer || colorLayer.width <= 0 || colorLayer.height <= 0) {
+      continue;
+    }
+
+    const colorTexture = new THREE.CanvasTexture(colorLayer.canvas);
+    colorTexture.encoding = THREE.sRGBEncoding;
+    colorTexture.minFilter = THREE.LinearFilter;
+    colorTexture.magFilter = THREE.LinearFilter;
+    colorTexture.needsUpdate = true;
+
+    const depthPixels = extractDepthPixelsFromCanvas(depthLayer.canvas);
+    const depthTexture = createDepthTextureResources(depthLayer.width, depthLayer.height, depthPixels).texture;
+
+    entries.push({
+      name: colorLayer.name || `Layer ${entries.length + 1}`,
+      left: colorLayer.left,
+      top: colorLayer.top,
+      width: colorLayer.width,
+      height: colorLayer.height,
+      colorTexture,
+      depthTexture,
+      visible: true,
+    });
+  }
+
+  return entries;
+}
+
+function flattenPsdLayers(layers, output = []) {
+  for (let i = 0; i < layers.length; i += 1) {
+    const layer = layers[i];
+    if (layer.hidden) {
+      continue;
+    }
+
+    if (layer.children && layer.children.length) {
+      flattenPsdLayers(layer.children, output);
+      continue;
+    }
+
+    if (!layer.canvas) {
+      continue;
+    }
+
+    output.push({
+      name: layer.name || "",
+      left: layer.left || 0,
+      top: layer.top || 0,
+      width: layer.canvas.width,
+      height: layer.canvas.height,
+      canvas: layer.canvas,
+    });
+  }
+
+  return output;
+}
+
+function extractDepthPixelsFromCanvas(canvas) {
+  const context = canvas.getContext("2d");
+  const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+  const pixels = new Uint8Array(canvas.width * canvas.height);
+
+  for (let i = 0, p = 0; i < imageData.data.length; i += 4, p += 1) {
+    const alpha = imageData.data[i + 3];
+    if (alpha === 0) {
+      pixels[p] = 0;
+      continue;
+    }
+    const gray = imageData.data[i];
+    pixels[p] = gray;
+  }
+
+  return pixels;
+}
+
 async function replaceImage(kind, file) {
   statusEl.textContent = `Loading ${kind}...`;
+
+  if ((kind === "color" || kind === "depth") && isPsdFilename(file.name)) {
+    const buffer = await file.arrayBuffer();
+    if (kind === "color") {
+      renderState.pendingPsdColorBuffer = buffer;
+    } else {
+      renderState.pendingPsdDepthBuffer = buffer;
+    }
+
+    if (renderState.pendingPsdColorBuffer && renderState.pendingPsdDepthBuffer) {
+      loadPsdPair(renderState.pendingPsdColorBuffer, renderState.pendingPsdDepthBuffer);
+      renderState.sourceMode = "psd";
+      sourceModeEl.value = "psd";
+      syncViewerModeUi();
+      buildMesh();
+      syncThumbs();
+      statusEl.textContent = "Loaded PSD pair.";
+    } else {
+      statusEl.textContent = `Waiting for ${kind === "color" ? "depth" : "color"} PSD...`;
+    }
+    return;
+  }
 
   const objectUrl = URL.createObjectURL(file);
 
   try {
+    renderState.sourceMode = "raster";
+    sourceModeEl.value = "raster";
+    renderState.imageWidth = renderState.rasterImageWidth;
+    renderState.imageHeight = renderState.rasterImageHeight;
+    syncViewerModeUi();
+
     if (kind === "color") {
       const texture = await loadTexture(objectUrl);
 
       if (
-        texture.image.width !== renderState.imageWidth ||
-        texture.image.height !== renderState.imageHeight
+      texture.image.width !== renderState.imageWidth ||
+      texture.image.height !== renderState.imageHeight
       ) {
         throw new Error("Color image size must match the current depth image.");
       }
@@ -1909,6 +2316,8 @@ async function replaceImage(kind, file) {
       revokeObjectUrl("color");
       renderState.colorTexture = texture;
       renderState.colorObjectUrl = objectUrl;
+      renderState.rasterImageWidth = texture.image.width;
+      renderState.rasterImageHeight = texture.image.height;
       if (renderState.material) {
       renderState.material.uniforms.uColorTexture.value = texture;
       }
@@ -1941,6 +2350,8 @@ async function replaceImage(kind, file) {
       renderState.sourceDepthTexture = texture;
       renderState.sourceDepthPixels = depthPixels;
       renderState.depthObjectUrl = objectUrl;
+      renderState.rasterImageWidth = texture.image.width;
+      renderState.rasterImageHeight = texture.image.height;
       rebuildSegments();
       rebuildDepthModeResources();
       buildMesh();
@@ -1959,6 +2370,8 @@ async function replaceImage(kind, file) {
     revokeObjectUrl("segment");
     renderState.segmentSourcePixels = segmentImage.pixels;
     renderState.segmentObjectUrl = objectUrl;
+    renderState.rasterImageWidth = segmentImage.width;
+    renderState.rasterImageHeight = segmentImage.height;
     renderState.segmentThumbUrl = createSegmentThumbDataUrl(
       renderState.segmentSourcePixels,
       renderState.imageWidth,
@@ -1968,6 +2381,7 @@ async function replaceImage(kind, file) {
     rebuildDepthModeResources();
     buildMesh();
     syncThumbs();
+    rebuildSegmentList();
   } catch (error) {
     URL.revokeObjectURL(objectUrl);
     statusEl.textContent = `Failed: ${error.message}`;
@@ -1976,9 +2390,20 @@ async function replaceImage(kind, file) {
 }
 
 function syncThumbs() {
+  if (renderState.sourceMode === "psd") {
+    colorThumbEl.src = renderState.psdColorPreviewUrl || defaultColorUrl;
+    depthThumbEl.src = renderState.psdDepthPreviewUrl || defaultDepthUrl;
+    segmentThumbEl.src = "";
+    return;
+  }
+
   colorThumbEl.src = renderState.colorObjectUrl || defaultColorUrl;
   depthThumbEl.src = renderState.depthObjectUrl || defaultDepthUrl;
   segmentThumbEl.src = renderState.segmentThumbUrl || renderState.segmentObjectUrl || defaultSegmentUrl;
+}
+
+function isPsdFilename(name) {
+  return /\.psd$/i.test(name || "");
 }
 
 function createSegmentThumbDataUrl(rgbPixels, width, height) {
@@ -2003,6 +2428,12 @@ function createSegmentThumbDataUrl(rgbPixels, width, height) {
   return canvas.toDataURL("image/png");
 }
 
+function syncViewerModeUi() {
+  const isPsd = renderState.sourceMode === "psd";
+  segmentHudEl.style.display = "";
+  segmentThumbButtonEl.parentElement.style.display = isPsd ? "none" : "";
+}
+
 function revokeObjectUrl(kind) {
   if (kind === "color" && renderState.colorObjectUrl) {
     URL.revokeObjectURL(renderState.colorObjectUrl);
@@ -2021,6 +2452,21 @@ function revokeObjectUrl(kind) {
 }
 
 function refreshStatusCounts() {
+  if (renderState.sourceMode === "psd") {
+    const layerCount = renderState.psdLayerEntries.length;
+    const visibleLayers = renderState.psdLayerVisibility.filter(Boolean).length;
+    const triangleCount = renderState.psdLayerMeshes.reduce(
+      (sum, entry) => sum + (entry.mesh.geometry.index ? entry.mesh.geometry.index.count / 3 : 0),
+      0,
+    );
+    const vertexCount = renderState.psdLayerMeshes.reduce(
+      (sum, entry) => sum + entry.mesh.geometry.attributes.position.count,
+      0,
+    );
+    statusEl.textContent = `${renderState.imageWidth}x${renderState.imageHeight} | psd-layers ${visibleLayers}/${layerCount} | vertices ${vertexCount.toLocaleString()} | triangles ${triangleCount.toLocaleString()}`;
+    return;
+  }
+
   if (!renderState.mesh) {
     return;
   }
@@ -3321,6 +3767,57 @@ function colorDistanceSquared(a, b) {
 function rebuildSegmentList() {
   segmentListEl.textContent = "";
 
+  if (renderState.sourceMode === "psd") {
+    renderState.psdLayerEntries.forEach((layer, index) => {
+      const row = document.createElement("div");
+      row.className = "segment-item";
+      row.dataset.segmentIndex = String(index);
+
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = renderState.psdLayerVisibility[index];
+      checkbox.dataset.segmentIndex = String(index);
+      checkbox.tabIndex = -1;
+      checkbox.style.pointerEvents = "none";
+
+      row.addEventListener("click", (event) => {
+        const itemIndex = Number(row.dataset.segmentIndex);
+        applySegmentToggle(itemIndex, event.shiftKey);
+      });
+
+      const swatch = document.createElement("span");
+      swatch.className = "segment-swatch";
+      swatch.style.backgroundColor = "#d0d7de";
+
+      const name = document.createElement("span");
+      name.className = "segment-name";
+      name.textContent = layer.name || `Layer ${index + 1}`;
+
+      const size = document.createElement("span");
+      size.className = "segment-size";
+      size.textContent = `${layer.width}x${layer.height}`;
+
+      const controls = document.createElement("div");
+      controls.className = "segment-controls";
+
+      const offsetDown = createSegmentControlButton("-", "offset-down", index);
+      const offsetUp = createSegmentControlButton("+", "offset-up", index);
+      const scaleDown = createSegmentControlButton("<", "scale-down", index);
+      const scaleUp = createSegmentControlButton(">", "scale-up", index);
+      const metrics = document.createElement("span");
+      metrics.className = "segment-metrics";
+      metrics.dataset.segmentMetrics = String(index);
+
+      controls.append(offsetDown, offsetUp, scaleDown, scaleUp, metrics);
+      row.append(checkbox, swatch, name, size, controls);
+      segmentListEl.appendChild(row);
+    });
+
+    syncSegmentAdjustmentLabels();
+    syncSegmentCheckboxes();
+    return;
+  }
+
   renderState.segmentPalette.forEach((color, index) => {
     const row = document.createElement("div");
     row.className = "segment-item";
@@ -3385,6 +3882,22 @@ function createSegmentControlButton(label, action, segmentIndex) {
 }
 
 function applySegmentToggle(segmentIndex, invertOthers) {
+  if (renderState.sourceMode === "psd") {
+    if (invertOthers) {
+      const nextTargetState = !renderState.psdLayerVisibility[segmentIndex];
+      renderState.psdLayerVisibility = renderState.psdLayerVisibility.map((_, index) => (
+        index === segmentIndex ? nextTargetState : !nextTargetState
+      ));
+    } else {
+      renderState.psdLayerVisibility[segmentIndex] = !renderState.psdLayerVisibility[segmentIndex];
+    }
+
+    syncSegmentCheckboxes();
+    buildMesh();
+    refreshStatusCounts();
+    return;
+  }
+
   if (invertOthers) {
     const nextTargetState = !renderState.segmentVisibility[segmentIndex];
     renderState.segmentVisibility = renderState.segmentVisibility.map((_, index) => (
@@ -3403,7 +3916,9 @@ function syncSegmentCheckboxes() {
   const checkboxes = segmentListEl.querySelectorAll('input[type="checkbox"]');
   checkboxes.forEach((checkbox) => {
     const index = Number(checkbox.dataset.segmentIndex);
-    checkbox.checked = renderState.segmentVisibility[index];
+    checkbox.checked = renderState.sourceMode === "psd"
+      ? renderState.psdLayerVisibility[index]
+      : renderState.segmentVisibility[index];
   });
 }
 
@@ -3411,28 +3926,41 @@ function syncSegmentAdjustmentLabels() {
   const labels = segmentListEl.querySelectorAll("[data-segment-metrics]");
   labels.forEach((label) => {
     const index = Number(label.dataset.segmentMetrics);
-    label.textContent = `o${renderState.segmentDepthOffsets[index]} s${renderState.segmentDepthScales[index].toFixed(2)}`;
+    if (renderState.sourceMode === "psd") {
+      label.textContent = `o${renderState.psdLayerDepthOffsets[index]} s${renderState.psdLayerDepthScales[index].toFixed(2)}`;
+    } else {
+      label.textContent = `o${renderState.segmentDepthOffsets[index]} s${renderState.segmentDepthScales[index].toFixed(2)}`;
+    }
   });
 }
 
 function applySegmentDepthAdjustment(action, segmentIndex) {
+  const offsets = renderState.sourceMode === "psd"
+    ? renderState.psdLayerDepthOffsets
+    : renderState.segmentDepthOffsets;
+  const scales = renderState.sourceMode === "psd"
+    ? renderState.psdLayerDepthScales
+    : renderState.segmentDepthScales;
+
   if (action === "offset-down") {
-    renderState.segmentDepthOffsets[segmentIndex] -= segmentDepthOffsetStep;
+    offsets[segmentIndex] -= segmentDepthOffsetStep;
   } else if (action === "offset-up") {
-    renderState.segmentDepthOffsets[segmentIndex] += segmentDepthOffsetStep;
+    offsets[segmentIndex] += segmentDepthOffsetStep;
   } else if (action === "scale-down") {
-    renderState.segmentDepthScales[segmentIndex] = Math.max(
+    scales[segmentIndex] = Math.max(
       0.1,
-      Number((renderState.segmentDepthScales[segmentIndex] - segmentDepthScaleStep).toFixed(2)),
+      Number((scales[segmentIndex] - segmentDepthScaleStep).toFixed(2)),
     );
   } else if (action === "scale-up") {
-    renderState.segmentDepthScales[segmentIndex] = Number(
-      (renderState.segmentDepthScales[segmentIndex] + segmentDepthScaleStep).toFixed(2),
+    scales[segmentIndex] = Number(
+      (scales[segmentIndex] + segmentDepthScaleStep).toFixed(2),
     );
   }
 
   syncSegmentAdjustmentLabels();
-  applySegmentDepthAdjustments();
+  if (renderState.sourceMode !== "psd") {
+    applySegmentDepthAdjustments();
+  }
   buildMesh();
 }
 

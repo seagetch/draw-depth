@@ -283,6 +283,16 @@
         <input id="invertDepth" type="checkbox">
       </div>
 
+      <div class="control">
+        <div class="control-row">
+          <label for="sourceMode">Source format</label>
+        </div>
+        <select id="sourceMode">
+          <option value="raster">Raster map</option>
+          <option value="psd">PSD pair</option>
+        </select>
+      </div>
+
       <div class="control-row">
         <label for="contourRepair">Repair contour band</label>
         <input id="contourRepair" type="checkbox" checked>
@@ -354,14 +364,14 @@
           <button class="thumb-button" id="colorThumbButton" type="button">
             <img id="colorThumb" alt="Color thumbnail">
           </button>
-          <input class="hidden-input" id="colorFileInput" type="file" accept="image/*">
+          <input class="hidden-input" id="colorFileInput" type="file" accept=".psd,image/*">
         </div>
         <div class="thumb-card">
           <div class="thumb-label">Depth image</div>
           <button class="thumb-button" id="depthThumbButton" type="button">
             <img id="depthThumb" alt="Depth thumbnail">
           </button>
-          <input class="hidden-input" id="depthFileInput" type="file" accept="image/*">
+          <input class="hidden-input" id="depthFileInput" type="file" accept=".psd,image/*">
         </div>
         <div class="thumb-card">
           <div class="thumb-label">Segment image</div>
@@ -383,6 +393,7 @@
     </section>
     <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
     <script src="https://unpkg.com/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="./node_modules/ag-psd/dist/bundle.js"></script>
     <script src="./viewer.js"></script>
   </body>
 </html>
