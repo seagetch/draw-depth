@@ -154,6 +154,40 @@
         display: none;
       }
 
+      .debug-panel {
+        display: none;
+        gap: 8px;
+        margin-top: 12px;
+        padding: 10px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.03);
+      }
+
+      .debug-panel.is-visible {
+        display: grid;
+      }
+
+      .debug-title {
+        font-size: 12px;
+        color: var(--text);
+      }
+
+      .debug-image {
+        width: 100%;
+        height: auto;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 8px;
+        background: rgba(0, 0, 0, 0.2);
+        image-rendering: pixelated;
+      }
+
+      .debug-legend {
+        font-size: 11px;
+        color: var(--muted);
+        line-height: 1.4;
+      }
+
       select,
       input[type="number"] {
         width: 100%;
@@ -289,13 +323,13 @@
         </div>
         <select id="sourceMode">
           <option value="raster">Raster map</option>
-          <option value="psd">PSD pair</option>
+          <option value="psd" selected>PSD pair</option>
         </select>
       </div>
 
       <div class="control-row">
         <label for="contourRepair">Repair contour band</label>
-        <input id="contourRepair" type="checkbox" checked>
+        <input id="contourRepair" type="checkbox">
       </div>
 
       <div class="control">
@@ -390,10 +424,32 @@
         <div class="segment-hint">Shift+click: invert target vs others</div>
       </div>
       <div class="segment-list" id="segmentList"></div>
+      <div class="debug-panel" id="psdDebugPanel">
+        <div class="debug-title" id="psdDebugTitle">PSD debug</div>
+        <img class="debug-image" id="psdDebugImage" alt="PSD debug map">
+        <div class="debug-legend" id="psdDebugLegend">
+          Blue: kept seed<br>
+          Orange: pixel-pruned<br>
+          Magenta: component-pruned<br>
+          Yellow: contour zeroed<br>
+          Dark: no seed / empty
+        </div>
+      </div>
     </section>
     <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
     <script src="https://unpkg.com/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
-    <script src="./node_modules/ag-psd/dist/bundle.js"></script>
-    <script src="./viewer.js"></script>
+    <script>
+      (function () {
+        const bust = Date.now().toString();
+        const psdScript = document.createElement("script");
+        psdScript.src = `./node_modules/ag-psd/dist/bundle.js?v=${bust}`;
+        psdScript.onload = function () {
+          const viewerScript = document.createElement("script");
+          viewerScript.src = `./viewer.js?v=${bust}`;
+          document.body.appendChild(viewerScript);
+        };
+        document.body.appendChild(psdScript);
+      }());
+    </script>
   </body>
 </html>
