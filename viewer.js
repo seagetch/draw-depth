@@ -29,18 +29,23 @@ const segmentThumbEl = document.querySelector("#segmentThumb");
 const colorFileInputEl = document.querySelector("#colorFileInput");
 const depthFileInputEl = document.querySelector("#depthFileInput");
 const segmentFileInputEl = document.querySelector("#segmentFileInput");
+const psdDebugPanelEl = document.querySelector("#psdDebugPanel");
+const psdDebugTitleEl = document.querySelector("#psdDebugTitle");
+const psdDebugImageEl = document.querySelector("#psdDebugImage");
 
 const colorUrl = "./data/Midori-color.jpg";
 const depthUrl = "./data/Midori-depth.jpg";
 const segmentUrl = "./data/Midori-segment.jpg";
 const psdColorUrl = "./data/Midori-color.psd";
 const psdDepthUrl = "./data/Midori-color_depth.psd";
+const psdStableDepthUrl = "./data/Midori-depth-st.png";
 const cacheBustToken = `${Date.now()}`;
 const defaultColorUrl = withCacheBust(colorUrl);
 const defaultDepthUrl = withCacheBust(depthUrl);
 const defaultSegmentUrl = withCacheBust(segmentUrl);
 const defaultPsdColorUrl = withCacheBust(psdColorUrl);
 const defaultPsdDepthUrl = withCacheBust(psdDepthUrl);
+const defaultPsdStableDepthUrl = withCacheBust(psdStableDepthUrl);
 const invalidDepthThreshold = 1 / 255;
 const segmentAnchorDistance = 36;
 const segmentMinAnchorPixels = 24;
@@ -107,7 +112,7 @@ const renderState = {
   segmentThumbUrl: "",
   generatedDepthTexture: null,
   segmentSourcePixels: null,
-  sourceMode: "raster",
+  sourceMode: "psd",
   segmentMap: null,
   segmentCount: 0,
   segmentPalette: [],
@@ -129,8 +134,12 @@ const renderState = {
   psdLayerVisibility: [],
   psdLayerDepthOffsets: [],
   psdLayerDepthScales: [],
+  psdDebugLayerIndex: -1,
   psdColorPreviewUrl: "",
   psdDepthPreviewUrl: "",
+  psdStableDepthPixels: null,
+  psdStableDepthWidth: 0,
+  psdStableDepthHeight: 0,
   pendingPsdColorBuffer: null,
   pendingPsdDepthBuffer: null,
 };
@@ -227,22 +236,29 @@ const psdLayerVertexShader = `
   uniform float uDepthScale;
   uniform float uInvertDepth;
   varying vec2 vUv;
+  varying float vDepthMask;
 
   void main() {
     vUv = uv;
     float rawDepth = texture2D(uDepthTexture, uv).r;
-    float depthValue = mix(1.0 - rawDepth, rawDepth, uInvertDepth);
+    vDepthMask = step(${invalidDepthThreshold.toFixed(8)}, rawDepth);
+    float depthValue = mix(rawDepth, 1.0 - rawDepth, uInvertDepth);
     vec3 displaced = position;
-    displaced.z += depthValue * uDepthScale;
+    displaced.z += depthValue * uDepthScale * vDepthMask;
     gl_Position = projectionMatrix * modelViewMatrix * vec4(displaced, 1.0);
   }
 `;
 
 const psdLayerFragmentShader = `
   uniform sampler2D uColorTexture;
+  uniform sampler2D uMaskTexture;
   varying vec2 vUv;
+  varying float vDepthMask;
 
   void main() {
+    if (vDepthMask < 0.5 || texture2D(uMaskTexture, vUv).r < 0.5) {
+      discard;
+    }
     vec4 color = texture2D(uColorTexture, vUv);
     if (color.a < 0.01) {
       discard;
@@ -311,11 +327,16 @@ async function init() {
 
   rebuildSegments();
   rebuildDepthModeResources();
-  renderState.sourceMode = sourceModeEl.value;
-  buildMesh();
+  sourceModeEl.value = "psd";
+  renderState.sourceMode = "psd";
   wireControls();
+  statusEl.textContent = "Loading PSD pair...";
+  await ensureDefaultPsdPairLoaded();
   syncViewerModeUi();
+  rebuildSegmentList();
+  buildMesh();
   syncThumbs();
+  updatePsdDebugPanel();
   onResize();
   animate();
 }
@@ -357,7 +378,11 @@ function wireControls() {
     buildMesh();
   });
 
-  depthDiscontinuityEl.addEventListener("change", () => {
+  depthDiscontinuityEl.addEventListener("change", async () => {
+    if (await rebuildPsdLayerEntriesIfNeeded()) {
+      buildMesh();
+      return;
+    }
     rebuildDepthModeResources();
     buildMesh();
   });
@@ -387,6 +412,7 @@ function wireControls() {
       syncViewerModeUi();
       rebuildSegmentList();
       buildMesh();
+      updatePsdDebugPanel();
       syncThumbs();
     } catch (error) {
       console.error(error);
@@ -396,12 +422,17 @@ function wireControls() {
       renderState.imageHeight = renderState.rasterImageHeight;
       syncViewerModeUi();
       buildMesh();
+      updatePsdDebugPanel();
       syncThumbs();
       statusEl.textContent = `Failed: ${error.message}`;
     }
   });
 
-  contourRepairEl.addEventListener("change", () => {
+  contourRepairEl.addEventListener("change", async () => {
+    if (await rebuildPsdLayerEntriesIfNeeded()) {
+      buildMesh();
+      return;
+    }
     rebuildDepthModeResources();
     buildMesh();
   });
@@ -612,6 +643,7 @@ function buildPsdLayerMeshes() {
     const material = new THREE.ShaderMaterial({
       uniforms: {
         uColorTexture: { value: layer.colorTexture },
+        uMaskTexture: { value: layer.maskTexture },
         uDepthTexture: { value: layer.depthTexture },
         uDepthScale: { value: Number(depthScaleEl.value) * renderState.psdLayerDepthScales[i] },
         uInvertDepth: { value: invertDepthEl.checked ? 1 : 0 },
@@ -826,6 +858,7 @@ function buildPsdLayerGeometry(imageWidth, imageHeight, layer, step) {
   const rows = Math.floor((layer.height - 1) / step) + 1;
   const positions = new Float32Array(cols * rows * 3);
   const uvs = new Float32Array(cols * rows * 2);
+  const vertexValid = new Uint8Array(cols * rows);
   const indices = [];
   const aspect = imageWidth / imageHeight;
   const halfWidth = aspect * 0.5;
@@ -836,22 +869,29 @@ function buildPsdLayerGeometry(imageWidth, imageHeight, layer, step) {
   for (let y = 0; y < rows; y += 1) {
     const py = Math.min(y * step, layer.height - 1);
     const imageY = layer.top + py;
-    const v = py / Math.max(1, layer.height - 1);
+    const v = (py + 0.5) / Math.max(1, layer.height);
     const globalV = imageY / Math.max(1, imageHeight - 1);
     const sy = THREE.MathUtils.lerp(halfHeight, -halfHeight, globalV);
 
     for (let x = 0; x < cols; x += 1) {
       const px = Math.min(x * step, layer.width - 1);
       const imageX = layer.left + px;
-      const u = px / Math.max(1, layer.width - 1);
+      const u = (px + 0.5) / Math.max(1, layer.width);
       const globalU = imageX / Math.max(1, imageWidth - 1);
       const sx = THREE.MathUtils.lerp(-halfWidth, halfWidth, globalU);
+      const localIndex = py * layer.width + px;
 
       positions[p++] = sx;
       positions[p++] = sy;
       positions[p++] = 0;
       uvs[t++] = u;
       uvs[t++] = 1 - v;
+      vertexValid[y * cols + x] = layer.renderDepthMask
+        ? layer.renderDepthMask[localIndex]
+        : (layer.maskPixels && layer.depthPixels
+          ? (layer.maskPixels[localIndex] && layer.depthPixels[localIndex] > 0 ? 1 : 0)
+          : 1)
+      ;
     }
   }
 
@@ -861,6 +901,12 @@ function buildPsdLayerGeometry(imageWidth, imageHeight, layer, step) {
       const b = a + 1;
       const c = a + cols;
       const d = c + 1;
+      if (!vertexValid[a] || !vertexValid[b] || !vertexValid[c] || !vertexValid[d]) {
+        continue;
+      }
+      if (!psdCellHasOnlyValidDepth(layer, x, y, step)) {
+        continue;
+      }
       indices.push(a, c, b);
       indices.push(b, c, d);
     }
@@ -872,6 +918,46 @@ function buildPsdLayerGeometry(imageWidth, imageHeight, layer, step) {
   geometry.setIndex(indices);
   geometry.computeVertexNormals();
   return geometry;
+}
+
+function psdCellHasOnlyValidDepth(layer, gridX, gridY, step) {
+  if (layer.renderDepthMask) {
+    const minX = Math.min(gridX * step, layer.width - 1);
+    const minY = Math.min(gridY * step, layer.height - 1);
+    const maxX = Math.min((gridX + 1) * step, layer.width - 1);
+    const maxY = Math.min((gridY + 1) * step, layer.height - 1);
+
+    for (let y = minY; y <= maxY; y += 1) {
+      for (let x = minX; x <= maxX; x += 1) {
+        const index = y * layer.width + x;
+        if (!layer.renderDepthMask[index]) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
+  if (!layer.maskPixels || !layer.depthPixels) {
+    return true;
+  }
+
+  const minX = Math.min(gridX * step, layer.width - 1);
+  const minY = Math.min(gridY * step, layer.height - 1);
+  const maxX = Math.min((gridX + 1) * step, layer.width - 1);
+  const maxY = Math.min((gridY + 1) * step, layer.height - 1);
+
+  for (let y = minY; y <= maxY; y += 1) {
+    for (let x = minX; x <= maxX; x += 1) {
+      const index = y * layer.width + x;
+      if (!layer.maskPixels[index] || layer.depthPixels[index] <= 0) {
+        return false;
+      }
+    }
+  }
+
+  return true;
 }
 
 function isSegmentContourPixel(segmentMap, width, height, index) {
@@ -1532,100 +1618,11 @@ function expandGapMaskWithinSegment(gapMask, segmentMap, width, height, passes) 
 
 function inpaintSegmentDepthGaps(sourcePixels, segmentMap, segmentDepthMeans, width, height, gapMask) {
   const filled = sourcePixels.slice();
-  const totalPixels = width * height;
-  const queued = new Uint8Array(totalPixels);
-  const queue = new Int32Array(totalPixels);
-  let head = 0;
-  let tail = 0;
-  let remaining = 0;
-
   for (let index = 0; index < filled.length; index += 1) {
     if (gapMask[index]) {
       filled[index] = 0;
-      remaining += 1;
     }
   }
-
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const index = y * width + x;
-      if (!gapMask[index]) {
-        continue;
-      }
-
-      const segmentIndex = segmentMap[index];
-      if (segmentIndex < 0) {
-        continue;
-      }
-
-      if (hasFilledSegmentNeighbor(filled, segmentMap, width, height, x, y, segmentIndex)) {
-        queue[tail++] = index;
-        queued[index] = 1;
-      }
-    }
-  }
-
-  while (head < tail && remaining > 0) {
-    const index = queue[head++];
-    if (!gapMask[index] || filled[index] > 0) {
-      continue;
-    }
-
-    const x = index % width;
-    const y = Math.floor(index / width);
-    const segmentIndex = segmentMap[index];
-    if (segmentIndex < 0) {
-      continue;
-    }
-
-    const replacement = sampleSegmentNeighborDepth(
-      filled,
-      segmentMap,
-      segmentDepthMeans,
-      width,
-      height,
-      x,
-      y,
-      segmentIndex,
-    );
-
-    if (replacement <= 0) {
-      continue;
-    }
-
-    filled[index] = replacement;
-    remaining -= 1;
-    tail = enqueueGapNeighbors(queue, queued, gapMask, segmentMap, width, height, x, y, segmentIndex, tail);
-  }
-
-  if (remaining > 0) {
-    for (let index = 0; index < totalPixels; index += 1) {
-      if (!gapMask[index] || filled[index] > 0) {
-        continue;
-      }
-
-      const segmentIndex = segmentMap[index];
-      if (segmentIndex < 0) {
-        continue;
-      }
-
-      const replacement = sampleSegmentNeighborDepth(
-        filled,
-        segmentMap,
-        segmentDepthMeans,
-        width,
-        height,
-        index % width,
-        Math.floor(index / width),
-        segmentIndex,
-      );
-
-      filled[index] = replacement > 0
-        ? replacement
-        : sampleSegmentMeanDepth(sourcePixels, segmentMap, segmentDepthMeans, width, height, index % width, Math.floor(index / width), segmentIndex);
-    }
-  }
-
   return filled;
 }
 
@@ -2116,7 +2113,7 @@ async function ensureDefaultPsdPairLoaded() {
     renderState.pendingPsdDepthBuffer = depthBuffer;
   }
 
-  loadPsdPair(renderState.pendingPsdColorBuffer, renderState.pendingPsdDepthBuffer);
+  await loadPsdPair(renderState.pendingPsdColorBuffer, renderState.pendingPsdDepthBuffer);
 }
 
 async function fetchArrayBuffer(url) {
@@ -2127,23 +2124,51 @@ async function fetchArrayBuffer(url) {
   return response.arrayBuffer();
 }
 
-function loadPsdPair(colorBuffer, depthBuffer) {
+async function loadPsdPair(colorBuffer, depthBuffer) {
   disposePsdLayerTextures();
   const colorPsd = agPsd.readPsd(colorBuffer);
   const depthPsd = agPsd.readPsd(depthBuffer);
-  const layerEntries = createPsdLayerEntries(colorPsd, depthPsd);
+  const stableDepthPixels = await ensurePsdStableDepthPixels(colorPsd.width, colorPsd.height);
+  const layerEntries = createPsdLayerEntries(colorPsd, depthPsd, stableDepthPixels);
 
   renderState.psdColorDocument = colorPsd;
   renderState.psdDepthDocument = depthPsd;
+  renderState.psdStableDepthPixels = stableDepthPixels;
   renderState.psdLayerEntries = layerEntries;
   renderState.psdLayerVisibility = new Array(layerEntries.length).fill(true);
   renderState.psdLayerDepthOffsets = new Array(layerEntries.length).fill(0);
   renderState.psdLayerDepthScales = new Array(layerEntries.length).fill(1);
+  renderState.psdDebugLayerIndex = -1;
   renderState.imageWidth = colorPsd.width;
   renderState.imageHeight = colorPsd.height;
   renderState.psdColorPreviewUrl = colorPsd.canvas ? colorPsd.canvas.toDataURL("image/png") : "";
   renderState.psdDepthPreviewUrl = depthPsd.canvas ? depthPsd.canvas.toDataURL("image/png") : "";
   rebuildSegmentList();
+  updatePsdDebugPanel();
+}
+
+async function rebuildPsdLayerEntriesIfNeeded() {
+  if (renderState.sourceMode !== "psd") {
+    return false;
+  }
+
+  if (renderState.pendingPsdColorBuffer && renderState.pendingPsdDepthBuffer) {
+    await loadPsdPair(renderState.pendingPsdColorBuffer, renderState.pendingPsdDepthBuffer);
+    return true;
+  }
+
+  if (renderState.psdColorDocument && renderState.psdDepthDocument) {
+    const [colorBuffer, depthBuffer] = await Promise.all([
+      fetchArrayBuffer(defaultPsdColorUrl),
+      fetchArrayBuffer(defaultPsdDepthUrl),
+    ]);
+    renderState.pendingPsdColorBuffer = colorBuffer;
+    renderState.pendingPsdDepthBuffer = depthBuffer;
+    await loadPsdPair(colorBuffer, depthBuffer);
+    return true;
+  }
+
+  return false;
 }
 
 function disposePsdLayerTextures() {
@@ -2155,11 +2180,42 @@ function disposePsdLayerTextures() {
     if (layer.depthTexture) {
       layer.depthTexture.dispose();
     }
+    if (layer.maskTexture) {
+      layer.maskTexture.dispose();
+    }
+    if (layer.debugTexture) {
+      layer.debugTexture.dispose();
+    }
   }
   renderState.psdLayerEntries = [];
 }
 
-function createPsdLayerEntries(colorPsd, depthPsd) {
+async function ensurePsdStableDepthPixels(expectedWidth, expectedHeight) {
+  if (
+    renderState.psdStableDepthPixels &&
+    renderState.psdStableDepthWidth === expectedWidth &&
+    renderState.psdStableDepthHeight === expectedHeight
+  ) {
+    return renderState.psdStableDepthPixels;
+  }
+
+  const stableImage = await loadImagePixels(defaultPsdStableDepthUrl);
+  if (stableImage.width !== expectedWidth || stableImage.height !== expectedHeight) {
+    throw new Error("Stable depth image size must match PSD size.");
+  }
+
+  const pixels = new Uint8Array(stableImage.width * stableImage.height);
+  for (let i = 0, p = 0; i < stableImage.data.length; i += 4, p += 1) {
+    pixels[p] = stableImage.data[i];
+  }
+
+  renderState.psdStableDepthPixels = pixels;
+  renderState.psdStableDepthWidth = stableImage.width;
+  renderState.psdStableDepthHeight = stableImage.height;
+  return pixels;
+}
+
+function createPsdLayerEntries(colorPsd, depthPsd, stableDepthPixels) {
   const colorLayers = flattenPsdLayers(colorPsd.children || []);
   const depthLayers = flattenPsdLayers(depthPsd.children || []);
   const depthByName = new Map();
@@ -2173,7 +2229,7 @@ function createPsdLayerEntries(colorPsd, depthPsd) {
     depthByName.get(key).push(layer);
   }
 
-  const entries = [];
+  const layerSources = [];
 
   for (let i = 0; i < colorLayers.length; i += 1) {
     const colorLayer = colorLayers[i];
@@ -2196,22 +2252,1133 @@ function createPsdLayerEntries(colorPsd, depthPsd) {
     colorTexture.magFilter = THREE.LinearFilter;
     colorTexture.needsUpdate = true;
 
-    const depthPixels = extractDepthPixelsFromCanvas(depthLayer.canvas);
-    const depthTexture = createDepthTextureResources(depthLayer.width, depthLayer.height, depthPixels).texture;
+    const colorImageData = getCanvasImageData(colorLayer.canvas);
+    const depthImageData = getCanvasImageData(depthLayer.canvas);
 
-    entries.push({
-      name: colorLayer.name || `Layer ${entries.length + 1}`,
+    layerSources.push({
+      name: colorLayer.name || `Layer ${layerSources.length + 1}`,
+      sourceIndex: i,
       left: colorLayer.left,
       top: colorLayer.top,
       width: colorLayer.width,
       height: colorLayer.height,
       colorTexture,
+      colorImageData,
+      depthImageData,
+      depthMaskPixels: extractLayerMaskPixels(depthImageData.data),
+    });
+  }
+
+  const mergedLayerSources = mergePsdFaceFeatureLayers(layerSources, colorPsd.width, colorPsd.height);
+
+  const visibleLayerMap = buildVisiblePsdLayerMap(
+    colorPsd.width,
+    colorPsd.height,
+    mergedLayerSources,
+  );
+  const entries = [];
+
+  for (let i = 0; i < mergedLayerSources.length; i += 1) {
+    const layer = mergedLayerSources[i];
+    const maskPixels = extractLayerMaskPixels(layer.colorImageData.data);
+    const seededDepthPixels = seedPsdLayerDepthPixels(
+      layer,
+      i,
+      colorPsd.width,
+      colorPsd.height,
+      stableDepthPixels,
+      visibleLayerMap,
+      maskPixels,
+    );
+    const pruneResult = prunePsdForeignDepthSeeds(
+      seededDepthPixels,
+      layer,
+      i,
+      colorPsd.width,
+      colorPsd.height,
+      stableDepthPixels,
+      visibleLayerMap,
+      maskPixels,
+      Number(depthDiscontinuityEl.value),
+    );
+    const depthPixels = pruneResult.pixels;
+    if (contourRepairEl.checked) {
+      const contourBandMask = buildLayerContourBandMask(maskPixels, layer.width, layer.height, 2);
+      for (let p = 0; p < depthPixels.length; p += 1) {
+        if (contourBandMask[p]) {
+          depthPixels[p] = 0;
+          pruneResult.debugState[p] = 5;
+        }
+      }
+    }
+
+    const erodedPositiveMask = erodePositiveDepthMask(depthPixels, layer.width, layer.height, 1);
+    let removedDepthPixels = 0;
+    for (let p = 0; p < depthPixels.length; p += 1) {
+      if (maskPixels[p] && depthPixels[p] > 0 && !erodedPositiveMask[p]) {
+        depthPixels[p] = 0;
+        pruneResult.debugState[p] = 5;
+        removedDepthPixels += 1;
+      }
+    }
+
+    const inpaintedDepthPixels = inpaintMaskedLayerDepth(depthPixels, maskPixels, layer.width, layer.height);
+    const renderDepthMask = new Uint8Array(inpaintedDepthPixels.length);
+    for (let p = 0; p < inpaintedDepthPixels.length; p += 1) {
+      renderDepthMask[p] = maskPixels[p] && inpaintedDepthPixels[p] > 0 ? 1 : 0;
+    }
+    const depthTexture = createDepthTextureResources(layer.width, layer.height, inpaintedDepthPixels).texture;
+    const maskTexture = createBinaryMaskTexture(layer.width, layer.height, renderDepthMask);
+    const debugTexture = createPsdDebugTexture(layer.width, layer.height, maskPixels, pruneResult.debugState, pruneResult.debugScore);
+    depthTexture.minFilter = THREE.NearestFilter;
+    depthTexture.magFilter = THREE.NearestFilter;
+    depthTexture.needsUpdate = true;
+
+    entries.push({
+      name: layer.name,
+      left: layer.left,
+      top: layer.top,
+      width: layer.width,
+      height: layer.height,
+      colorTexture: layer.colorTexture,
       depthTexture,
+      maskTexture,
+      debugTexture: debugTexture.texture,
+      debugPreviewUrl: debugTexture.url,
+      depthPixels: inpaintedDepthPixels,
+      renderDepthMask,
+      maskPixels,
+      removedDepthPixels,
       visible: true,
     });
   }
 
   return entries;
+}
+
+function getCanvasImageData(canvas) {
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  return context.getImageData(0, 0, canvas.width, canvas.height);
+}
+
+function mergePsdFaceFeatureLayers(layerSources, imageWidth, imageHeight) {
+  const merged = layerSources.slice();
+  const featureRegex = /(?:^|[\s_-])(nose|mouth|eyewhite|eyebrow|irides|eyelash|eye)(?:$|[\s_-])/i;
+  const faceRegex = /(face|skin|head)/i;
+  const mergePlans = [];
+
+  for (let i = 0; i < merged.length; i += 1) {
+    if (featureRegex.test(merged[i].name)) {
+      const targetIndex = findPsdFeatureMergeTarget(merged, i, faceRegex, imageWidth, imageHeight);
+      if (targetIndex >= 0) {
+        mergePlans.push({
+          sourceIndex: i,
+          targetIndex,
+        });
+      }
+    }
+  }
+
+  mergePlans.sort((a, b) => b.sourceIndex - a.sourceIndex);
+
+  const removed = new Uint8Array(merged.length);
+  for (let i = 0; i < mergePlans.length; i += 1) {
+    const { sourceIndex, targetIndex } = mergePlans[i];
+    if (removed[sourceIndex] || removed[targetIndex]) {
+      continue;
+    }
+    compositePsdLayerIntoTarget(merged[targetIndex], merged[sourceIndex], imageWidth, imageHeight);
+    removed[sourceIndex] = 1;
+  }
+
+  for (let i = merged.length - 1; i >= 0; i -= 1) {
+    if (removed[i]) {
+      merged.splice(i, 1);
+    }
+  }
+
+  return merged;
+}
+
+function findPsdFeatureMergeTarget(layerSources, featureIndex, faceRegex, imageWidth, imageHeight) {
+  const featureLayer = layerSources[featureIndex];
+  let bestIndex = -1;
+  let bestScore = -1;
+
+  for (let i = 0; i < layerSources.length; i += 1) {
+    if (i === featureIndex) {
+      continue;
+    }
+
+    const candidate = layerSources[i];
+    if (!faceRegex.test(candidate.name)) {
+      continue;
+    }
+
+    const overlap = estimateLayerMaskOverlap(featureLayer, candidate, imageWidth, imageHeight);
+    if (overlap <= 0) {
+      continue;
+    }
+
+    if (overlap > bestScore) {
+      bestScore = overlap;
+      bestIndex = i;
+    }
+  }
+
+  return bestIndex;
+}
+
+function estimateLayerMaskOverlap(layerA, layerB, imageWidth, imageHeight) {
+  const left = Math.max(layerA.left, layerB.left, 0);
+  const top = Math.max(layerA.top, layerB.top, 0);
+  const right = Math.min(layerA.left + layerA.width, layerB.left + layerB.width, imageWidth);
+  const bottom = Math.min(layerA.top + layerA.height, layerB.top + layerB.height, imageHeight);
+  if (right <= left || bottom <= top) {
+    return 0;
+  }
+
+  let overlap = 0;
+  for (let y = top; y < bottom; y += 1) {
+    const ay = y - layerA.top;
+    const by = y - layerB.top;
+    for (let x = left; x < right; x += 1) {
+      const ax = x - layerA.left;
+      const bx = x - layerB.left;
+      const aIndex = ay * layerA.width + ax;
+      const bIndex = by * layerB.width + bx;
+      if (layerA.colorImageData.data[aIndex * 4 + 3] > 0 && layerB.colorImageData.data[bIndex * 4 + 3] > 0) {
+        overlap += 1;
+      }
+    }
+  }
+
+  return overlap;
+}
+
+function compositePsdLayerIntoTarget(targetLayer, featureLayer, imageWidth, imageHeight) {
+  const left = Math.max(targetLayer.left, featureLayer.left, 0);
+  const top = Math.max(targetLayer.top, featureLayer.top, 0);
+  const right = Math.min(targetLayer.left + targetLayer.width, featureLayer.left + featureLayer.width, imageWidth);
+  const bottom = Math.min(targetLayer.top + targetLayer.height, featureLayer.top + featureLayer.height, imageHeight);
+  if (right <= left || bottom <= top) {
+    return;
+  }
+
+  const targetPixels = targetLayer.colorImageData.data;
+  const featurePixels = featureLayer.colorImageData.data;
+  const targetDepthPixels = targetLayer.depthImageData.data;
+  const featureDepthPixels = featureLayer.depthImageData.data;
+
+  for (let y = top; y < bottom; y += 1) {
+    const ty = y - targetLayer.top;
+    const fy = y - featureLayer.top;
+    for (let x = left; x < right; x += 1) {
+      const tx = x - targetLayer.left;
+      const fx = x - featureLayer.left;
+      const targetOffset = (ty * targetLayer.width + tx) * 4;
+      const featureOffset = (fy * featureLayer.width + fx) * 4;
+      const srcAlpha = featurePixels[featureOffset + 3];
+      if (srcAlpha <= 0) {
+        continue;
+      }
+
+      const srcDepthAlpha = featureDepthPixels[featureOffset + 3];
+      const dstDepthAlpha = targetDepthPixels[targetOffset + 3];
+      const srcDepth = featureDepthPixels[featureOffset];
+      const dstDepth = targetDepthPixels[targetOffset];
+      const featureIsFront = srcDepthAlpha > 0 && (dstDepthAlpha <= 0 || srcDepth <= dstDepth);
+      if (!featureIsFront && targetPixels[targetOffset + 3] > 0) {
+        continue;
+      }
+
+      const srcAlphaN = srcAlpha / 255;
+      const dstAlphaN = targetPixels[targetOffset + 3] / 255;
+      const outAlpha = srcAlphaN + dstAlphaN * (1 - srcAlphaN);
+      if (outAlpha <= 0) {
+        continue;
+      }
+
+      for (let c = 0; c < 3; c += 1) {
+        const src = featurePixels[featureOffset + c] / 255;
+        const dst = targetPixels[targetOffset + c] / 255;
+        const out = (src * srcAlphaN + dst * dstAlphaN * (1 - srcAlphaN)) / outAlpha;
+        targetPixels[targetOffset + c] = clampByte(Math.round(out * 255));
+      }
+      targetPixels[targetOffset + 3] = clampByte(Math.round(outAlpha * 255));
+      for (let c = 0; c < 3; c += 1) {
+        targetDepthPixels[targetOffset + c] = featureDepthPixels[featureOffset + c];
+      }
+      targetDepthPixels[targetOffset + 3] = Math.max(dstDepthAlpha, srcDepthAlpha);
+    }
+  }
+
+  const targetCanvas = document.createElement("canvas");
+  targetCanvas.width = targetLayer.width;
+  targetCanvas.height = targetLayer.height;
+  const targetContext = targetCanvas.getContext("2d");
+  targetContext.putImageData(targetLayer.colorImageData, 0, 0);
+
+  targetLayer.colorTexture.dispose();
+  const colorTexture = new THREE.CanvasTexture(targetCanvas);
+  colorTexture.encoding = THREE.sRGBEncoding;
+  colorTexture.minFilter = THREE.LinearFilter;
+  colorTexture.magFilter = THREE.LinearFilter;
+  colorTexture.needsUpdate = true;
+  targetLayer.colorTexture = colorTexture;
+  targetLayer.depthMaskPixels = extractLayerMaskPixels(targetLayer.depthImageData.data);
+}
+
+function extractLayerMaskPixels(rgbaPixels) {
+  const maskPixels = new Uint8Array(rgbaPixels.length >> 2);
+  for (let i = 0, p = 0; i < rgbaPixels.length; i += 4, p += 1) {
+    maskPixels[p] = rgbaPixels[i + 3] > 0 ? 1 : 0;
+  }
+  return maskPixels;
+}
+
+function extractLayerRelativeDepthPixels(rgbaPixels) {
+  const depthPixels = new Uint8Array(rgbaPixels.length >> 2);
+  for (let i = 0, p = 0; i < rgbaPixels.length; i += 4, p += 1) {
+    depthPixels[p] = rgbaPixels[i + 3] > 0 ? rgbaPixels[i] : 255;
+  }
+  return depthPixels;
+}
+
+function prunePsdForeignDepthSeeds(
+  sourceDepthPixels,
+  layer,
+  layerIndex,
+  imageWidth,
+  imageHeight,
+  stableDepthPixels,
+  visibleLayerMap,
+  maskPixels,
+  threshold,
+) {
+  const filtered = sourceDepthPixels.slice();
+  const debugState = new Uint8Array(filtered.length);
+  const debugScore = new Uint8Array(filtered.length);
+  const globalSupport = collectPositiveValues(filtered);
+  const globalMedian = globalSupport.length ? medianOfNumbers(globalSupport) : 0;
+
+  for (let i = 0; i < filtered.length; i += 1) {
+    if (!maskPixels[i]) {
+      continue;
+    }
+    debugState[i] = filtered[i] > 0 ? 2 : 1;
+  }
+
+  for (let y = 0; y < layer.height; y += 1) {
+    for (let x = 0; x < layer.width; x += 1) {
+      const localIndex = y * layer.width + x;
+      const seedDepth = filtered[localIndex];
+      if (!maskPixels[localIndex] || seedDepth === 0) {
+        continue;
+      }
+
+      const globalX = layer.left + x;
+      const globalY = layer.top + y;
+      const sameLayerSupport = collectPsdLocalDepthSupport(
+        filtered,
+        maskPixels,
+        layer.width,
+        layer.height,
+        x,
+        y,
+        4,
+      );
+      if (sameLayerSupport.length < 4) {
+        continue;
+      }
+
+      const sameMedian = medianOfNumbers(sameLayerSupport);
+      const sortedSupport = sameLayerSupport.slice().sort((a, b) => a - b);
+      const q1 = percentileFromSorted(sortedSupport, 0.25);
+      const q3 = percentileFromSorted(sortedSupport, 0.75);
+      const localRange = sortedSupport[sortedSupport.length - 1] - sortedSupport[0];
+      const foreignSupport = collectPsdForeignVisibleDepthSupport(
+        imageWidth,
+        imageHeight,
+        globalX,
+        globalY,
+        4,
+        layerIndex,
+        stableDepthPixels,
+        visibleLayerMap,
+      );
+      if (foreignSupport.length < 3) {
+        continue;
+      }
+
+      const foreignMedian = medianOfNumbers(foreignSupport);
+      const sameDistance = Math.abs(seedDepth - sameMedian);
+      const foreignDistance = Math.abs(seedDepth - foreignMedian);
+      const globalDistance = Math.abs(seedDepth - globalMedian);
+      const localThreshold = Math.max(2, Math.min(6, threshold * 0.1));
+      const bandDistance = seedDepth < q1 ? q1 - seedDepth : seedDepth > q3 ? seedDepth - q3 : 0;
+      const hasSharpLocalGradient = localRange > localThreshold * 3 && bandDistance > localThreshold;
+      const score = Math.max(sameDistance, globalDistance) - foreignDistance;
+      debugScore[localIndex] = Math.max(debugScore[localIndex], clampByte(Math.round(score * 24)));
+
+      if (
+        (
+          (sameDistance > localThreshold && globalDistance > localThreshold) ||
+          hasSharpLocalGradient
+        ) &&
+        foreignDistance < Math.min(sameDistance, globalDistance)
+      ) {
+        filtered[localIndex] = 0;
+        debugState[localIndex] = 3;
+      }
+    }
+  }
+
+  pruneThinForeignSeedComponents(
+    filtered,
+    debugState,
+    debugScore,
+    layer,
+    layerIndex,
+    imageWidth,
+    imageHeight,
+    stableDepthPixels,
+    visibleLayerMap,
+    maskPixels,
+    globalMedian,
+    threshold,
+  );
+
+  return {
+    pixels: filtered,
+    debugState,
+    debugScore,
+  };
+}
+
+function pruneThinForeignSeedComponents(
+  depthPixels,
+  debugState,
+  debugScore,
+  layer,
+  layerIndex,
+  imageWidth,
+  imageHeight,
+  stableDepthPixels,
+  visibleLayerMap,
+  maskPixels,
+  globalMedian,
+  threshold,
+) {
+  const totalPixels = layer.width * layer.height;
+  const visited = new Uint8Array(totalPixels);
+  const componentIds = new Int32Array(totalPixels);
+  componentIds.fill(-1);
+  const contourMask = buildLayerContourBandMask(maskPixels, layer.width, layer.height, 1);
+  const wideContourMask = buildLayerContourBandMask(maskPixels, layer.width, layer.height, 4);
+  const linkThreshold = Math.max(8, threshold * 0.35);
+  const queue = new Int32Array(totalPixels);
+  const neighbors = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+    [-1, -1],
+    [1, -1],
+    [-1, 1],
+    [1, 1],
+  ];
+  let componentId = 0;
+
+  for (let start = 0; start < totalPixels; start += 1) {
+    if (visited[start] || !maskPixels[start] || depthPixels[start] === 0) {
+      continue;
+    }
+
+    let head = 0;
+    let tail = 0;
+    queue[tail++] = start;
+    visited[start] = 1;
+    componentIds[start] = componentId;
+    const indices = [];
+    const values = [];
+    let minX = layer.width;
+    let maxX = 0;
+    let minY = layer.height;
+    let maxY = 0;
+    let contourHits = 0;
+    let wideContourHits = 0;
+
+    while (head < tail) {
+      const index = queue[head++];
+      indices.push(index);
+      values.push(depthPixels[index]);
+      const x = index % layer.width;
+      const y = Math.floor(index / layer.width);
+      minX = Math.min(minX, x);
+      maxX = Math.max(maxX, x);
+      minY = Math.min(minY, y);
+      maxY = Math.max(maxY, y);
+      if (contourMask[index]) {
+        contourHits += 1;
+      }
+      if (wideContourMask[index]) {
+        wideContourHits += 1;
+      }
+
+      for (let i = 0; i < neighbors.length; i += 1) {
+        const [dx, dy] = neighbors[i];
+        const sx = x + dx;
+        const sy = y + dy;
+        if (sx < 0 || sx >= layer.width || sy < 0 || sy >= layer.height) {
+          continue;
+        }
+
+        const sampleIndex = sy * layer.width + sx;
+        if (visited[sampleIndex] || !maskPixels[sampleIndex] || depthPixels[sampleIndex] === 0) {
+          continue;
+        }
+
+        if (Math.abs(depthPixels[sampleIndex] - depthPixels[index]) > linkThreshold) {
+          continue;
+        }
+
+        visited[sampleIndex] = 1;
+        componentIds[sampleIndex] = componentId;
+        queue[tail++] = sampleIndex;
+      }
+    }
+
+    const width = maxX - minX + 1;
+    const height = maxY - minY + 1;
+    const componentMedian = medianOfNumbers(values);
+    const sameLayerSupport = collectComponentExternalDepthSupport(
+      depthPixels,
+      maskPixels,
+      componentIds,
+      componentId,
+      wideContourMask,
+      layer.width,
+      layer.height,
+      minX,
+      minY,
+      maxX,
+      maxY,
+      5,
+    );
+    const foreignSupport = collectComponentForeignVisibleDepthSupport(
+      indices,
+      layer,
+      imageWidth,
+      imageHeight,
+      stableDepthPixels,
+      visibleLayerMap,
+      layerIndex,
+    );
+    const contourRatio = contourHits / indices.length;
+    const wideContourRatio = wideContourHits / indices.length;
+    const sameMedian = sameLayerSupport.length ? medianOfNumbers(sameLayerSupport) : globalMedian;
+    const foreignMedian = foreignSupport.length ? medianOfNumbers(foreignSupport) : componentMedian;
+    const sameDistance = Math.abs(componentMedian - sameMedian);
+    const foreignDistance = Math.abs(componentMedian - foreignMedian);
+    const isThin = Math.min(width, height) <= 3 || indices.length <= Math.max(width, height) * 2;
+    const isSmallish = indices.length <= Math.max(48, threshold * 8);
+    const localThreshold = Math.max(2, Math.min(6, threshold * 0.1));
+    const componentScore = sameDistance - foreignDistance;
+
+    if (
+      foreignSupport.length >= 4 &&
+      (
+        sameDistance > localThreshold ||
+        (sameLayerSupport.length < 4 && wideContourRatio > 0.7)
+      ) &&
+      foreignDistance < sameDistance &&
+      (contourRatio >= 0.35 || wideContourRatio >= 0.7) &&
+      (isThin || isSmallish)
+    ) {
+      for (let i = 0; i < indices.length; i += 1) {
+        depthPixels[indices[i]] = 0;
+        debugState[indices[i]] = 4;
+        debugScore[indices[i]] = Math.max(debugScore[indices[i]], clampByte(Math.round(componentScore * 24)));
+      }
+    }
+
+    componentId += 1;
+  }
+}
+
+function clampByte(value) {
+  return Math.max(0, Math.min(255, value));
+}
+
+function collectComponentExternalDepthSupport(
+  depthPixels,
+  maskPixels,
+  componentIds,
+  componentId,
+  contourMask,
+  width,
+  height,
+  minX,
+  minY,
+  maxX,
+  maxY,
+  radius,
+) {
+  const values = [];
+  const startX = Math.max(0, minX - radius);
+  const startY = Math.max(0, minY - radius);
+  const endX = Math.min(width - 1, maxX + radius);
+  const endY = Math.min(height - 1, maxY + radius);
+
+  for (let y = startY; y <= endY; y += 1) {
+    for (let x = startX; x <= endX; x += 1) {
+      const index = y * width + x;
+      if (
+        !maskPixels[index] ||
+        depthPixels[index] === 0 ||
+        componentIds[index] === componentId ||
+        contourMask[index]
+      ) {
+        continue;
+      }
+
+      values.push(depthPixels[index]);
+    }
+  }
+
+  return values;
+}
+
+function collectComponentForeignVisibleDepthSupport(
+  indices,
+  layer,
+  imageWidth,
+  imageHeight,
+  stableDepthPixels,
+  visibleLayerMap,
+  layerIndex,
+) {
+  const values = [];
+
+  for (let i = 0; i < indices.length; i += 1) {
+    const index = indices[i];
+    const x = index % layer.width;
+    const y = Math.floor(index / layer.width);
+    const globalX = layer.left + x;
+    const globalY = layer.top + y;
+    if (globalX < 0 || globalX >= imageWidth || globalY < 0 || globalY >= imageHeight) {
+      continue;
+    }
+
+    for (let dy = -2; dy <= 2; dy += 1) {
+      const sy = globalY + dy;
+      if (sy < 0 || sy >= imageHeight) {
+        continue;
+      }
+
+      for (let dx = -2; dx <= 2; dx += 1) {
+        const sx = globalX + dx;
+        if (sx < 0 || sx >= imageWidth) {
+          continue;
+        }
+
+        const globalIndex = sy * imageWidth + sx;
+        const visibleLayer = visibleLayerMap[globalIndex];
+        if (visibleLayer < 0 || visibleLayer === layerIndex) {
+          continue;
+        }
+
+        values.push(stableDepthPixels[globalIndex]);
+      }
+    }
+  }
+
+  return values;
+}
+
+function collectPsdLocalDepthSupport(depthPixels, maskPixels, width, height, centerX, centerY, radius) {
+  const values = [];
+
+  for (let dy = -radius; dy <= radius; dy += 1) {
+    const sy = centerY + dy;
+    if (sy < 0 || sy >= height) {
+      continue;
+    }
+
+    for (let dx = -radius; dx <= radius; dx += 1) {
+      const sx = centerX + dx;
+      if (sx < 0 || sx >= width || sy < 0 || sy >= height || (dx === 0 && dy === 0)) {
+        continue;
+      }
+
+      const sampleIndex = sy * width + sx;
+      const sampleDepth = depthPixels[sampleIndex];
+      if (!maskPixels[sampleIndex] || sampleDepth === 0) {
+        continue;
+      }
+
+      values.push(sampleDepth);
+    }
+  }
+
+  return values;
+}
+
+function collectPsdForeignVisibleDepthSupport(imageWidth, imageHeight, centerX, centerY, radius, layerIndex, stableDepthPixels, visibleLayerMap) {
+  const values = [];
+
+  for (let dy = -radius; dy <= radius; dy += 1) {
+    const sy = centerY + dy;
+    if (sy < 0 || sy >= imageHeight) {
+      continue;
+    }
+
+    for (let dx = -radius; dx <= radius; dx += 1) {
+      const sx = centerX + dx;
+      if (sx < 0 || sx >= imageWidth || (dx === 0 && dy === 0)) {
+        continue;
+      }
+
+      const globalIndex = sy * imageWidth + sx;
+      const visibleLayer = visibleLayerMap[globalIndex];
+      if (visibleLayer < 0 || visibleLayer === layerIndex) {
+        continue;
+      }
+
+      values.push(stableDepthPixels[globalIndex]);
+    }
+  }
+
+  return values;
+}
+
+function medianOfNumbers(values) {
+  const sorted = values.slice().sort((a, b) => a - b);
+  return sorted[(sorted.length - 1) >> 1];
+}
+
+function percentileFromSorted(sorted, percentile) {
+  if (!sorted.length) {
+    return 0;
+  }
+  const index = Math.max(0, Math.min(sorted.length - 1, Math.round((sorted.length - 1) * percentile)));
+  return sorted[index];
+}
+
+function collectPositiveValues(values) {
+  const positive = [];
+  for (let i = 0; i < values.length; i += 1) {
+    if (values[i] > 0) {
+      positive.push(values[i]);
+    }
+  }
+  return positive;
+}
+
+function buildVisiblePsdLayerMap(imageWidth, imageHeight, layers) {
+  const visibleLayerMap = new Int32Array(imageWidth * imageHeight);
+  const visibleDepthMap = new Uint8Array(imageWidth * imageHeight);
+  visibleLayerMap.fill(-1);
+  visibleDepthMap.fill(255);
+
+  for (let layerIndex = 0; layerIndex < layers.length; layerIndex += 1) {
+    const layer = layers[layerIndex];
+    const maskPixels = layer.depthMaskPixels;
+    const relativeDepthPixels = extractLayerRelativeDepthPixels(layer.depthImageData.data);
+
+    for (let y = 0; y < layer.height; y += 1) {
+      for (let x = 0; x < layer.width; x += 1) {
+        const localIndex = y * layer.width + x;
+        if (!maskPixels[localIndex]) {
+          continue;
+        }
+
+        const globalX = layer.left + x;
+        const globalY = layer.top + y;
+        if (globalX < 0 || globalX >= imageWidth || globalY < 0 || globalY >= imageHeight) {
+          continue;
+        }
+
+        const globalIndex = globalY * imageWidth + globalX;
+        const relativeDepth = relativeDepthPixels[localIndex];
+        if (visibleLayerMap[globalIndex] < 0 || relativeDepth < visibleDepthMap[globalIndex]) {
+          visibleLayerMap[globalIndex] = layerIndex;
+          visibleDepthMap[globalIndex] = relativeDepth;
+        }
+      }
+    }
+  }
+
+  return visibleLayerMap;
+}
+
+function seedPsdLayerDepthPixels(layer, layerIndex, imageWidth, imageHeight, stableDepthPixels, visibleLayerMap, maskPixels) {
+  const depthPixels = new Uint8Array(layer.width * layer.height);
+  const stableSeedMask = buildLayerContourBandMask(layer.depthMaskPixels, layer.width, layer.height, 2);
+
+  for (let y = 0; y < layer.height; y += 1) {
+    for (let x = 0; x < layer.width; x += 1) {
+      const localIndex = y * layer.width + x;
+      if (!maskPixels[localIndex]) {
+        continue;
+      }
+      if (stableSeedMask[localIndex]) {
+        continue;
+      }
+
+      const globalX = layer.left + x;
+      const globalY = layer.top + y;
+      if (globalX < 0 || globalX >= imageWidth || globalY < 0 || globalY >= imageHeight) {
+        continue;
+      }
+
+      const globalIndex = globalY * imageWidth + globalX;
+      if (visibleLayerMap[globalIndex] === layerIndex) {
+        depthPixels[localIndex] = stableDepthPixels[globalIndex];
+      }
+    }
+  }
+
+  return depthPixels;
+}
+
+function buildLayerContourBandMask(maskPixels, width, height, thickness) {
+  const contourMask = new Uint8Array(maskPixels.length);
+  const bandMask = new Uint8Array(maskPixels.length);
+
+  for (let index = 0; index < maskPixels.length; index += 1) {
+    if (isMaskContourPixel(maskPixels, width, height, index)) {
+      contourMask[index] = 1;
+      bandMask[index] = 1;
+    }
+  }
+
+  let frontier = contourMask;
+  for (let pass = 1; pass < thickness; pass += 1) {
+    frontier = expandMaskFrontier(maskPixels, width, height, frontier, bandMask);
+  }
+
+  return bandMask;
+}
+
+function buildPositiveDepthErodeMask(depthPixels, width, height, thickness) {
+  const positiveMask = new Uint8Array(depthPixels.length);
+  for (let i = 0; i < depthPixels.length; i += 1) {
+    positiveMask[i] = depthPixels[i] > 0 ? 1 : 0;
+  }
+
+  let eroded = positiveMask.slice();
+  for (let pass = 0; pass < thickness; pass += 1) {
+    eroded = erodeBinaryMask(eroded, width, height);
+  }
+
+  const removedMask = new Uint8Array(depthPixels.length);
+  for (let i = 0; i < positiveMask.length; i += 1) {
+    if (positiveMask[i] && !eroded[i]) {
+      removedMask[i] = 1;
+    }
+  }
+
+  return removedMask;
+}
+
+function erodePositiveDepthMask(depthPixels, width, height, thickness) {
+  let mask = new Uint8Array(depthPixels.length);
+  for (let i = 0; i < depthPixels.length; i += 1) {
+    mask[i] = depthPixels[i] > 0 ? 1 : 0;
+  }
+
+  for (let pass = 0; pass < thickness; pass += 1) {
+    mask = erodeBinaryMask(mask, width, height);
+  }
+
+  return mask;
+}
+
+function erodeBinaryMask(maskPixels, width, height) {
+  const eroded = new Uint8Array(maskPixels.length);
+  const offsets = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+    [-1, -1],
+    [1, -1],
+    [-1, 1],
+    [1, 1],
+  ];
+
+  for (let index = 0; index < maskPixels.length; index += 1) {
+    if (!maskPixels[index]) {
+      continue;
+    }
+
+    const x = index % width;
+    const y = Math.floor(index / width);
+    let keep = true;
+    for (let i = 0; i < offsets.length; i += 1) {
+      const [dx, dy] = offsets[i];
+      const sx = x + dx;
+      const sy = y + dy;
+      if (sx < 0 || sx >= width || sy < 0 || sy >= height || !maskPixels[sy * width + sx]) {
+        keep = false;
+        break;
+      }
+    }
+
+    if (keep) {
+      eroded[index] = 1;
+    }
+  }
+
+  return eroded;
+}
+
+function isMaskContourPixel(maskPixels, width, height, index) {
+  if (!maskPixels[index]) {
+    return false;
+  }
+
+  const x = index % width;
+  const y = Math.floor(index / width);
+  const offsets = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+  ];
+
+  for (let i = 0; i < offsets.length; i += 1) {
+    const [dx, dy] = offsets[i];
+    const sx = x + dx;
+    const sy = y + dy;
+    if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+      return true;
+    }
+
+    if (!maskPixels[sy * width + sx]) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function expandMaskFrontier(maskPixels, width, height, frontier, bandMask) {
+  const next = new Uint8Array(maskPixels.length);
+  const offsets = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+    [-1, -1],
+    [1, -1],
+    [-1, 1],
+    [1, 1],
+  ];
+
+  for (let index = 0; index < frontier.length; index += 1) {
+    if (!frontier[index]) {
+      continue;
+    }
+
+    const x = index % width;
+    const y = Math.floor(index / width);
+    for (let i = 0; i < offsets.length; i += 1) {
+      const [dx, dy] = offsets[i];
+      const sx = x + dx;
+      const sy = y + dy;
+      if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+        continue;
+      }
+
+      const sampleIndex = sy * width + sx;
+      if (!maskPixels[sampleIndex] || bandMask[sampleIndex]) {
+        continue;
+      }
+
+      bandMask[sampleIndex] = 1;
+      next[sampleIndex] = 1;
+    }
+  }
+
+  return next;
+}
+
+function inpaintMaskedLayerDepth(sourceDepthPixels, maskPixels, width, height) {
+  const depthPixels = sourceDepthPixels.slice();
+  const totalPixels = width * height;
+  const queue = new Int32Array(totalPixels);
+  const queued = new Uint8Array(totalPixels);
+  let head = 0;
+  let tail = 0;
+
+  for (let index = 0; index < totalPixels; index += 1) {
+    if (!maskPixels[index] || depthPixels[index] > 0) {
+      continue;
+    }
+    if (!hasPositiveMaskedNeighbor(depthPixels, maskPixels, width, height, index)) {
+      continue;
+    }
+    queue[tail++] = index;
+    queued[index] = 1;
+  }
+
+  while (head < tail) {
+    const index = queue[head++];
+    if (!maskPixels[index] || depthPixels[index] > 0) {
+      continue;
+    }
+
+    const fillDepth = sampleMaskedNeighborMedian(depthPixels, maskPixels, width, height, index);
+    if (fillDepth <= 0) {
+      continue;
+    }
+
+    depthPixels[index] = fillDepth;
+    tail = enqueueMaskedGapNeighbors(queue, queued, depthPixels, maskPixels, width, height, index, tail);
+  }
+
+  return depthPixels;
+}
+
+function hasPositiveMaskedNeighbor(depthPixels, maskPixels, width, height, index) {
+  const x = index % width;
+  const y = Math.floor(index / width);
+  const offsets = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+    [-1, -1],
+    [1, -1],
+    [-1, 1],
+    [1, 1],
+  ];
+
+  for (let i = 0; i < offsets.length; i += 1) {
+    const [dx, dy] = offsets[i];
+    const sx = x + dx;
+    const sy = y + dy;
+    if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+      continue;
+    }
+    const sampleIndex = sy * width + sx;
+    if (maskPixels[sampleIndex] && depthPixels[sampleIndex] > 0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function sampleMaskedNeighborMedian(depthPixels, maskPixels, width, height, index) {
+  const x = index % width;
+  const y = Math.floor(index / width);
+  const values = [];
+  const offsets = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+    [-1, -1],
+    [1, -1],
+    [-1, 1],
+    [1, 1],
+  ];
+
+  for (let i = 0; i < offsets.length; i += 1) {
+    const [dx, dy] = offsets[i];
+    const sx = x + dx;
+    const sy = y + dy;
+    if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+      continue;
+    }
+
+    const sampleIndex = sy * width + sx;
+    if (!maskPixels[sampleIndex] || depthPixels[sampleIndex] <= 0) {
+      continue;
+    }
+
+    values.push(depthPixels[sampleIndex]);
+  }
+
+  if (!values.length) {
+    return 0;
+  }
+
+  return medianOfNumbers(values);
+}
+
+function sampleMaskedNeighborDepth(depthPixels, maskPixels, width, height, index) {
+  const x = index % width;
+  const y = Math.floor(index / width);
+  const offsets = [
+    [-1, 0, 1],
+    [1, 0, 1],
+    [0, -1, 1],
+    [0, 1, 1],
+    [-1, -1, Math.SQRT2],
+    [1, -1, Math.SQRT2],
+    [-1, 1, Math.SQRT2],
+    [1, 1, Math.SQRT2],
+  ];
+
+  let weightedSum = 0;
+  let totalWeight = 0;
+
+  for (let i = 0; i < offsets.length; i += 1) {
+    const [dx, dy, distance] = offsets[i];
+    const sx = x + dx;
+    const sy = y + dy;
+    if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+      continue;
+    }
+    const sampleIndex = sy * width + sx;
+    if (!maskPixels[sampleIndex] || depthPixels[sampleIndex] <= 0) {
+      continue;
+    }
+    const weight = 1 / distance;
+    weightedSum += depthPixels[sampleIndex] * weight;
+    totalWeight += weight;
+  }
+
+  return totalWeight > 0 ? Math.max(1, Math.min(255, Math.round(weightedSum / totalWeight))) : 0;
+}
+
+function enqueueMaskedGapNeighbors(queue, queued, depthPixels, maskPixels, width, height, index, tail) {
+  const x = index % width;
+  const y = Math.floor(index / width);
+  const offsets = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+    [-1, -1],
+    [1, -1],
+    [-1, 1],
+    [1, 1],
+  ];
+
+  let nextTail = tail;
+
+  for (let i = 0; i < offsets.length; i += 1) {
+    const [dx, dy] = offsets[i];
+    const sx = x + dx;
+    const sy = y + dy;
+    if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+      continue;
+    }
+    const sampleIndex = sy * width + sx;
+    if (!maskPixels[sampleIndex] || depthPixels[sampleIndex] > 0 || queued[sampleIndex]) {
+      continue;
+    }
+    queue[nextTail++] = sampleIndex;
+    queued[sampleIndex] = 1;
+  }
+
+  return nextTail;
 }
 
 function flattenPsdLayers(layers, output = []) {
@@ -2273,7 +3440,7 @@ async function replaceImage(kind, file) {
     }
 
     if (renderState.pendingPsdColorBuffer && renderState.pendingPsdDepthBuffer) {
-      loadPsdPair(renderState.pendingPsdColorBuffer, renderState.pendingPsdDepthBuffer);
+      await loadPsdPair(renderState.pendingPsdColorBuffer, renderState.pendingPsdDepthBuffer);
       renderState.sourceMode = "psd";
       sourceModeEl.value = "psd";
       syncViewerModeUi();
@@ -2463,7 +3630,10 @@ function refreshStatusCounts() {
       (sum, entry) => sum + entry.mesh.geometry.attributes.position.count,
       0,
     );
-    statusEl.textContent = `${renderState.imageWidth}x${renderState.imageHeight} | psd-layers ${visibleLayers}/${layerCount} | vertices ${vertexCount.toLocaleString()} | triangles ${triangleCount.toLocaleString()}`;
+    const debugSuffix = renderState.psdDebugLayerIndex >= 0
+      ? ` | debug D=kept R=pixel M=component Y=contour dark=empty`
+      : "";
+    statusEl.textContent = `${renderState.imageWidth}x${renderState.imageHeight} | psd-layers ${visibleLayers}/${layerCount} | vertices ${vertexCount.toLocaleString()} | triangles ${triangleCount.toLocaleString()}${debugSuffix}`;
     return;
   }
 
@@ -3800,6 +4970,7 @@ function rebuildSegmentList() {
       const controls = document.createElement("div");
       controls.className = "segment-controls";
 
+      const debugButton = createSegmentControlButton("D", "debug-toggle", index);
       const offsetDown = createSegmentControlButton("-", "offset-down", index);
       const offsetUp = createSegmentControlButton("+", "offset-up", index);
       const scaleDown = createSegmentControlButton("<", "scale-down", index);
@@ -3808,7 +4979,7 @@ function rebuildSegmentList() {
       metrics.className = "segment-metrics";
       metrics.dataset.segmentMetrics = String(index);
 
-      controls.append(offsetDown, offsetUp, scaleDown, scaleUp, metrics);
+      controls.append(debugButton, offsetDown, offsetUp, scaleDown, scaleUp, metrics);
       row.append(checkbox, swatch, name, size, controls);
       segmentListEl.appendChild(row);
     });
@@ -3932,9 +5103,27 @@ function syncSegmentAdjustmentLabels() {
       label.textContent = `o${renderState.segmentDepthOffsets[index]} s${renderState.segmentDepthScales[index].toFixed(2)}`;
     }
   });
+
+  const debugButtons = segmentListEl.querySelectorAll('[data-segment-action="debug-toggle"]');
+  debugButtons.forEach((button) => {
+    const index = Number(button.dataset.segmentIndex);
+    const active = renderState.psdDebugLayerIndex === index;
+    button.textContent = active ? "H" : "D";
+    button.title = active ? "Hide debug evidence" : "Show debug evidence";
+    button.style.background = active ? "rgba(255, 120, 120, 0.28)" : "rgba(255, 255, 255, 0.05)";
+  });
+
+  updatePsdDebugPanel();
 }
 
 function applySegmentDepthAdjustment(action, segmentIndex) {
+  if (action === "debug-toggle" && renderState.sourceMode === "psd") {
+    renderState.psdDebugLayerIndex = renderState.psdDebugLayerIndex === segmentIndex ? -1 : segmentIndex;
+    syncSegmentAdjustmentLabels();
+    buildMesh();
+    return;
+  }
+
   const offsets = renderState.sourceMode === "psd"
     ? renderState.psdLayerDepthOffsets
     : renderState.segmentDepthOffsets;
@@ -4236,6 +5425,114 @@ function createDepthTextureResources(width, height, pixels) {
   texture.needsUpdate = true;
 
   return { texture, pixels };
+}
+
+function createBinaryMaskTexture(width, height, maskPixels) {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  const imageData = context.createImageData(width, height);
+
+  for (let pixelIndex = 0; pixelIndex < maskPixels.length; pixelIndex += 1) {
+    const value = maskPixels[pixelIndex] ? 255 : 0;
+    const imageIndex = pixelIndex * 4;
+    imageData.data[imageIndex] = value;
+    imageData.data[imageIndex + 1] = value;
+    imageData.data[imageIndex + 2] = value;
+    imageData.data[imageIndex + 3] = 255;
+  }
+
+  context.putImageData(imageData, 0, 0);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.minFilter = THREE.NearestFilter;
+  texture.magFilter = THREE.NearestFilter;
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function updatePsdDebugPanel() {
+  if (!psdDebugPanelEl) {
+    return;
+  }
+
+  if (renderState.sourceMode !== "psd" || renderState.psdDebugLayerIndex < 0) {
+    psdDebugPanelEl.classList.remove("is-visible");
+    psdDebugImageEl.removeAttribute("src");
+    return;
+  }
+
+  const layer = renderState.psdLayerEntries[renderState.psdDebugLayerIndex];
+  if (!layer || !layer.debugPreviewUrl) {
+    psdDebugPanelEl.classList.remove("is-visible");
+    psdDebugImageEl.removeAttribute("src");
+    return;
+  }
+
+  psdDebugTitleEl.textContent = `PSD debug: ${layer.name || `Layer ${renderState.psdDebugLayerIndex + 1}`} | removed ${layer.removedDepthPixels || 0}px`;
+  psdDebugImageEl.src = layer.debugPreviewUrl;
+  psdDebugPanelEl.classList.add("is-visible");
+}
+
+function createPsdDebugTexture(width, height, maskPixels, debugState, debugScore) {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  const imageData = context.createImageData(width, height);
+
+  for (let pixelIndex = 0; pixelIndex < maskPixels.length; pixelIndex += 1) {
+    const imageIndex = pixelIndex * 4;
+    if (!maskPixels[pixelIndex]) {
+      imageData.data[imageIndex + 3] = 0;
+      continue;
+    }
+
+    const state = debugState[pixelIndex];
+    const score = debugScore[pixelIndex] / 255;
+    let r = 24;
+    let g = 24;
+    let b = 30;
+    let a = 220;
+
+    if (state === 1) {
+      r = 18;
+      g = 18;
+      b = 28;
+      a = 120;
+    } else if (state === 2) {
+      r = Math.round(20 + score * 40);
+      g = Math.round(70 + score * 120);
+      b = Math.round(180 + score * 60);
+    } else if (state === 3) {
+      r = 255;
+      g = Math.round(170 * (1 - score * 0.7));
+      b = Math.round(40 * (1 - score * 0.3));
+    } else if (state === 4) {
+      r = 255;
+      g = Math.round(60 + score * 30);
+      b = Math.round(170 + score * 60);
+    } else if (state === 5) {
+      r = 255;
+      g = 235;
+      b = 90;
+    }
+
+    imageData.data[imageIndex] = r;
+    imageData.data[imageIndex + 1] = g;
+    imageData.data[imageIndex + 2] = b;
+    imageData.data[imageIndex + 3] = a;
+  }
+
+  context.putImageData(imageData, 0, 0);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.minFilter = THREE.NearestFilter;
+  texture.magFilter = THREE.NearestFilter;
+  texture.needsUpdate = true;
+  return {
+    texture,
+    url: canvas.toDataURL("image/png"),
+  };
 }
 
 function sampleGridPosition(index, count, extent) {
