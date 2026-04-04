@@ -9,6 +9,7 @@ const depthDiscontinuityValueEl = document.querySelector("#depthDiscontinuityVal
 const invertDepthEl = document.querySelector("#invertDepth");
 const sourceModeEl = document.querySelector("#sourceMode");
 const contourRepairEl = document.querySelector("#contourRepair");
+const surfaceSmoothEl = document.querySelector("#surfaceSmooth");
 const depthModeEl = document.querySelector("#depthMode");
 const gridSpecModeEl = document.querySelector("#gridSpecMode");
 const gridXEl = document.querySelector("#gridX");
@@ -32,19 +33,18 @@ const segmentFileInputEl = document.querySelector("#segmentFileInput");
 const psdDebugPanelEl = document.querySelector("#psdDebugPanel");
 const psdDebugTitleEl = document.querySelector("#psdDebugTitle");
 const psdDebugImageEl = document.querySelector("#psdDebugImage");
+const psdDepthImageEl = document.querySelector("#psdDepthImage");
 
 const colorUrl = "./data/Midori-color.jpg";
 const depthUrl = "./data/Midori-depth.jpg";
 const segmentUrl = "./data/Midori-segment.jpg";
-const psdColorUrl = "./data/Midori-color.psd";
-const psdDepthUrl = "./data/Midori-color_depth.psd";
+const psdColorUrl = "./data/Midori-full.psd";
 const psdStableDepthUrl = "./data/Midori-depth-st.png";
 const cacheBustToken = `${Date.now()}`;
 const defaultColorUrl = withCacheBust(colorUrl);
 const defaultDepthUrl = withCacheBust(depthUrl);
 const defaultSegmentUrl = withCacheBust(segmentUrl);
 const defaultPsdColorUrl = withCacheBust(psdColorUrl);
-const defaultPsdDepthUrl = withCacheBust(psdDepthUrl);
 const defaultPsdStableDepthUrl = withCacheBust(psdStableDepthUrl);
 const invalidDepthThreshold = 1 / 255;
 const segmentAnchorDistance = 36;
@@ -134,6 +134,7 @@ const renderState = {
   psdLayerVisibility: [],
   psdLayerDepthOffsets: [],
   psdLayerDepthScales: [],
+  psdLayerOutlierPruneEnabled: [],
   psdDebugLayerIndex: -1,
   psdColorPreviewUrl: "",
   psdDepthPreviewUrl: "",
@@ -188,6 +189,29 @@ const fragmentShader = `
   }
 `;
 
+const staticVertexShader = `
+  varying vec2 vUv;
+
+  void main() {
+    vUv = uv;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`;
+
+const staticFragmentShader = `
+  uniform sampler2D uColorTexture;
+  uniform sampler2D uSegmentMaskTexture;
+  varying vec2 vUv;
+
+  void main() {
+    if (texture2D(uSegmentMaskTexture, vUv).r < 0.5) {
+      discard;
+    }
+    vec4 color = texture2D(uColorTexture, vUv);
+    gl_FragColor = color;
+  }
+`;
+
 const pointVertexShader = `
   uniform sampler2D uDepthTexture;
   uniform float uDepthScale;
@@ -231,6 +255,17 @@ const pointFragmentShader = `
   }
 `;
 
+const staticPointVertexShader = `
+  varying vec2 vUv;
+  uniform float uPointSize;
+
+  void main() {
+    vUv = uv;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    gl_PointSize = uPointSize;
+  }
+`;
+
 const psdLayerVertexShader = `
   uniform sampler2D uDepthTexture;
   uniform float uDepthScale;
@@ -257,6 +292,23 @@ const psdLayerFragmentShader = `
 
   void main() {
     if (vDepthMask < 0.5 || texture2D(uMaskTexture, vUv).r < 0.5) {
+      discard;
+    }
+    vec4 color = texture2D(uColorTexture, vUv);
+    if (color.a < 0.01) {
+      discard;
+    }
+    gl_FragColor = color;
+  }
+`;
+
+const staticPsdLayerFragmentShader = `
+  uniform sampler2D uColorTexture;
+  uniform sampler2D uMaskTexture;
+  varying vec2 vUv;
+
+  void main() {
+    if (texture2D(uMaskTexture, vUv).r < 0.5) {
       discard;
     }
     vec4 color = texture2D(uColorTexture, vUv);
@@ -351,6 +403,10 @@ function wireControls() {
 
   depthScaleEl.addEventListener("input", () => {
     depthScaleValueEl.textContent = Number(depthScaleEl.value).toFixed(2);
+    if (surfaceSmoothEl.checked) {
+      buildMesh();
+      return;
+    }
     if (renderState.material) {
       renderState.material.uniforms.uDepthScale.value = Number(depthScaleEl.value);
     }
@@ -358,11 +414,9 @@ function wireControls() {
       renderState.edgePointMaterial.uniforms.uDepthScale.value = Number(depthScaleEl.value);
     }
     for (let i = 0; i < renderState.psdLayerMeshes.length; i += 1) {
-      const layerIndex = renderState.psdLayerMeshes[i].layerIndex;
       renderState.psdLayerMeshes[i].mesh.material.uniforms.uDepthScale.value =
-        Number(depthScaleEl.value) * renderState.psdLayerDepthScales[layerIndex];
-      renderState.psdLayerMeshes[i].mesh.position.z =
-        renderState.psdLayerDepthOffsets[layerIndex] / 255 * Number(depthScaleEl.value);
+        Number(depthScaleEl.value);
+      renderState.psdLayerMeshes[i].mesh.position.z = 0;
     }
   });
 
@@ -388,6 +442,10 @@ function wireControls() {
   });
 
   invertDepthEl.addEventListener("change", () => {
+    if (surfaceSmoothEl.checked) {
+      buildMesh();
+      return;
+    }
     if (renderState.material) {
       renderState.material.uniforms.uInvertDepth.value = invertDepthEl.checked ? 1 : 0;
     }
@@ -434,6 +492,15 @@ function wireControls() {
       return;
     }
     rebuildDepthModeResources();
+    buildMesh();
+  });
+
+  surfaceSmoothEl.addEventListener("change", async () => {
+    if (await rebuildPsdLayerEntriesIfNeeded()) {
+      buildMesh();
+      return;
+    }
+    applySegmentDepthAdjustments();
     buildMesh();
   });
 
@@ -561,6 +628,7 @@ function buildMesh() {
   renderState.meshDepthTexture = renderState.activeDepthTexture;
   renderState.meshDepthPixels = renderState.activeDepthPixels;
   renderState.meshGapMask = renderState.repairedBaseGapMask || new Uint8Array(renderState.imageWidth * renderState.imageHeight);
+  const useSurfaceSmooth = surfaceSmoothEl.checked;
   const geometry = buildMaskedPlaneGeometry(
     renderState.imageWidth,
     renderState.imageHeight,
@@ -569,6 +637,12 @@ function buildMesh() {
     renderState.segmentDepthMeans,
     renderState.meshGapMask,
     step,
+    {
+      bakeDepth: useSurfaceSmooth,
+      depthScale: Number(depthScaleEl.value),
+      invertDepth: invertDepthEl.checked,
+      surfaceSmooth: useSurfaceSmooth,
+    },
   );
 
   geometry.computeVertexNormals();
@@ -576,13 +650,15 @@ function buildMesh() {
   const material = new THREE.ShaderMaterial({
     uniforms: {
       uColorTexture: { value: renderState.colorTexture },
-      uDepthTexture: { value: renderState.meshDepthTexture },
       uSegmentMaskTexture: { value: renderState.segmentMaskTexture },
-      uDepthScale: { value: Number(depthScaleEl.value) },
-      uInvertDepth: { value: invertDepthEl.checked ? 1 : 0 },
+      ...(useSurfaceSmooth ? {} : {
+        uDepthTexture: { value: renderState.meshDepthTexture },
+        uDepthScale: { value: Number(depthScaleEl.value) },
+        uInvertDepth: { value: invertDepthEl.checked ? 1 : 0 },
+      }),
     },
-    vertexShader,
-    fragmentShader,
+    vertexShader: useSurfaceSmooth ? staticVertexShader : vertexShader,
+    fragmentShader: useSurfaceSmooth ? staticFragmentShader : fragmentShader,
     side: THREE.DoubleSide,
     transparent: true,
   });
@@ -599,14 +675,19 @@ function buildMesh() {
     step,
   );
   const edgePointMaterial = new THREE.ShaderMaterial({
-    uniforms: {
-      uDepthTexture: { value: renderState.meshDepthTexture },
-      uSegmentMaskTexture: { value: renderState.segmentMaskTexture },
-      uDepthScale: { value: Number(depthScaleEl.value) },
-      uInvertDepth: { value: invertDepthEl.checked ? 1 : 0 },
-      uPointSize: { value: 2.2 },
-    },
-    vertexShader: pointVertexShader,
+    uniforms: useSurfaceSmooth
+      ? {
+        uSegmentMaskTexture: { value: renderState.segmentMaskTexture },
+        uPointSize: { value: 2.2 },
+      }
+      : {
+        uDepthTexture: { value: renderState.meshDepthTexture },
+        uSegmentMaskTexture: { value: renderState.segmentMaskTexture },
+        uDepthScale: { value: Number(depthScaleEl.value) },
+        uInvertDepth: { value: invertDepthEl.checked ? 1 : 0 },
+        uPointSize: { value: 2.2 },
+      },
+    vertexShader: useSurfaceSmooth ? staticPointVertexShader : pointVertexShader,
     fragmentShader: pointFragmentShader,
     transparent: true,
     depthWrite: false,
@@ -645,13 +726,20 @@ function clearSceneVisuals() {
       scene.remove(entry.mesh);
       entry.mesh.geometry.dispose();
       entry.mesh.material.dispose();
+      if (entry.depthTexture) {
+        entry.depthTexture.dispose();
+      }
+      if (entry.maskTexture) {
+        entry.maskTexture.dispose();
+      }
     }
     renderState.psdLayerMeshes = [];
   }
 }
 
 function buildPsdLayerMeshes() {
-  const layers = renderState.psdLayerEntries || [];
+  const layers = buildPreparedPsdLayerEntries();
+  const useSurfaceSmooth = surfaceSmoothEl.checked;
   for (let i = 0; i < layers.length; i += 1) {
     const layer = layers[i];
     if (!renderState.psdLayerVisibility[i]) {
@@ -663,35 +751,152 @@ function buildPsdLayerMeshes() {
       renderState.imageHeight,
       layer,
       Number(meshDetailEl.value),
+      {
+        bakeDepth: useSurfaceSmooth,
+        depthScale: Number(depthScaleEl.value),
+        invertDepth: invertDepthEl.checked,
+        surfaceSmooth: useSurfaceSmooth,
+      },
     );
     const material = new THREE.ShaderMaterial({
       uniforms: {
         uColorTexture: { value: layer.colorTexture },
         uMaskTexture: { value: layer.maskTexture },
-        uDepthTexture: { value: layer.depthTexture },
-        uDepthScale: { value: Number(depthScaleEl.value) * renderState.psdLayerDepthScales[i] },
-        uInvertDepth: { value: invertDepthEl.checked ? 1 : 0 },
+        ...(useSurfaceSmooth ? {} : {
+          uDepthTexture: { value: layer.depthTexture },
+          uDepthScale: { value: Number(depthScaleEl.value) },
+          uInvertDepth: { value: invertDepthEl.checked ? 1 : 0 },
+        }),
       },
-      vertexShader: psdLayerVertexShader,
-      fragmentShader: psdLayerFragmentShader,
+      vertexShader: useSurfaceSmooth ? staticVertexShader : psdLayerVertexShader,
+      fragmentShader: useSurfaceSmooth ? staticPsdLayerFragmentShader : psdLayerFragmentShader,
       side: THREE.DoubleSide,
       transparent: true,
       depthWrite: true,
     });
     const mesh = new THREE.Mesh(geometry, material);
     mesh.renderOrder = i;
-    mesh.position.z += renderState.psdLayerDepthOffsets[i] / 255 * Number(depthScaleEl.value);
     scene.add(mesh);
-    renderState.psdLayerMeshes.push({ mesh, layerIndex: i });
+    renderState.psdLayerMeshes.push({
+      mesh,
+      layerIndex: i,
+      depthTexture: layer.depthTexture,
+      maskTexture: layer.maskTexture,
+    });
   }
 }
 
-function buildMaskedPlaneGeometry(width, height, depthPixels, segmentMap, segmentDepthMeans, gapMask, step) {
+function buildPreparedPsdLayerEntries() {
+  const sourceLayers = renderState.psdLayerEntries || [];
+  const preparedLayers = new Array(sourceLayers.length);
+  const upperDepthLimit = new Uint16Array(renderState.imageWidth * renderState.imageHeight);
+  upperDepthLimit.fill(256);
+
+  for (let layerIndex = sourceLayers.length - 1; layerIndex >= 0; layerIndex -= 1) {
+    const layer = sourceLayers[layerIndex];
+    const baseDepthPixels = layer.baseDepthPixels || layer.depthPixels;
+    const effectiveDepthPixels = new Uint8Array(baseDepthPixels.length);
+    const renderDepthMask = new Uint8Array(baseDepthPixels.length);
+    const depthScale = renderState.psdLayerDepthScales[layerIndex] ?? 1;
+    const depthOffset = renderState.psdLayerDepthOffsets[layerIndex] ?? 0;
+
+    for (let y = 0; y < layer.height; y += 1) {
+      const globalY = layer.top + y;
+      if (globalY < 0 || globalY >= renderState.imageHeight) {
+        continue;
+      }
+
+      for (let x = 0; x < layer.width; x += 1) {
+        const localIndex = y * layer.width + x;
+        if (!layer.maskPixels[localIndex]) {
+          continue;
+        }
+
+        const baseDepth = baseDepthPixels[localIndex];
+        if (baseDepth <= 0) {
+          continue;
+        }
+
+        const globalX = layer.left + x;
+        if (globalX < 0 || globalX >= renderState.imageWidth) {
+          continue;
+        }
+
+        const globalIndex = globalY * renderState.imageWidth + globalX;
+        let effectiveDepth = clamp(Math.round(baseDepth * depthScale + depthOffset), 1, 255);
+        const upperLimit = upperDepthLimit[globalIndex];
+        if (upperLimit <= 255) {
+          effectiveDepth = Math.min(effectiveDepth, Math.max(1, upperLimit - 1));
+        }
+
+        effectiveDepthPixels[localIndex] = effectiveDepth;
+        renderDepthMask[localIndex] = 1;
+      }
+    }
+
+    if (renderState.psdLayerVisibility[layerIndex]) {
+      for (let y = 0; y < layer.height; y += 1) {
+        const globalY = layer.top + y;
+        if (globalY < 0 || globalY >= renderState.imageHeight) {
+          continue;
+        }
+
+        for (let x = 0; x < layer.width; x += 1) {
+          const localIndex = y * layer.width + x;
+          const effectiveDepth = effectiveDepthPixels[localIndex];
+          if (effectiveDepth <= 0) {
+            continue;
+          }
+
+          const globalX = layer.left + x;
+          if (globalX < 0 || globalX >= renderState.imageWidth) {
+            continue;
+          }
+
+          const globalIndex = globalY * renderState.imageWidth + globalX;
+          upperDepthLimit[globalIndex] = Math.min(upperDepthLimit[globalIndex], effectiveDepth);
+        }
+      }
+    }
+
+    const depthTexture = createDepthTextureResources(
+      layer.width,
+      layer.height,
+      effectiveDepthPixels,
+    ).texture;
+    depthTexture.minFilter = THREE.NearestFilter;
+    depthTexture.magFilter = THREE.NearestFilter;
+    depthTexture.needsUpdate = true;
+    const maskTexture = createBinaryMaskTexture(layer.width, layer.height, renderDepthMask);
+    const depthPreviewUrl = createPsdDepthPreviewUrl(
+      layer.width,
+      layer.height,
+      effectiveDepthPixels,
+      renderDepthMask,
+    );
+
+    layer.currentDepthPreviewUrl = depthPreviewUrl;
+    preparedLayers[layerIndex] = {
+      ...layer,
+      depthPixels: effectiveDepthPixels,
+      renderDepthMask,
+      depthTexture,
+      maskTexture,
+      depthPreviewUrl,
+    };
+  }
+
+  return preparedLayers;
+}
+
+function buildMaskedPlaneGeometry(width, height, depthPixels, segmentMap, segmentDepthMeans, gapMask, step, options = {}) {
   const cols = Math.floor((width - 1) / step) + 1;
   const rows = Math.floor((height - 1) / step) + 1;
   const positions = new Float32Array(cols * rows * 3);
   const uvs = new Float32Array(cols * rows * 2);
   const vertexValid = new Uint8Array(cols * rows);
+  const vertexGroup = new Int32Array(cols * rows);
+  vertexGroup.fill(-1);
   const aspect = width / height;
   const halfWidth = aspect * 0.5;
   const halfHeight = 0.5;
@@ -712,13 +917,31 @@ function buildMaskedPlaneGeometry(width, height, depthPixels, segmentMap, segmen
 
       positions[p++] = sx;
       positions[p++] = sy;
-      positions[p++] = 0;
+      positions[p++] = options.bakeDepth
+        ? getDepthDisplacementFromByte(depthPixels[py * width + px], options.depthScale, options.invertDepth)
+        : 0;
 
       uvs[t++] = u;
       uvs[t++] = 1 - v;
 
       vertexValid[index] = isValidDepth(depthPixels, width, px, py) && !gapMask[py * width + px] ? 1 : 0;
+      if (vertexValid[index]) {
+        vertexGroup[index] = getSegmentIndex(segmentMap, width, px, py);
+      }
     }
+  }
+
+  if (options.bakeDepth && options.surfaceSmooth) {
+    smoothGridVertexPositions(
+      positions,
+      vertexValid,
+      vertexGroup,
+      cols,
+      rows,
+      3,
+      Number(depthDiscontinuityEl.value),
+      options.depthScale,
+    );
   }
 
   const indices = [];
@@ -877,12 +1100,14 @@ function isRenderedBoundaryVertex(gridX, gridY, cols, rows, width, height, step,
   return false;
 }
 
-function buildPsdLayerGeometry(imageWidth, imageHeight, layer, step) {
+function buildPsdLayerGeometry(imageWidth, imageHeight, layer, step, options = {}) {
   const cols = Math.floor((layer.width - 1) / step) + 1;
   const rows = Math.floor((layer.height - 1) / step) + 1;
   const positions = new Float32Array(cols * rows * 3);
   const uvs = new Float32Array(cols * rows * 2);
   const vertexValid = new Uint8Array(cols * rows);
+  const vertexGroup = new Int32Array(cols * rows);
+  vertexGroup.fill(-1);
   const indices = [];
   const aspect = imageWidth / imageHeight;
   const halfWidth = aspect * 0.5;
@@ -907,7 +1132,9 @@ function buildPsdLayerGeometry(imageWidth, imageHeight, layer, step) {
 
       positions[p++] = sx;
       positions[p++] = sy;
-      positions[p++] = 0;
+      positions[p++] = options.bakeDepth
+        ? getDepthDisplacementFromByte(layer.depthPixels[localIndex], options.depthScale, options.invertDepth)
+        : 0;
       uvs[t++] = u;
       uvs[t++] = 1 - v;
       vertexValid[y * cols + x] = layer.renderDepthMask
@@ -916,7 +1143,23 @@ function buildPsdLayerGeometry(imageWidth, imageHeight, layer, step) {
           ? (layer.maskPixels[localIndex] && layer.depthPixels[localIndex] > 0 ? 1 : 0)
           : 1)
       ;
+      if (vertexValid[y * cols + x]) {
+        vertexGroup[y * cols + x] = 0;
+      }
     }
+  }
+
+  if (options.bakeDepth && options.surfaceSmooth) {
+    smoothGridVertexPositions(
+      positions,
+      vertexValid,
+      vertexGroup,
+      cols,
+      rows,
+      3,
+      Number(depthDiscontinuityEl.value),
+      options.depthScale,
+    );
   }
 
   for (let y = 0; y < rows - 1; y += 1) {
@@ -1017,6 +1260,218 @@ function isSegmentContourPixel(segmentMap, width, height, index) {
 
 function isValidDepth(depthPixels, width, x, y) {
   return depthPixels[y * width + x] > 0;
+}
+
+function getDepthDisplacementFromByte(depthByte, depthScale, invertDepth) {
+  if (depthByte <= 0) {
+    return 0;
+  }
+  const rawDepth = depthByte / 255;
+  const depthValue = invertDepth ? 1 - rawDepth : rawDepth;
+  return depthValue * depthScale;
+}
+
+function smoothGridVertexPositions(positions, vertexValid, vertexGroup, cols, rows, passes, depthThreshold, depthScale) {
+  let input = new Float32Array(positions);
+  const smoothFlags = new Uint8Array(cols * rows);
+  const edgeThresholdZ = Math.max(0.0001, (depthThreshold / 255) * Math.max(depthScale || 1, 0.0001));
+  for (let gy = 0; gy < rows; gy += 1) {
+    for (let gx = 0; gx < cols; gx += 1) {
+      const vertexIndex = gy * cols + gx;
+      if (vertexValid[vertexIndex]) {
+        smoothFlags[vertexIndex] = isGridSmoothEdgeVertex(
+          positions,
+          gx,
+          gy,
+          cols,
+          rows,
+          vertexValid,
+          vertexGroup,
+          edgeThresholdZ,
+        ) ? 1 : 0;
+      }
+    }
+  }
+
+  expandGridSmoothFlags(smoothFlags, cols, rows, vertexValid, vertexGroup, 2);
+
+  input = taubinSmoothGridDepths(input, smoothFlags, vertexValid, vertexGroup, cols, rows, passes * 2, 0.62, -0.64);
+
+  positions.set(input);
+}
+
+function isGridSmoothEdgeVertex(positions, gridX, gridY, cols, rows, vertexValid, vertexGroup, edgeThresholdZ) {
+  if (isGridSmoothBoundaryVertex(gridX, gridY, cols, rows, vertexValid, vertexGroup)) {
+    return true;
+  }
+
+  return hasGridLocalDepthEdge(
+    positions,
+    gridX,
+    gridY,
+    cols,
+    rows,
+    vertexValid,
+    vertexGroup,
+    edgeThresholdZ,
+  );
+}
+
+function isGridSmoothBoundaryVertex(gridX, gridY, cols, rows, vertexValid, vertexGroup) {
+  const vertexIndex = gridY * cols + gridX;
+  const group = vertexGroup[vertexIndex];
+  const offsets = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+  ];
+
+  for (let i = 0; i < offsets.length; i += 1) {
+    const [dx, dy] = offsets[i];
+    const sx = gridX + dx;
+    const sy = gridY + dy;
+    if (sx < 0 || sx >= cols || sy < 0 || sy >= rows) {
+      return true;
+    }
+    const sampleVertex = sy * cols + sx;
+    if (!vertexValid[sampleVertex] || vertexGroup[sampleVertex] !== group) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function hasGridLocalDepthEdge(positions, gridX, gridY, cols, rows, vertexValid, vertexGroup, edgeThresholdZ) {
+  const vertexIndex = gridY * cols + gridX;
+  const group = vertexGroup[vertexIndex];
+  let minZ = positions[vertexIndex * 3 + 2];
+  let maxZ = minZ;
+  let count = 0;
+
+  for (let dy = -1; dy <= 1; dy += 1) {
+    for (let dx = -1; dx <= 1; dx += 1) {
+      const sx = gridX + dx;
+      const sy = gridY + dy;
+      if (sx < 0 || sx >= cols || sy < 0 || sy >= rows) {
+        continue;
+      }
+      const sampleVertex = sy * cols + sx;
+      if (!vertexValid[sampleVertex] || vertexGroup[sampleVertex] !== group) {
+        continue;
+      }
+      const z = positions[sampleVertex * 3 + 2];
+      if (z < minZ) {
+        minZ = z;
+      }
+      if (z > maxZ) {
+        maxZ = z;
+      }
+      count += 1;
+    }
+  }
+
+  return count >= 3 && (maxZ - minZ) >= edgeThresholdZ;
+}
+
+function expandGridSmoothFlags(smoothFlags, cols, rows, vertexValid, vertexGroup, passes) {
+  for (let pass = 0; pass < passes; pass += 1) {
+    const expanded = new Uint8Array(smoothFlags);
+    for (let gy = 0; gy < rows; gy += 1) {
+      for (let gx = 0; gx < cols; gx += 1) {
+        const vertexIndex = gy * cols + gx;
+        if (!vertexValid[vertexIndex] || smoothFlags[vertexIndex]) {
+          continue;
+        }
+        const group = vertexGroup[vertexIndex];
+        for (let dy = -1; dy <= 1; dy += 1) {
+          for (let dx = -1; dx <= 1; dx += 1) {
+            if (dx === 0 && dy === 0) {
+              continue;
+            }
+            const sx = gx + dx;
+            const sy = gy + dy;
+            if (sx < 0 || sx >= cols || sy < 0 || sy >= rows) {
+              continue;
+            }
+            const sampleVertex = sy * cols + sx;
+            if (vertexValid[sampleVertex] && vertexGroup[sampleVertex] === group && smoothFlags[sampleVertex]) {
+              expanded[vertexIndex] = 1;
+              dx = 2;
+              dy = 2;
+            }
+          }
+        }
+      }
+    }
+    smoothFlags.set(expanded);
+  }
+}
+
+function taubinSmoothGridDepths(positions, smoothFlags, vertexValid, vertexGroup, cols, rows, passes, lambda, mu) {
+  let input = new Float32Array(positions);
+  for (let pass = 0; pass < passes; pass += 1) {
+    input = applyGridLaplacianPass(
+      input,
+      smoothFlags,
+      vertexValid,
+      vertexGroup,
+      cols,
+      rows,
+      pass % 2 === 0 ? lambda : mu,
+    );
+  }
+  return input;
+}
+
+function applyGridLaplacianPass(positions, smoothFlags, vertexValid, vertexGroup, cols, rows, factor) {
+  const output = new Float32Array(positions);
+  for (let gy = 0; gy < rows; gy += 1) {
+    for (let gx = 0; gx < cols; gx += 1) {
+      const vertexIndex = gy * cols + gx;
+      if (!vertexValid[vertexIndex] || !smoothFlags[vertexIndex]) {
+        continue;
+      }
+
+      const group = vertexGroup[vertexIndex];
+      let weightedSum = 0;
+      let weightTotal = 0;
+      for (let dy = -2; dy <= 2; dy += 1) {
+        for (let dx = -2; dx <= 2; dx += 1) {
+          if (dx === 0 && dy === 0) {
+            continue;
+          }
+          const sx = gx + dx;
+          const sy = gy + dy;
+          if (sx < 0 || sx >= cols || sy < 0 || sy >= rows) {
+            continue;
+          }
+          const sampleVertex = sy * cols + sx;
+          if (!vertexValid[sampleVertex] || vertexGroup[sampleVertex] !== group) {
+            continue;
+          }
+          const distance = Math.hypot(dx, dy);
+          if (distance <= 0 || distance > 2.5) {
+            continue;
+          }
+          const weight = 1 / distance;
+          weightedSum += positions[sampleVertex * 3 + 2] * weight;
+          weightTotal += weight;
+        }
+      }
+
+      if (weightTotal <= 0) {
+        continue;
+      }
+
+      const averageZ = weightedSum / weightTotal;
+      const currentZ = positions[vertexIndex * 3 + 2];
+      output[vertexIndex * 3 + 2] = currentZ + factor * (averageZ - currentZ);
+    }
+  }
+
+  return output;
 }
 
 function getSegmentIndex(segmentMap, width, x, y) {
@@ -2128,16 +2583,12 @@ async function ensureDefaultPsdPairLoaded() {
     return;
   }
 
-  if (!renderState.pendingPsdColorBuffer || !renderState.pendingPsdDepthBuffer) {
-    const [colorBuffer, depthBuffer] = await Promise.all([
-      fetchArrayBuffer(defaultPsdColorUrl),
-      fetchArrayBuffer(defaultPsdDepthUrl),
-    ]);
+  if (!renderState.pendingPsdColorBuffer) {
+    const colorBuffer = await fetchArrayBuffer(defaultPsdColorUrl);
     renderState.pendingPsdColorBuffer = colorBuffer;
-    renderState.pendingPsdDepthBuffer = depthBuffer;
   }
 
-  await loadPsdPair(renderState.pendingPsdColorBuffer, renderState.pendingPsdDepthBuffer);
+  await loadPsdPair(renderState.pendingPsdColorBuffer);
 }
 
 async function fetchArrayBuffer(url) {
@@ -2148,25 +2599,43 @@ async function fetchArrayBuffer(url) {
   return response.arrayBuffer();
 }
 
-async function loadPsdPair(colorBuffer, depthBuffer) {
+async function loadPsdPair(colorBuffer) {
+  const previousDebugLayerName = renderState.psdDebugLayerIndex >= 0
+    ? renderState.psdLayerEntries[renderState.psdDebugLayerIndex]?.name
+    : null;
+  const previousVisibilityByName = new Map(
+    renderState.psdLayerEntries.map((layer, index) => [layer.name, !!renderState.psdLayerVisibility[index]]),
+  );
+  const previousOffsetByName = new Map(
+    renderState.psdLayerEntries.map((layer, index) => [layer.name, renderState.psdLayerDepthOffsets[index] ?? 0]),
+  );
+  const previousScaleByName = new Map(
+    renderState.psdLayerEntries.map((layer, index) => [layer.name, renderState.psdLayerDepthScales[index] ?? 1]),
+  );
+  const previousPruneByName = new Map(
+    renderState.psdLayerEntries.map((layer, index) => [layer.name, !!renderState.psdLayerOutlierPruneEnabled[index]]),
+  );
   disposePsdLayerTextures();
   const colorPsd = agPsd.readPsd(colorBuffer);
-  const depthPsd = agPsd.readPsd(depthBuffer);
-  const stableDepthPixels = await ensurePsdStableDepthPixels(colorPsd.width, colorPsd.height);
-  const layerEntries = createPsdLayerEntries(colorPsd, depthPsd, stableDepthPixels);
+  const scaledPsd = prepareScaledPsdDocument(colorPsd, 1280);
+  const stableDepthResult = await ensurePsdStableDepthPixels(scaledPsd);
+  const layerEntries = createPsdLayerEntries(scaledPsd, stableDepthResult.pixels);
 
-  renderState.psdColorDocument = colorPsd;
-  renderState.psdDepthDocument = depthPsd;
-  renderState.psdStableDepthPixels = stableDepthPixels;
+  renderState.psdColorDocument = scaledPsd;
+  renderState.psdDepthDocument = null;
+  renderState.psdStableDepthPixels = stableDepthResult.pixels;
   renderState.psdLayerEntries = layerEntries;
-  renderState.psdLayerVisibility = new Array(layerEntries.length).fill(true);
-  renderState.psdLayerDepthOffsets = new Array(layerEntries.length).fill(0);
-  renderState.psdLayerDepthScales = new Array(layerEntries.length).fill(1);
-  renderState.psdDebugLayerIndex = -1;
-  renderState.imageWidth = colorPsd.width;
-  renderState.imageHeight = colorPsd.height;
-  renderState.psdColorPreviewUrl = colorPsd.canvas ? colorPsd.canvas.toDataURL("image/png") : "";
-  renderState.psdDepthPreviewUrl = depthPsd.canvas ? depthPsd.canvas.toDataURL("image/png") : "";
+  renderState.psdLayerVisibility = layerEntries.map((layer) => previousVisibilityByName.get(layer.name) ?? true);
+  renderState.psdLayerDepthOffsets = layerEntries.map((layer) => previousOffsetByName.get(layer.name) ?? 0);
+  renderState.psdLayerDepthScales = layerEntries.map((layer) => previousScaleByName.get(layer.name) ?? 1);
+  renderState.psdLayerOutlierPruneEnabled = layerEntries.map((layer) => previousPruneByName.get(layer.name) ?? false);
+  renderState.psdDebugLayerIndex = previousDebugLayerName
+    ? layerEntries.findIndex((layer) => layer.name === previousDebugLayerName)
+    : -1;
+  renderState.imageWidth = scaledPsd.width;
+  renderState.imageHeight = scaledPsd.height;
+  renderState.psdColorPreviewUrl = scaledPsd.canvas ? scaledPsd.canvas.toDataURL("image/png") : "";
+  renderState.psdDepthPreviewUrl = stableDepthResult.previewUrl;
   rebuildSegmentList();
   updatePsdDebugPanel();
 }
@@ -2176,19 +2645,15 @@ async function rebuildPsdLayerEntriesIfNeeded() {
     return false;
   }
 
-  if (renderState.pendingPsdColorBuffer && renderState.pendingPsdDepthBuffer) {
-    await loadPsdPair(renderState.pendingPsdColorBuffer, renderState.pendingPsdDepthBuffer);
+  if (renderState.pendingPsdColorBuffer) {
+    await loadPsdPair(renderState.pendingPsdColorBuffer);
     return true;
   }
 
-  if (renderState.psdColorDocument && renderState.psdDepthDocument) {
-    const [colorBuffer, depthBuffer] = await Promise.all([
-      fetchArrayBuffer(defaultPsdColorUrl),
-      fetchArrayBuffer(defaultPsdDepthUrl),
-    ]);
+  if (renderState.psdColorDocument) {
+    const colorBuffer = await fetchArrayBuffer(defaultPsdColorUrl);
     renderState.pendingPsdColorBuffer = colorBuffer;
-    renderState.pendingPsdDepthBuffer = depthBuffer;
-    await loadPsdPair(colorBuffer, depthBuffer);
+    await loadPsdPair(colorBuffer);
     return true;
   }
 
@@ -2214,59 +2679,290 @@ function disposePsdLayerTextures() {
   renderState.psdLayerEntries = [];
 }
 
-async function ensurePsdStableDepthPixels(expectedWidth, expectedHeight) {
+function prepareScaledPsdDocument(psd, maxHeight) {
+  const scale = psd.height > maxHeight ? maxHeight / psd.height : 1;
+  if (scale >= 0.9999) {
+    return psd;
+  }
+
+  const scaledWidth = Math.max(1, Math.round(psd.width * scale));
+  const scaledHeight = Math.max(1, Math.round(psd.height * scale));
+  const compositeCanvas = document.createElement("canvas");
+  compositeCanvas.width = scaledWidth;
+  compositeCanvas.height = scaledHeight;
+  const compositeContext = compositeCanvas.getContext("2d");
+  compositeContext.drawImage(psd.canvas, 0, 0, scaledWidth, scaledHeight);
+
+  const scaledLayers = flattenPsdLayers(psd.children || []).map((layer, index) => {
+    const width = Math.max(1, Math.round(layer.width * scale));
+    const height = Math.max(1, Math.round(layer.height * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    context.drawImage(layer.canvas, 0, 0, width, height);
+    return {
+      ...layer,
+      left: Math.round(layer.left * scale),
+      top: Math.round(layer.top * scale),
+      width,
+      height,
+      canvas,
+      sourceIndex: index,
+    };
+  });
+
+  return {
+    ...psd,
+    width: scaledWidth,
+    height: scaledHeight,
+    canvas: compositeCanvas,
+    children: scaledLayers,
+    scaleFactor: scale,
+  };
+}
+
+async function ensurePsdStableDepthPixels(psdDocument) {
   if (
     renderState.psdStableDepthPixels &&
-    renderState.psdStableDepthWidth === expectedWidth &&
-    renderState.psdStableDepthHeight === expectedHeight
+    renderState.psdStableDepthWidth === psdDocument.width &&
+    renderState.psdStableDepthHeight === psdDocument.height
   ) {
-    return renderState.psdStableDepthPixels;
+    return {
+      pixels: renderState.psdStableDepthPixels,
+      previewUrl: renderState.psdDepthPreviewUrl,
+    };
   }
 
   const stableImage = await loadImagePixels(defaultPsdStableDepthUrl);
-  if (stableImage.width !== expectedWidth || stableImage.height !== expectedHeight) {
-    throw new Error("Stable depth image size must match PSD size.");
-  }
+  const mergedMask = buildMergedOpacityMaskFromPsd(psdDocument);
+  const aligned = alignStableDepthToMergedMask(
+    stableImage,
+    mergedMask,
+    psdDocument.width,
+    psdDocument.height,
+  );
 
-  const pixels = new Uint8Array(stableImage.width * stableImage.height);
-  for (let i = 0, p = 0; i < stableImage.data.length; i += 4, p += 1) {
-    pixels[p] = stableImage.data[i];
-  }
-
-  renderState.psdStableDepthPixels = pixels;
-  renderState.psdStableDepthWidth = stableImage.width;
-  renderState.psdStableDepthHeight = stableImage.height;
-  return pixels;
+  renderState.psdStableDepthPixels = aligned.pixels;
+  renderState.psdStableDepthWidth = psdDocument.width;
+  renderState.psdStableDepthHeight = psdDocument.height;
+  return aligned;
 }
 
-function createPsdLayerEntries(colorPsd, depthPsd, stableDepthPixels) {
-  const colorLayers = flattenPsdLayers(colorPsd.children || []);
-  const depthLayers = flattenPsdLayers(depthPsd.children || []);
-  const depthByName = new Map();
-
-  for (let i = 0; i < depthLayers.length; i += 1) {
-    const layer = depthLayers[i];
-    const key = layer.name || `#${i}`;
-    if (!depthByName.has(key)) {
-      depthByName.set(key, []);
+function buildMergedOpacityMaskFromPsd(psdDocument) {
+  const mask = new Uint8Array(psdDocument.width * psdDocument.height);
+  const layers = flattenPsdLayers(psdDocument.children || []);
+  for (let i = 0; i < layers.length; i += 1) {
+    const layer = layers[i];
+    const imageData = getCanvasImageData(layer.canvas);
+    const alphaPixels = imageData.data;
+    for (let y = 0; y < layer.height; y += 1) {
+      const globalY = layer.top + y;
+      if (globalY < 0 || globalY >= psdDocument.height) {
+        continue;
+      }
+      for (let x = 0; x < layer.width; x += 1) {
+        const globalX = layer.left + x;
+        if (globalX < 0 || globalX >= psdDocument.width) {
+          continue;
+        }
+        const localIndex = (y * layer.width + x) * 4 + 3;
+        if (alphaPixels[localIndex] > 0) {
+          mask[globalY * psdDocument.width + globalX] = 1;
+        }
+      }
     }
-    depthByName.get(key).push(layer);
   }
+  return mask;
+}
+
+function alignStableDepthToMergedMask(stableImage, mergedMask, targetWidth, targetHeight) {
+  const stablePixels = new Uint8Array(stableImage.width * stableImage.height);
+  const stableMask = new Uint8Array(stableImage.width * stableImage.height);
+  for (let i = 0, p = 0; i < stableImage.data.length; i += 4, p += 1) {
+    const value = stableImage.data[i];
+    stablePixels[p] = value;
+    stableMask[p] = value > 0 ? 1 : 0;
+  }
+
+  const stableBounds = computeBinaryMaskBounds(stableMask, stableImage.width, stableImage.height);
+  const mergedBounds = computeBinaryMaskBounds(mergedMask, targetWidth, targetHeight);
+  if (!stableBounds || !mergedBounds) {
+    return {
+      pixels: new Uint8Array(targetWidth * targetHeight),
+      previewUrl: "",
+    };
+  }
+
+  const cropCanvas = document.createElement("canvas");
+  cropCanvas.width = stableBounds.width;
+  cropCanvas.height = stableBounds.height;
+  const cropContext = cropCanvas.getContext("2d");
+  cropContext.putImageData(
+    new ImageData(
+      stableImage.data.slice(
+        0,
+        stableImage.data.length,
+      ),
+      stableImage.width,
+      stableImage.height,
+    ),
+    -stableBounds.left,
+    -stableBounds.top,
+  );
+  const cropMask = new Uint8Array(cropCanvas.width * cropCanvas.height);
+  const cropImage = cropContext.getImageData(0, 0, cropCanvas.width, cropCanvas.height);
+  for (let i = 0, p = 0; i < cropImage.data.length; i += 4, p += 1) {
+    cropMask[p] = cropImage.data[i] > 0 ? 1 : 0;
+  }
+
+  const baseScaleX = mergedBounds.width / stableBounds.width;
+  const baseScaleY = mergedBounds.height / stableBounds.height;
+  const baseScale = (baseScaleX + baseScaleY) * 0.5;
+  const targetCenterX = mergedBounds.left + mergedBounds.width * 0.5;
+  const targetCenterY = mergedBounds.top + mergedBounds.height * 0.5;
+
+  let best = {
+    scale: baseScale,
+    offsetX: targetCenterX - stableBounds.width * baseScale * 0.5,
+    offsetY: targetCenterY - stableBounds.height * baseScale * 0.5,
+    score: Number.POSITIVE_INFINITY,
+  };
+
+  const searchConfigs = [
+    { scaleRange: 0.35, scaleSteps: 11, shiftRangeX: Math.max(64, targetWidth * 0.08), shiftRangeY: Math.max(64, targetHeight * 0.08), shiftStep: 16 },
+    { scaleRange: 0.12, scaleSteps: 9, shiftRangeX: 24, shiftRangeY: 24, shiftStep: 6 },
+    { scaleRange: 0.04, scaleSteps: 7, shiftRangeX: 8, shiftRangeY: 8, shiftStep: 2 },
+  ];
+
+  for (let configIndex = 0; configIndex < searchConfigs.length; configIndex += 1) {
+    const config = searchConfigs[configIndex];
+    const scaleStart = best.scale * (1 - config.scaleRange);
+    const scaleEnd = best.scale * (1 + config.scaleRange);
+    const scaleDivisor = Math.max(1, config.scaleSteps - 1);
+    for (let scaleStep = 0; scaleStep < config.scaleSteps; scaleStep += 1) {
+      const scale = scaleStart + (scaleEnd - scaleStart) * (scaleStep / scaleDivisor);
+      for (let offsetY = best.offsetY - config.shiftRangeY; offsetY <= best.offsetY + config.shiftRangeY; offsetY += config.shiftStep) {
+        for (let offsetX = best.offsetX - config.shiftRangeX; offsetX <= best.offsetX + config.shiftRangeX; offsetX += config.shiftStep) {
+          const score = scoreStableAlignment(
+            cropMask,
+            cropCanvas.width,
+            cropCanvas.height,
+            mergedMask,
+            targetWidth,
+            targetHeight,
+            offsetX,
+            offsetY,
+            scale,
+          );
+          if (score < best.score) {
+            best = { scale, offsetX, offsetY, score };
+          }
+        }
+      }
+    }
+  }
+
+  const alignedCanvas = document.createElement("canvas");
+  alignedCanvas.width = targetWidth;
+  alignedCanvas.height = targetHeight;
+  const alignedContext = alignedCanvas.getContext("2d");
+  alignedContext.clearRect(0, 0, targetWidth, targetHeight);
+  alignedContext.imageSmoothingEnabled = true;
+  alignedContext.drawImage(
+    cropCanvas,
+    best.offsetX,
+    best.offsetY,
+    cropCanvas.width * best.scale,
+    cropCanvas.height * best.scale,
+  );
+  const alignedImage = alignedContext.getImageData(0, 0, targetWidth, targetHeight);
+  const alignedPixels = new Uint8Array(targetWidth * targetHeight);
+  for (let i = 0, p = 0; i < alignedImage.data.length; i += 4, p += 1) {
+    alignedPixels[p] = alignedImage.data[i];
+  }
+
+  return {
+    pixels: alignedPixels,
+    previewUrl: alignedCanvas.toDataURL("image/png"),
+  };
+}
+
+function computeBinaryMaskBounds(mask, width, height) {
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (!mask[y * width + x]) {
+        continue;
+      }
+      if (x < minX) {
+        minX = x;
+      }
+      if (y < minY) {
+        minY = y;
+      }
+      if (x > maxX) {
+        maxX = x;
+      }
+      if (y > maxY) {
+        maxY = y;
+      }
+    }
+  }
+  if (maxX < minX || maxY < minY) {
+    return null;
+  }
+  return {
+    left: minX,
+    top: minY,
+    width: maxX - minX + 1,
+    height: maxY - minY + 1,
+  };
+}
+
+function scoreStableAlignment(cropMask, cropWidth, cropHeight, mergedMask, targetWidth, targetHeight, offsetX, offsetY, scale) {
+  const sampleStep = Math.max(1, Math.round(targetHeight / 180));
+  const drawnLeft = offsetX;
+  const drawnTop = offsetY;
+  const drawnWidth = cropWidth * scale;
+  const drawnHeight = cropHeight * scale;
+  let diff = 0;
+  let overlap = 0;
+
+  for (let y = 0; y < targetHeight; y += sampleStep) {
+    for (let x = 0; x < targetWidth; x += sampleStep) {
+      const inMask = mergedMask[y * targetWidth + x] > 0;
+      let inStable = false;
+      if (x >= drawnLeft && x < drawnLeft + drawnWidth && y >= drawnTop && y < drawnTop + drawnHeight) {
+        const u = Math.floor(((x - drawnLeft) / Math.max(1, drawnWidth)) * cropWidth);
+        const v = Math.floor(((y - drawnTop) / Math.max(1, drawnHeight)) * cropHeight);
+        if (u >= 0 && u < cropWidth && v >= 0 && v < cropHeight) {
+          inStable = cropMask[v * cropWidth + u] > 0;
+        }
+      }
+      if (inMask !== inStable) {
+        diff += 1;
+      }
+      if (inMask && inStable) {
+        overlap += 1;
+      }
+    }
+  }
+
+  return diff - overlap * 0.25;
+}
+
+function createPsdLayerEntries(colorPsd, stableDepthPixels) {
+  const colorLayers = flattenPsdLayers(colorPsd.children || []);
 
   const layerSources = [];
 
   for (let i = 0; i < colorLayers.length; i += 1) {
     const colorLayer = colorLayers[i];
-    const key = colorLayer.name || `#${i}`;
-    let depthLayer = null;
-
-    if (depthByName.has(key) && depthByName.get(key).length) {
-      depthLayer = depthByName.get(key).shift();
-    } else if (depthLayers[i]) {
-      depthLayer = depthLayers[i];
-    }
-
-    if (!depthLayer || colorLayer.width <= 0 || colorLayer.height <= 0) {
+    if (colorLayer.width <= 0 || colorLayer.height <= 0) {
       continue;
     }
 
@@ -2277,7 +2973,7 @@ function createPsdLayerEntries(colorPsd, depthPsd, stableDepthPixels) {
     colorTexture.needsUpdate = true;
 
     const colorImageData = getCanvasImageData(colorLayer.canvas);
-    const depthImageData = getCanvasImageData(depthLayer.canvas);
+    const maskPixels = extractLayerMaskPixels(colorImageData.data);
 
     layerSources.push({
       name: colorLayer.name || `Layer ${layerSources.length + 1}`,
@@ -2288,8 +2984,8 @@ function createPsdLayerEntries(colorPsd, depthPsd, stableDepthPixels) {
       height: colorLayer.height,
       colorTexture,
       colorImageData,
-      depthImageData,
-      depthMaskPixels: extractLayerMaskPixels(depthImageData.data),
+      maskPixels,
+      depthMaskPixels: maskPixels,
     });
   }
 
@@ -2313,6 +3009,7 @@ function createPsdLayerEntries(colorPsd, depthPsd, stableDepthPixels) {
       stableDepthPixels,
       visibleLayerMap,
       maskPixels,
+      mergedLayerSources,
     );
     const pruneResult = prunePsdForeignDepthSeeds(
       seededDepthPixels,
@@ -2346,8 +3043,20 @@ function createPsdLayerEntries(colorPsd, depthPsd, stableDepthPixels) {
       }
     }
 
+    if (renderState.psdLayerOutlierPruneEnabled[i]) {
+      pruneOutlierSeedDepthClusters(
+        depthPixels,
+        pruneResult.debugState,
+        pruneResult.debugScore,
+        maskPixels,
+        layer.width,
+        layer.height,
+        Number(depthDiscontinuityEl.value),
+      );
+    }
+
     const inpaintedDepthPixels = inpaintMaskedLayerDepth(depthPixels, maskPixels, layer.width, layer.height);
-    const smoothedDepthPixels = smoothMaskedPositiveDepth(inpaintedDepthPixels, maskPixels, layer.width, layer.height);
+    const smoothedDepthPixels = inpaintedDepthPixels;
     const finalDepthPixels = depthModeEl.value === "raw"
       ? smoothedDepthPixels
       : createMaskedGridDepthPixels(
@@ -2368,6 +3077,7 @@ function createPsdLayerEntries(colorPsd, depthPsd, stableDepthPixels) {
     const depthTexture = createDepthTextureResources(layer.width, layer.height, finalDepthPixels).texture;
     const maskTexture = createBinaryMaskTexture(layer.width, layer.height, renderDepthMask);
     const debugTexture = createPsdDebugTexture(layer.width, layer.height, maskPixels, pruneResult.debugState, pruneResult.debugScore);
+    const depthPreviewUrl = createPsdDepthPreviewUrl(layer.width, layer.height, finalDepthPixels, maskPixels);
     depthTexture.minFilter = THREE.NearestFilter;
     depthTexture.magFilter = THREE.NearestFilter;
     depthTexture.needsUpdate = true;
@@ -2383,6 +3093,8 @@ function createPsdLayerEntries(colorPsd, depthPsd, stableDepthPixels) {
       maskTexture,
       debugTexture: debugTexture.texture,
       debugPreviewUrl: debugTexture.url,
+      depthPreviewUrl,
+      baseDepthPixels: finalDepthPixels.slice(),
       depthPixels: finalDepthPixels,
       renderDepthMask,
       maskPixels,
@@ -2505,8 +3217,6 @@ function compositePsdLayerIntoTarget(targetLayer, featureLayer, imageWidth, imag
 
   const targetPixels = targetLayer.colorImageData.data;
   const featurePixels = featureLayer.colorImageData.data;
-  const targetDepthPixels = targetLayer.depthImageData.data;
-  const featureDepthPixels = featureLayer.depthImageData.data;
 
   for (let y = top; y < bottom; y += 1) {
     const ty = y - targetLayer.top;
@@ -2518,15 +3228,6 @@ function compositePsdLayerIntoTarget(targetLayer, featureLayer, imageWidth, imag
       const featureOffset = (fy * featureLayer.width + fx) * 4;
       const srcAlpha = featurePixels[featureOffset + 3];
       if (srcAlpha <= 0) {
-        continue;
-      }
-
-      const srcDepthAlpha = featureDepthPixels[featureOffset + 3];
-      const dstDepthAlpha = targetDepthPixels[targetOffset + 3];
-      const srcDepth = featureDepthPixels[featureOffset];
-      const dstDepth = targetDepthPixels[targetOffset];
-      const featureIsFront = srcDepthAlpha > 0 && (dstDepthAlpha <= 0 || srcDepth <= dstDepth);
-      if (!featureIsFront && targetPixels[targetOffset + 3] > 0) {
         continue;
       }
 
@@ -2544,10 +3245,6 @@ function compositePsdLayerIntoTarget(targetLayer, featureLayer, imageWidth, imag
         targetPixels[targetOffset + c] = clampByte(Math.round(out * 255));
       }
       targetPixels[targetOffset + 3] = clampByte(Math.round(outAlpha * 255));
-      for (let c = 0; c < 3; c += 1) {
-        targetDepthPixels[targetOffset + c] = featureDepthPixels[featureOffset + c];
-      }
-      targetDepthPixels[targetOffset + 3] = Math.max(dstDepthAlpha, srcDepthAlpha);
     }
   }
 
@@ -2564,7 +3261,8 @@ function compositePsdLayerIntoTarget(targetLayer, featureLayer, imageWidth, imag
   colorTexture.magFilter = THREE.LinearFilter;
   colorTexture.needsUpdate = true;
   targetLayer.colorTexture = colorTexture;
-  targetLayer.depthMaskPixels = extractLayerMaskPixels(targetLayer.depthImageData.data);
+  targetLayer.maskPixels = extractLayerMaskPixels(targetLayer.colorImageData.data);
+  targetLayer.depthMaskPixels = targetLayer.maskPixels;
 }
 
 function extractLayerMaskPixels(rgbaPixels) {
@@ -3016,14 +3714,11 @@ function collectPositiveValues(values) {
 
 function buildVisiblePsdLayerMap(imageWidth, imageHeight, layers) {
   const visibleLayerMap = new Int32Array(imageWidth * imageHeight);
-  const visibleDepthMap = new Uint8Array(imageWidth * imageHeight);
   visibleLayerMap.fill(-1);
-  visibleDepthMap.fill(255);
 
-  for (let layerIndex = 0; layerIndex < layers.length; layerIndex += 1) {
+  for (let layerIndex = layers.length - 1; layerIndex >= 0; layerIndex -= 1) {
     const layer = layers[layerIndex];
-    const maskPixels = layer.depthMaskPixels;
-    const relativeDepthPixels = extractLayerRelativeDepthPixels(layer.depthImageData.data);
+    const maskPixels = layer.maskPixels;
 
     for (let y = 0; y < layer.height; y += 1) {
       for (let x = 0; x < layer.width; x += 1) {
@@ -3039,10 +3734,8 @@ function buildVisiblePsdLayerMap(imageWidth, imageHeight, layers) {
         }
 
         const globalIndex = globalY * imageWidth + globalX;
-        const relativeDepth = relativeDepthPixels[localIndex];
-        if (visibleLayerMap[globalIndex] < 0 || relativeDepth < visibleDepthMap[globalIndex]) {
+        if (visibleLayerMap[globalIndex] < 0) {
           visibleLayerMap[globalIndex] = layerIndex;
-          visibleDepthMap[globalIndex] = relativeDepth;
         }
       }
     }
@@ -3051,9 +3744,9 @@ function buildVisiblePsdLayerMap(imageWidth, imageHeight, layers) {
   return visibleLayerMap;
 }
 
-function seedPsdLayerDepthPixels(layer, layerIndex, imageWidth, imageHeight, stableDepthPixels, visibleLayerMap, maskPixels) {
+function seedPsdLayerDepthPixels(layer, layerIndex, imageWidth, imageHeight, stableDepthPixels, visibleLayerMap, maskPixels, layers) {
   const depthPixels = new Uint8Array(layer.width * layer.height);
-  const stableSeedMask = buildLayerContourBandMask(layer.depthMaskPixels, layer.width, layer.height, 2);
+  const stableSeedMask = buildLayerContourBandMask(maskPixels, layer.width, layer.height, 2);
 
   for (let y = 0; y < layer.height; y += 1) {
     for (let x = 0; x < layer.width; x += 1) {
@@ -3073,12 +3766,49 @@ function seedPsdLayerDepthPixels(layer, layerIndex, imageWidth, imageHeight, sta
 
       const globalIndex = globalY * imageWidth + globalX;
       if (visibleLayerMap[globalIndex] === layerIndex) {
+        if (hasUpperLayerMaskNearby(layers, layerIndex, globalX, globalY, 2)) {
+          continue;
+        }
         depthPixels[localIndex] = stableDepthPixels[globalIndex];
       }
     }
   }
 
   return depthPixels;
+}
+
+function hasUpperLayerMaskNearby(layers, layerIndex, globalX, globalY, radius) {
+  for (let upperIndex = layerIndex + 1; upperIndex < layers.length; upperIndex += 1) {
+    const layer = layers[upperIndex];
+    if (
+      globalX < layer.left - radius ||
+      globalX >= layer.left + layer.width + radius ||
+      globalY < layer.top - radius ||
+      globalY >= layer.top + layer.height + radius
+    ) {
+      continue;
+    }
+
+    for (let dy = -radius; dy <= radius; dy += 1) {
+      const sy = globalY + dy;
+      const localY = sy - layer.top;
+      if (localY < 0 || localY >= layer.height) {
+        continue;
+      }
+      for (let dx = -radius; dx <= radius; dx += 1) {
+        const sx = globalX + dx;
+        const localX = sx - layer.left;
+        if (localX < 0 || localX >= layer.width) {
+          continue;
+        }
+        if (layer.maskPixels[localY * layer.width + localX]) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
 }
 
 function buildLayerContourBandMask(maskPixels, width, height, thickness) {
@@ -3335,6 +4065,66 @@ function smoothMaskedPositiveDepth(sourceDepthPixels, maskPixels, width, height)
   return input;
 }
 
+function smoothSegmentedPositiveDepth(sourceDepthPixels, segmentMap, width, height, passes) {
+  const kernel = [
+    [-1, -1, 1],
+    [0, -1, 2],
+    [1, -1, 1],
+    [-1, 0, 2],
+    [0, 0, 4],
+    [1, 0, 2],
+    [-1, 1, 1],
+    [0, 1, 2],
+    [1, 1, 1],
+  ];
+  let input = sourceDepthPixels.slice();
+
+  for (let pass = 0; pass < passes; pass += 1) {
+    const output = input.slice();
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const index = y * width + x;
+        const centerDepth = input[index];
+        const centerSegment = segmentMap[index];
+        if (centerDepth <= 0 || centerSegment < 0) {
+          continue;
+        }
+
+        let weightedSum = 0;
+        let totalWeight = 0;
+        for (let i = 0; i < kernel.length; i += 1) {
+          const [dx, dy, weight] = kernel[i];
+          const sx = x + dx;
+          const sy = y + dy;
+          if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+            continue;
+          }
+
+          const sampleIndex = sy * width + sx;
+          if (segmentMap[sampleIndex] !== centerSegment) {
+            continue;
+          }
+
+          const sampleDepth = input[sampleIndex];
+          if (sampleDepth <= 0) {
+            continue;
+          }
+
+          weightedSum += sampleDepth * weight;
+          totalWeight += weight;
+        }
+
+        if (totalWeight > 0) {
+          output[index] = clampByte(Math.round(weightedSum / totalWeight));
+        }
+      }
+    }
+    input = output;
+  }
+
+  return input;
+}
+
 function hasPositiveMaskedNeighbor(depthPixels, maskPixels, width, height, index) {
   const x = index % width;
   const y = Math.floor(index / width);
@@ -3523,25 +4313,16 @@ function extractDepthPixelsFromCanvas(canvas) {
 async function replaceImage(kind, file) {
   statusEl.textContent = `Loading ${kind}...`;
 
-  if ((kind === "color" || kind === "depth") && isPsdFilename(file.name)) {
+  if (kind === "color" && isPsdFilename(file.name)) {
     const buffer = await file.arrayBuffer();
-    if (kind === "color") {
-      renderState.pendingPsdColorBuffer = buffer;
-    } else {
-      renderState.pendingPsdDepthBuffer = buffer;
-    }
-
-    if (renderState.pendingPsdColorBuffer && renderState.pendingPsdDepthBuffer) {
-      await loadPsdPair(renderState.pendingPsdColorBuffer, renderState.pendingPsdDepthBuffer);
-      renderState.sourceMode = "psd";
-      sourceModeEl.value = "psd";
-      syncViewerModeUi();
-      buildMesh();
-      syncThumbs();
-      statusEl.textContent = "Loaded PSD pair.";
-    } else {
-      statusEl.textContent = `Waiting for ${kind === "color" ? "depth" : "color"} PSD...`;
-    }
+    renderState.pendingPsdColorBuffer = buffer;
+    await loadPsdPair(renderState.pendingPsdColorBuffer);
+    renderState.sourceMode = "psd";
+    sourceModeEl.value = "psd";
+    syncViewerModeUi();
+    buildMesh();
+    syncThumbs();
+    statusEl.textContent = "Loaded PSD.";
     return;
   }
 
@@ -5030,50 +5811,66 @@ function rebuildSegmentList() {
   segmentListEl.textContent = "";
 
   if (renderState.sourceMode === "psd") {
-    renderState.psdLayerEntries.forEach((layer, index) => {
-      const row = document.createElement("div");
-      row.className = "segment-item";
-      row.dataset.segmentIndex = String(index);
+    const groups = groupPsdLayerEntries(renderState.psdLayerEntries);
+    groups.forEach((group) => {
+      const groupEl = document.createElement("div");
+      groupEl.className = "segment-group";
 
-      const checkbox = document.createElement("input");
-      checkbox.type = "checkbox";
-      checkbox.checked = renderState.psdLayerVisibility[index];
-      checkbox.dataset.segmentIndex = String(index);
-      checkbox.tabIndex = -1;
-      checkbox.style.pointerEvents = "none";
+      if (group.title) {
+        const titleEl = document.createElement("div");
+        titleEl.className = "segment-group-title";
+        titleEl.textContent = group.title;
+        groupEl.appendChild(titleEl);
+      }
 
-      row.addEventListener("click", (event) => {
-        const itemIndex = Number(row.dataset.segmentIndex);
-        applySegmentToggle(itemIndex, event.shiftKey);
+      group.items.forEach(({ layer, index, label }) => {
+        const row = document.createElement("div");
+        row.className = "segment-item";
+        row.dataset.segmentIndex = String(index);
+
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = renderState.psdLayerVisibility[index];
+        checkbox.dataset.segmentIndex = String(index);
+        checkbox.tabIndex = -1;
+        checkbox.style.pointerEvents = "none";
+
+        row.addEventListener("click", (event) => {
+          const itemIndex = Number(row.dataset.segmentIndex);
+          applySegmentToggle(itemIndex, event.shiftKey);
+        });
+
+        const swatch = document.createElement("span");
+        swatch.className = "segment-swatch";
+        swatch.style.backgroundColor = "#d0d7de";
+
+        const name = document.createElement("span");
+        name.className = "segment-name";
+        name.textContent = label;
+
+        const size = document.createElement("span");
+        size.className = "segment-size";
+        size.textContent = `${layer.width}x${layer.height}`;
+
+        const controls = document.createElement("div");
+        controls.className = "segment-controls";
+
+        const debugButton = createSegmentControlButton("D", "debug-toggle", index);
+        const pruneButton = createSegmentControlButton("P", "prune-toggle", index);
+        const offsetDown = createSegmentControlButton("-", "offset-down", index);
+        const offsetUp = createSegmentControlButton("+", "offset-up", index);
+        const scaleDown = createSegmentControlButton("<", "scale-down", index);
+        const scaleUp = createSegmentControlButton(">", "scale-up", index);
+        const metrics = document.createElement("span");
+        metrics.className = "segment-metrics";
+        metrics.dataset.segmentMetrics = String(index);
+
+        controls.append(debugButton, pruneButton, offsetDown, offsetUp, scaleDown, scaleUp, metrics);
+        row.append(checkbox, swatch, name, size, controls);
+        groupEl.appendChild(row);
       });
 
-      const swatch = document.createElement("span");
-      swatch.className = "segment-swatch";
-      swatch.style.backgroundColor = "#d0d7de";
-
-      const name = document.createElement("span");
-      name.className = "segment-name";
-      name.textContent = layer.name || `Layer ${index + 1}`;
-
-      const size = document.createElement("span");
-      size.className = "segment-size";
-      size.textContent = `${layer.width}x${layer.height}`;
-
-      const controls = document.createElement("div");
-      controls.className = "segment-controls";
-
-      const debugButton = createSegmentControlButton("D", "debug-toggle", index);
-      const offsetDown = createSegmentControlButton("-", "offset-down", index);
-      const offsetUp = createSegmentControlButton("+", "offset-up", index);
-      const scaleDown = createSegmentControlButton("<", "scale-down", index);
-      const scaleUp = createSegmentControlButton(">", "scale-up", index);
-      const metrics = document.createElement("span");
-      metrics.className = "segment-metrics";
-      metrics.dataset.segmentMetrics = String(index);
-
-      controls.append(debugButton, offsetDown, offsetUp, scaleDown, scaleUp, metrics);
-      row.append(checkbox, swatch, name, size, controls);
-      segmentListEl.appendChild(row);
+      segmentListEl.appendChild(groupEl);
     });
 
     syncSegmentAdjustmentLabels();
@@ -5128,6 +5925,36 @@ function rebuildSegmentList() {
   });
 
   syncSegmentAdjustmentLabels();
+}
+
+function groupPsdLayerEntries(layers) {
+  const groups = [];
+  const groupMap = new Map();
+
+  layers.forEach((layer, index) => {
+    const fullName = layer.name || `Layer ${index + 1}`;
+    const separatorIndex = fullName.indexOf("::");
+    const groupKey = separatorIndex >= 0 ? fullName.slice(0, separatorIndex) : "";
+    const label = separatorIndex >= 0 ? fullName.slice(separatorIndex + 2) || fullName : fullName;
+
+    let group = groupMap.get(groupKey);
+    if (!group) {
+      group = {
+        title: groupKey,
+        items: [],
+      };
+      groupMap.set(groupKey, group);
+      groups.push(group);
+    }
+
+    group.items.push({
+      layer,
+      index,
+      label,
+    });
+  });
+
+  return groups;
 }
 
 function createSegmentControlButton(label, action, segmentIndex) {
@@ -5205,6 +6032,14 @@ function syncSegmentAdjustmentLabels() {
     button.style.background = active ? "rgba(255, 120, 120, 0.28)" : "rgba(255, 255, 255, 0.05)";
   });
 
+  const pruneButtons = segmentListEl.querySelectorAll('[data-segment-action="prune-toggle"]');
+  pruneButtons.forEach((button) => {
+    const index = Number(button.dataset.segmentIndex);
+    const active = !!renderState.psdLayerOutlierPruneEnabled[index];
+    button.title = active ? "Disable outlier segment prune" : "Enable outlier segment prune";
+    button.style.background = active ? "rgba(255, 200, 120, 0.28)" : "rgba(255, 255, 255, 0.05)";
+  });
+
   updatePsdDebugPanel();
 }
 
@@ -5213,6 +6048,21 @@ function applySegmentDepthAdjustment(action, segmentIndex) {
     renderState.psdDebugLayerIndex = renderState.psdDebugLayerIndex === segmentIndex ? -1 : segmentIndex;
     syncSegmentAdjustmentLabels();
     buildMesh();
+    return;
+  }
+
+  if (action === "prune-toggle" && renderState.sourceMode === "psd") {
+    renderState.psdLayerOutlierPruneEnabled[segmentIndex] = !renderState.psdLayerOutlierPruneEnabled[segmentIndex];
+    syncSegmentAdjustmentLabels();
+    rebuildPsdLayerEntriesIfNeeded().then((reloaded) => {
+      if (reloaded) {
+        rebuildSegmentList();
+      }
+      buildMesh();
+    }).catch((error) => {
+      console.error(error);
+      statusEl.textContent = `Failed: ${error.message}`;
+    });
     return;
   }
 
@@ -5267,10 +6117,12 @@ function applySegmentDepthAdjustments() {
     adjustedPixels[index] = clamp(Math.round(shifted), 1, 255);
   }
 
+  const finalPixels = adjustedPixels;
+
   const adjusted = createDepthTextureResources(
     renderState.imageWidth,
     renderState.imageHeight,
-    adjustedPixels,
+    finalPixels,
   );
 
   renderState.adjustedDepthTexture = adjusted.texture;
@@ -5563,6 +6415,9 @@ function updatePsdDebugPanel() {
   if (renderState.sourceMode !== "psd" || renderState.psdDebugLayerIndex < 0) {
     psdDebugPanelEl.classList.remove("is-visible");
     psdDebugImageEl.removeAttribute("src");
+    if (psdDepthImageEl) {
+      psdDepthImageEl.removeAttribute("src");
+    }
     return;
   }
 
@@ -5570,12 +6425,123 @@ function updatePsdDebugPanel() {
   if (!layer || !layer.debugPreviewUrl) {
     psdDebugPanelEl.classList.remove("is-visible");
     psdDebugImageEl.removeAttribute("src");
+    if (psdDepthImageEl) {
+      psdDepthImageEl.removeAttribute("src");
+    }
     return;
   }
 
   psdDebugTitleEl.textContent = `PSD debug: ${layer.name || `Layer ${renderState.psdDebugLayerIndex + 1}`} | removed ${layer.removedDepthPixels || 0}px`;
   psdDebugImageEl.src = layer.debugPreviewUrl;
+  if (psdDepthImageEl && (layer.currentDepthPreviewUrl || layer.depthPreviewUrl)) {
+    psdDepthImageEl.src = layer.currentDepthPreviewUrl || layer.depthPreviewUrl;
+  }
   psdDebugPanelEl.classList.add("is-visible");
+}
+
+function pruneOutlierSeedDepthClusters(depthPixels, debugState, debugScore, maskPixels, width, height, threshold) {
+  const totalPixels = width * height;
+  const visited = new Uint8Array(totalPixels);
+  const queue = new Int32Array(totalPixels);
+  const components = [];
+  const linkThreshold = Math.max(6, threshold * 0.2);
+  const contourMask = buildLayerContourBandMask(maskPixels, width, height, 1);
+  const neighbors = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+    [-1, -1],
+    [1, -1],
+    [-1, 1],
+    [1, 1],
+  ];
+
+  for (let start = 0; start < totalPixels; start += 1) {
+    if (visited[start] || !maskPixels[start] || depthPixels[start] === 0) {
+      continue;
+    }
+
+    let head = 0;
+    let tail = 0;
+    queue[tail++] = start;
+    visited[start] = 1;
+    const indices = [];
+    const values = [];
+    let contourHits = 0;
+
+    while (head < tail) {
+      const index = queue[head++];
+      indices.push(index);
+      values.push(depthPixels[index]);
+      if (contourMask[index]) {
+        contourHits += 1;
+      }
+      const x = index % width;
+      const y = Math.floor(index / width);
+
+      for (let i = 0; i < neighbors.length; i += 1) {
+        const [dx, dy] = neighbors[i];
+        const sx = x + dx;
+        const sy = y + dy;
+        if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+          continue;
+        }
+        const sampleIndex = sy * width + sx;
+        if (visited[sampleIndex] || !maskPixels[sampleIndex] || depthPixels[sampleIndex] === 0) {
+          continue;
+        }
+        if (Math.abs(depthPixels[sampleIndex] - depthPixels[index]) > linkThreshold) {
+          continue;
+        }
+        visited[sampleIndex] = 1;
+        queue[tail++] = sampleIndex;
+      }
+    }
+
+    components.push({
+      indices,
+      size: indices.length,
+      contourRatio: contourHits / indices.length,
+      median: medianOfNumbers(values),
+    });
+  }
+
+  if (components.length < 2) {
+    return;
+  }
+
+  let dominant = components[0];
+  for (let i = 1; i < components.length; i += 1) {
+    if (components[i].size > dominant.size) {
+      dominant = components[i];
+    }
+  }
+
+  const clusterThreshold = Math.max(4, threshold * 0.18);
+  const dominantSizeFloor = Math.max(12, dominant.size * 0.45);
+
+  for (let i = 0; i < components.length; i += 1) {
+    const component = components[i];
+    if (component === dominant) {
+      continue;
+    }
+
+    const medianDistance = Math.abs(component.median - dominant.median);
+    if (medianDistance <= clusterThreshold) {
+      continue;
+    }
+    if (component.size >= dominantSizeFloor && component.contourRatio < 0.55) {
+      continue;
+    }
+
+    for (let j = 0; j < component.indices.length; j += 1) {
+      const index = component.indices[j];
+      depthPixels[index] = 0;
+      debugState[index] = 6;
+      debugScore[index] = Math.max(debugScore[index], clampByte(Math.round(medianDistance * 24)));
+    }
+  }
 }
 
 function createPsdDebugTexture(width, height, maskPixels, debugState, debugScore) {
@@ -5620,6 +6586,10 @@ function createPsdDebugTexture(width, height, maskPixels, debugState, debugScore
       r = 255;
       g = 235;
       b = 90;
+    } else if (state === 6) {
+      r = 120;
+      g = Math.round(220 + score * 20);
+      b = 255;
     }
 
     imageData.data[imageIndex] = r;
@@ -5637,6 +6607,31 @@ function createPsdDebugTexture(width, height, maskPixels, debugState, debugScore
     texture,
     url: canvas.toDataURL("image/png"),
   };
+}
+
+function createPsdDepthPreviewUrl(width, height, depthPixels, maskPixels) {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  const imageData = context.createImageData(width, height);
+
+  for (let pixelIndex = 0; pixelIndex < depthPixels.length; pixelIndex += 1) {
+    const imageIndex = pixelIndex * 4;
+    if (!maskPixels[pixelIndex]) {
+      imageData.data[imageIndex + 3] = 0;
+      continue;
+    }
+
+    const depth = depthPixels[pixelIndex];
+    imageData.data[imageIndex] = depth;
+    imageData.data[imageIndex + 1] = depth;
+    imageData.data[imageIndex + 2] = depth;
+    imageData.data[imageIndex + 3] = 255;
+  }
+
+  context.putImageData(imageData, 0, 0);
+  return canvas.toDataURL("image/png");
 }
 
 function sampleGridPosition(index, count, extent) {
