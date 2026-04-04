@@ -437,12 +437,20 @@ function wireControls() {
     buildMesh();
   });
 
-  depthModeEl.addEventListener("change", () => {
+  depthModeEl.addEventListener("change", async () => {
+    if (await rebuildPsdLayerEntriesIfNeeded()) {
+      buildMesh();
+      return;
+    }
     rebuildDepthModeResources();
     buildMesh();
   });
 
-  gridSpecModeEl.addEventListener("change", () => {
+  gridSpecModeEl.addEventListener("change", async () => {
+    if (await rebuildPsdLayerEntriesIfNeeded()) {
+      buildMesh();
+      return;
+    }
     rebuildDepthModeResources();
     buildMesh();
   });
@@ -459,22 +467,38 @@ function wireControls() {
     kernelSizeValueEl.textContent = kernelSizeEl.value;
   });
 
-  gridXEl.addEventListener("change", () => {
+  gridXEl.addEventListener("change", async () => {
+    if (await rebuildPsdLayerEntriesIfNeeded()) {
+      buildMesh();
+      return;
+    }
     rebuildDepthModeResources();
     buildMesh();
   });
 
-  gridYEl.addEventListener("change", () => {
+  gridYEl.addEventListener("change", async () => {
+    if (await rebuildPsdLayerEntriesIfNeeded()) {
+      buildMesh();
+      return;
+    }
     rebuildDepthModeResources();
     buildMesh();
   });
 
-  kernelSizeEl.addEventListener("change", () => {
+  kernelSizeEl.addEventListener("change", async () => {
+    if (await rebuildPsdLayerEntriesIfNeeded()) {
+      buildMesh();
+      return;
+    }
     rebuildDepthModeResources();
     buildMesh();
   });
 
-  interpModeEl.addEventListener("change", () => {
+  interpModeEl.addEventListener("change", async () => {
+    if (await rebuildPsdLayerEntriesIfNeeded()) {
+      buildMesh();
+      return;
+    }
     rebuildDepthModeResources();
     buildMesh();
   });
@@ -2323,11 +2347,25 @@ function createPsdLayerEntries(colorPsd, depthPsd, stableDepthPixels) {
     }
 
     const inpaintedDepthPixels = inpaintMaskedLayerDepth(depthPixels, maskPixels, layer.width, layer.height);
-    const renderDepthMask = new Uint8Array(inpaintedDepthPixels.length);
-    for (let p = 0; p < inpaintedDepthPixels.length; p += 1) {
-      renderDepthMask[p] = maskPixels[p] && inpaintedDepthPixels[p] > 0 ? 1 : 0;
+    const smoothedDepthPixels = smoothMaskedPositiveDepth(inpaintedDepthPixels, maskPixels, layer.width, layer.height);
+    const finalDepthPixels = depthModeEl.value === "raw"
+      ? smoothedDepthPixels
+      : createMaskedGridDepthPixels(
+        layer.width,
+        layer.height,
+        smoothedDepthPixels,
+        maskPixels,
+        gridSpecModeEl.value,
+        Number(gridXEl.value),
+        Number(gridYEl.value),
+        Number(kernelSizeEl.value),
+        interpModeEl.value,
+      );
+    const renderDepthMask = new Uint8Array(finalDepthPixels.length);
+    for (let p = 0; p < finalDepthPixels.length; p += 1) {
+      renderDepthMask[p] = maskPixels[p] && finalDepthPixels[p] > 0 ? 1 : 0;
     }
-    const depthTexture = createDepthTextureResources(layer.width, layer.height, inpaintedDepthPixels).texture;
+    const depthTexture = createDepthTextureResources(layer.width, layer.height, finalDepthPixels).texture;
     const maskTexture = createBinaryMaskTexture(layer.width, layer.height, renderDepthMask);
     const debugTexture = createPsdDebugTexture(layer.width, layer.height, maskPixels, pruneResult.debugState, pruneResult.debugScore);
     depthTexture.minFilter = THREE.NearestFilter;
@@ -2345,7 +2383,7 @@ function createPsdLayerEntries(colorPsd, depthPsd, stableDepthPixels) {
       maskTexture,
       debugTexture: debugTexture.texture,
       debugPreviewUrl: debugTexture.url,
-      depthPixels: inpaintedDepthPixels,
+      depthPixels: finalDepthPixels,
       renderDepthMask,
       maskPixels,
       removedDepthPixels,
@@ -3241,6 +3279,60 @@ function inpaintMaskedLayerDepth(sourceDepthPixels, maskPixels, width, height) {
   }
 
   return depthPixels;
+}
+
+function smoothMaskedPositiveDepth(sourceDepthPixels, maskPixels, width, height) {
+  const kernel = [
+    [-1, -1, 1],
+    [0, -1, 2],
+    [1, -1, 1],
+    [-1, 0, 2],
+    [0, 0, 4],
+    [1, 0, 2],
+    [-1, 1, 1],
+    [0, 1, 2],
+    [1, 1, 1],
+  ];
+  let input = sourceDepthPixels.slice();
+
+  for (let pass = 0; pass < 3; pass += 1) {
+    const output = input.slice();
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const index = y * width + x;
+        if (!maskPixels[index] || input[index] <= 0) {
+          continue;
+        }
+
+        let weightedSum = 0;
+        let totalWeight = 0;
+        for (let i = 0; i < kernel.length; i += 1) {
+          const [dx, dy, weight] = kernel[i];
+          const sx = x + dx;
+          const sy = y + dy;
+          if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+            continue;
+          }
+
+          const sampleIndex = sy * width + sx;
+          const sampleDepth = input[sampleIndex];
+          if (!maskPixels[sampleIndex] || sampleDepth <= 0) {
+            continue;
+          }
+
+          weightedSum += sampleDepth * weight;
+          totalWeight += weight;
+        }
+
+        if (totalWeight > 0) {
+          output[index] = clampByte(Math.round(weightedSum / totalWeight));
+        }
+      }
+    }
+    input = output;
+  }
+
+  return input;
 }
 
 function hasPositiveMaskedNeighbor(depthPixels, maskPixels, width, height, index) {
@@ -5275,6 +5367,18 @@ function createGridDepthResources(width, height, sourcePixels, specMode, gridX, 
   const kernel = createGaussianKernel(gridSpec.radius);
   const pixels = createGridDepthPixels(width, height, sourcePixels, gridSpec, kernel, interpMode);
   return createDepthTextureResources(width, height, pixels);
+}
+
+function createMaskedGridDepthPixels(width, height, sourcePixels, maskPixels, specMode, gridX, gridY, kernelSize, interpMode) {
+  const gridSpec = createGridSpec(width, height, specMode, gridX, gridY, kernelSize);
+  const kernel = createGaussianKernel(gridSpec.radius);
+  const pixels = createGridDepthPixels(width, height, sourcePixels, gridSpec, kernel, interpMode);
+  for (let i = 0; i < pixels.length; i += 1) {
+    if (!maskPixels[i]) {
+      pixels[i] = 0;
+    }
+  }
+  return pixels;
 }
 
 function createGridSpec(width, height, specMode, gridX, gridY, kernelSize) {
