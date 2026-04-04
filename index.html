@@ -225,13 +225,27 @@
       }
 
       .segment-item {
-        display: flex;
+        display: grid;
+        grid-template-columns: auto auto minmax(72px, 1fr) auto auto;
         align-items: center;
         gap: 8px;
         padding: 6px 8px;
         border: 1px solid rgba(255, 255, 255, 0.06);
         border-radius: 10px;
         background: rgba(255, 255, 255, 0.03);
+        min-width: 0;
+      }
+
+      .segment-group {
+        display: grid;
+        gap: 6px;
+      }
+
+      .segment-group-title {
+        padding: 2px 4px 0;
+        font-size: 11px;
+        color: var(--muted);
+        text-transform: none;
       }
 
       .segment-swatch {
@@ -243,19 +257,24 @@
       }
 
       .segment-name {
-        flex: 1;
-        min-width: 0;
+        min-width: 72px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
 
       .segment-size {
         color: var(--muted);
         font-variant-numeric: tabular-nums;
+        flex: 0 0 auto;
       }
 
       .segment-controls {
         display: flex;
         align-items: center;
         gap: 4px;
+        flex: 0 0 auto;
+        justify-self: end;
       }
 
       .segment-button {
@@ -274,7 +293,7 @@
       }
 
       .segment-metrics {
-        min-width: 86px;
+        min-width: 64px;
         color: var(--muted);
         font-size: 11px;
         font-variant-numeric: tabular-nums;
@@ -330,6 +349,11 @@
       <div class="control-row">
         <label for="contourRepair">Repair contour band</label>
         <input id="contourRepair" type="checkbox">
+      </div>
+
+      <div class="control-row">
+        <label for="surfaceSmooth">Smooth wavy surface</label>
+        <input id="surfaceSmooth" type="checkbox">
       </div>
 
       <div class="control">
@@ -427,10 +451,12 @@
       <div class="debug-panel" id="psdDebugPanel">
         <div class="debug-title" id="psdDebugTitle">PSD debug</div>
         <img class="debug-image" id="psdDebugImage" alt="PSD debug map">
+        <img class="debug-image" id="psdDepthImage" alt="PSD depth grayscale">
         <div class="debug-legend" id="psdDebugLegend">
           Blue: kept seed<br>
           Orange: pixel-pruned<br>
           Magenta: component-pruned<br>
+          Cyan: cluster-pruned<br>
           Yellow: contour zeroed<br>
           Dark: no seed / empty
         </div>
