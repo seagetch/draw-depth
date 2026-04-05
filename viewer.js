@@ -3122,8 +3122,8 @@ function getCanvasImageData(canvas) {
 
 function mergePsdFaceFeatureLayers(layerSources, imageWidth, imageHeight) {
   const merged = layerSources.slice();
-  const featureRegex = /(?:^|[\s_-])(nose|mouth|eyewhite|eyebrow|irides|eyelash|eye)(?:$|[\s_-])/i;
-  const faceRegex = /(face|skin|head)/i;
+  const featureRegex = /(?:^|[\s_:#-])(nose|mouth|lower[\s_-]?lip|upper[\s_-]?lip|lower[\s_-]?teeth|upper[\s_-]?teeth|tongue|eyewhite|eyebrow\d*|irides?|eyelash|eyelid\d*|eylid\d*|eye|iris|sclera)(?:$|[\s_:#-])/i;
+  const faceRegex = /(?:^|[\s_:#-])#?face(?:$|[\s_:#-])/i;
   const mergePlans = [];
 
   for (let i = 0; i < merged.length; i += 1) {
@@ -3138,7 +3138,7 @@ function mergePsdFaceFeatureLayers(layerSources, imageWidth, imageHeight) {
     }
   }
 
-  mergePlans.sort((a, b) => b.sourceIndex - a.sourceIndex);
+  mergePlans.sort((a, b) => a.sourceIndex - b.sourceIndex);
 
   const removed = new Uint8Array(merged.length);
   for (let i = 0; i < mergePlans.length; i += 1) {
