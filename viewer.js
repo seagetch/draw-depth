@@ -873,6 +873,7 @@ function buildPreparedPsdLayerEntries() {
       layer.height,
       effectiveDepthPixels,
       renderDepthMask,
+      layer.inpaintFilledMask,
     );
 
     layer.currentDepthPreviewUrl = depthPreviewUrl;
@@ -3055,7 +3056,8 @@ function createPsdLayerEntries(colorPsd, stableDepthPixels) {
       );
     }
 
-    const inpaintedDepthPixels = inpaintMaskedLayerDepth(depthPixels, maskPixels, layer.width, layer.height);
+    const inpaintResult = inpaintMaskedLayerDepth(depthPixels, maskPixels, layer.width, layer.height);
+    const inpaintedDepthPixels = inpaintResult.pixels;
     const smoothedDepthPixels = inpaintedDepthPixels;
     const finalDepthPixels = depthModeEl.value === "raw"
       ? smoothedDepthPixels
@@ -3077,7 +3079,13 @@ function createPsdLayerEntries(colorPsd, stableDepthPixels) {
     const depthTexture = createDepthTextureResources(layer.width, layer.height, finalDepthPixels).texture;
     const maskTexture = createBinaryMaskTexture(layer.width, layer.height, renderDepthMask);
     const debugTexture = createPsdDebugTexture(layer.width, layer.height, maskPixels, pruneResult.debugState, pruneResult.debugScore);
-    const depthPreviewUrl = createPsdDepthPreviewUrl(layer.width, layer.height, finalDepthPixels, maskPixels);
+    const depthPreviewUrl = createPsdDepthPreviewUrl(
+      layer.width,
+      layer.height,
+      finalDepthPixels,
+      maskPixels,
+      inpaintResult.filledMask,
+    );
     depthTexture.minFilter = THREE.NearestFilter;
     depthTexture.magFilter = THREE.NearestFilter;
     depthTexture.needsUpdate = true;
@@ -3094,6 +3102,7 @@ function createPsdLayerEntries(colorPsd, stableDepthPixels) {
       debugTexture: debugTexture.texture,
       debugPreviewUrl: debugTexture.url,
       depthPreviewUrl,
+      inpaintFilledMask: inpaintResult.filledMask,
       baseDepthPixels: finalDepthPixels.slice(),
       depthPixels: finalDepthPixels,
       renderDepthMask,
@@ -3977,6 +3986,7 @@ function expandMaskFrontier(maskPixels, width, height, frontier, bandMask) {
 function inpaintMaskedLayerDepth(sourceDepthPixels, maskPixels, width, height) {
   const depthPixels = sourceDepthPixels.slice();
   const totalPixels = width * height;
+  const filledMask = new Uint8Array(totalPixels);
   const queue = new Int32Array(totalPixels);
   const queued = new Uint8Array(totalPixels);
   let head = 0;
@@ -4005,10 +4015,14 @@ function inpaintMaskedLayerDepth(sourceDepthPixels, maskPixels, width, height) {
     }
 
     depthPixels[index] = fillDepth;
+    filledMask[index] = 1;
     tail = enqueueMaskedGapNeighbors(queue, queued, depthPixels, maskPixels, width, height, index, tail);
   }
 
-  return depthPixels;
+  return {
+    pixels: depthPixels,
+    filledMask,
+  };
 }
 
 function smoothMaskedPositiveDepth(sourceDepthPixels, maskPixels, width, height) {
@@ -6609,7 +6623,7 @@ function createPsdDebugTexture(width, height, maskPixels, debugState, debugScore
   };
 }
 
-function createPsdDepthPreviewUrl(width, height, depthPixels, maskPixels) {
+function createPsdDepthPreviewUrl(width, height, depthPixels, maskPixels, filledMask = null) {
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
@@ -6624,9 +6638,15 @@ function createPsdDepthPreviewUrl(width, height, depthPixels, maskPixels) {
     }
 
     const depth = depthPixels[pixelIndex];
-    imageData.data[imageIndex] = depth;
-    imageData.data[imageIndex + 1] = depth;
-    imageData.data[imageIndex + 2] = depth;
+    if (filledMask && filledMask[pixelIndex]) {
+      imageData.data[imageIndex] = 0;
+      imageData.data[imageIndex + 1] = depth;
+      imageData.data[imageIndex + 2] = depth;
+    } else {
+      imageData.data[imageIndex] = 0;
+      imageData.data[imageIndex + 1] = depth;
+      imageData.data[imageIndex + 2] = 0;
+    }
     imageData.data[imageIndex + 3] = 255;
   }
 
