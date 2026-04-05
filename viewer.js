@@ -4005,11 +4005,12 @@ function inpaintMaskedLayerDepth(sourceDepthPixels, maskPixels, width, height) {
 
   while (head < tail) {
     const index = queue[head++];
+    queued[index] = 0;
     if (!maskPixels[index] || depthPixels[index] > 0) {
       continue;
     }
 
-    const fillDepth = sampleMaskedNeighborMedian(depthPixels, maskPixels, width, height, index);
+    const fillDepth = sampleMaskedMultiscaleDepth(depthPixels, maskPixels, width, height, index);
     if (fillDepth <= 0) {
       continue;
     }
@@ -4205,6 +4206,142 @@ function sampleMaskedNeighborMedian(depthPixels, maskPixels, width, height, inde
   }
 
   return medianOfNumbers(values);
+}
+
+function sampleMaskedMultiscaleDepth(depthPixels, maskPixels, width, height, index, contexts = null) {
+  const activeContexts = contexts || [
+    estimateMaskedDepthAtScale(depthPixels, maskPixels, width, height, index, 1, 4, 0.48),
+    estimateMaskedDepthAtScale(depthPixels, maskPixels, width, height, index, 7, 5, 0.32),
+    estimateMaskedDepthAtScale(depthPixels, maskPixels, width, height, index, 37, 5, 0.20),
+  ];
+  let weightedDepth = 0;
+  let totalWeight = 0;
+
+  for (let i = 0; i < activeContexts.length; i += 1) {
+    const estimate = activeContexts[i];
+    if (!estimate.valid) {
+      continue;
+    }
+    const confidence = estimate.weight * estimate.confidence;
+    weightedDepth += estimate.depth * confidence;
+    totalWeight += confidence;
+  }
+
+  if (totalWeight > 0) {
+    return clampByte(Math.round(weightedDepth / totalWeight));
+  }
+
+  return sampleMaskedNeighborMedian(depthPixels, maskPixels, width, height, index);
+}
+
+function estimateMaskedDepthAtScale(depthPixels, maskPixels, width, height, index, radius, minSamples, weight) {
+  const x0 = index % width;
+  const y0 = Math.floor(index / width);
+  const sampled = sampleMaskedSparseGridDepths(depthPixels, maskPixels, width, height, x0, y0, radius);
+  const values = sampled.values;
+  if (values.length < minSamples) {
+    return { valid: false, depth: 0, confidence: 0, weight };
+  }
+
+  const sortedValues = values.slice().sort((a, b) => a - b);
+  const grid = sampled.grid;
+  const centerMean = values.reduce((sum, value) => sum + value, 0) / values.length;
+  for (let i = 0; i < grid.length; i += 1) {
+    if (grid[i] <= 0) {
+      grid[i] = centerMean;
+    }
+  }
+
+  const planeDepth = estimateGridPlaneDepth(grid);
+  const medianDepth = medianOfNumbers(values);
+  const lo = percentileFromSorted(sortedValues, 0.2);
+  const hi = percentileFromSorted(sortedValues, 0.8);
+  const robustDepth = clamp(Math.round(planeDepth * 0.7 + medianDepth * 0.3), lo, hi);
+
+  return {
+    valid: true,
+    depth: robustDepth,
+    confidence: clamp(values.length / 9, 0, 1),
+    weight,
+  };
+}
+
+function sampleMaskedSparseGridDepths(depthPixels, maskPixels, width, height, x0, y0, radius) {
+  const grid = new Float32Array(9);
+  const values = [];
+  let cursor = 0;
+  const searchRadius = Math.max(1, Math.floor(radius / 3));
+
+  for (let gy = -1; gy <= 1; gy += 1) {
+    for (let gx = -1; gx <= 1; gx += 1) {
+      const targetX = clamp(Math.round(x0 + gx * radius), 0, width - 1);
+      const targetY = clamp(Math.round(y0 + gy * radius), 0, height - 1);
+      const sampledDepth = sampleNearestMaskedDepth(
+        depthPixels,
+        maskPixels,
+        width,
+        height,
+        targetX,
+        targetY,
+        searchRadius,
+      );
+      grid[cursor] = sampledDepth;
+      if (sampledDepth > 0) {
+        values.push(sampledDepth);
+      }
+      cursor += 1;
+    }
+  }
+
+  return { grid, values };
+}
+
+function sampleNearestMaskedDepth(depthPixels, maskPixels, width, height, targetX, targetY, searchRadius) {
+  let bestDepth = 0;
+  let bestDistanceSq = Infinity;
+
+  for (let dy = -searchRadius; dy <= searchRadius; dy += 1) {
+    const y = targetY + dy;
+    if (y < 0 || y >= height) {
+      continue;
+    }
+    for (let dx = -searchRadius; dx <= searchRadius; dx += 1) {
+      const x = targetX + dx;
+      if (x < 0 || x >= width) {
+        continue;
+      }
+
+      const index = y * width + x;
+      const depth = depthPixels[index];
+      if (!maskPixels[index] || depth <= 0) {
+        continue;
+      }
+
+      const distanceSq = dx * dx + dy * dy;
+      if (distanceSq < bestDistanceSq) {
+        bestDistanceSq = distanceSq;
+        bestDepth = depth;
+      }
+    }
+  }
+
+  return bestDepth;
+}
+
+function estimateGridPlaneDepth(grid) {
+  const tl = grid[0];
+  const tc = grid[1];
+  const tr = grid[2];
+  const ml = grid[3];
+  const mc = grid[4];
+  const mr = grid[5];
+  const bl = grid[6];
+  const bc = grid[7];
+  const br = grid[8];
+
+  const gradX = (tr + 2 * mr + br) - (tl + 2 * ml + bl);
+  const gradY = (bl + 2 * bc + br) - (tl + 2 * tc + tr);
+  return mc + (gradX + gradY) * 0.125;
 }
 
 function sampleMaskedNeighborDepth(depthPixels, maskPixels, width, height, index) {
