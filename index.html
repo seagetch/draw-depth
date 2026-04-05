@@ -54,7 +54,7 @@
         top: 16px;
         right: 16px;
         z-index: 10;
-        width: min(320px, calc(100vw - 32px));
+        width: min(480px, calc(100vw - 32px));
         max-height: calc(100vh - 32px);
         padding: 14px 14px 12px;
         border: 1px solid var(--line);
@@ -156,8 +156,9 @@
 
       .debug-panel {
         display: none;
-        gap: 8px;
-        margin-top: 12px;
+        gap: 8px 10px;
+        width: 75%;
+        margin: 12px auto 0;
         padding: 10px;
         border: 1px solid var(--line);
         border-radius: 10px;
@@ -166,11 +167,14 @@
 
       .debug-panel.is-visible {
         display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        align-items: start;
       }
 
       .debug-title {
         font-size: 12px;
         color: var(--text);
+        grid-column: 1 / -1;
       }
 
       .debug-image {
@@ -186,6 +190,7 @@
         font-size: 11px;
         color: var(--muted);
         line-height: 1.4;
+        grid-column: 1 / -1;
       }
 
       select,
