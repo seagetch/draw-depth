@@ -80,6 +80,20 @@
         margin-bottom: 10px;
       }
 
+      .action-button {
+        width: 100%;
+        padding: 8px 10px;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--text);
+        cursor: pointer;
+      }
+
+      .action-button:hover {
+        background: rgba(255, 255, 255, 0.1);
+      }
+
       .control-row {
         display: flex;
         justify-content: space-between;
@@ -359,6 +373,10 @@
       <div class="control-row">
         <label for="surfaceSmooth">Smooth wavy surface</label>
         <input id="surfaceSmooth" type="checkbox">
+      </div>
+
+      <div class="control">
+        <button class="action-button" id="saveDepthPsdButton" type="button">Save Midori-full-depth.psd</button>
       </div>
 
       <div class="control">

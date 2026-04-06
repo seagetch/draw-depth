@@ -24,6 +24,7 @@ const segmentHudEl = document.querySelector("#segmentHud");
 const colorThumbButtonEl = document.querySelector("#colorThumbButton");
 const depthThumbButtonEl = document.querySelector("#depthThumbButton");
 const segmentThumbButtonEl = document.querySelector("#segmentThumbButton");
+const saveDepthPsdButtonEl = document.querySelector("#saveDepthPsdButton");
 const colorThumbEl = document.querySelector("#colorThumb");
 const depthThumbEl = document.querySelector("#depthThumb");
 const segmentThumbEl = document.querySelector("#segmentThumb");
@@ -39,12 +40,14 @@ const colorUrl = "./data/Midori-color.jpg";
 const depthUrl = "./data/Midori-depth.jpg";
 const segmentUrl = "./data/Midori-segment.jpg";
 const psdColorUrl = "./data/Midori-full.psd";
+const psdDepthPsdUrl = "./data/Midori-full-depth.psd";
 const psdStableDepthUrl = "./data/Midori-depth-st.png";
 const cacheBustToken = `${Date.now()}`;
 const defaultColorUrl = withCacheBust(colorUrl);
 const defaultDepthUrl = withCacheBust(depthUrl);
 const defaultSegmentUrl = withCacheBust(segmentUrl);
 const defaultPsdColorUrl = withCacheBust(psdColorUrl);
+const defaultPsdDepthPsdUrl = withCacheBust(psdDepthPsdUrl);
 const defaultPsdStableDepthUrl = withCacheBust(psdStableDepthUrl);
 const invalidDepthThreshold = 1 / 255;
 const segmentAnchorDistance = 36;
@@ -581,6 +584,15 @@ function wireControls() {
     segmentFileInputEl.click();
   });
 
+  saveDepthPsdButtonEl.addEventListener("click", async () => {
+    try {
+      await saveCurrentPsdDepthAsPsd();
+    } catch (error) {
+      console.error(error);
+      statusEl.textContent = `Failed: ${error.message}`;
+    }
+  });
+
   colorFileInputEl.addEventListener("change", async (event) => {
     const file = event.target.files[0];
     if (!file) {
@@ -797,6 +809,7 @@ function buildPreparedPsdLayerEntries() {
     const baseDepthPixels = layer.baseDepthPixels || layer.depthPixels;
     const effectiveDepthPixels = new Uint8Array(baseDepthPixels.length);
     const renderDepthMask = new Uint8Array(baseDepthPixels.length);
+    const effectiveMaskPixels = layer.maskPixels;
     const depthScale = renderState.psdLayerDepthScales[layerIndex] ?? 1;
     const depthOffset = renderState.psdLayerDepthOffsets[layerIndex] ?? 0;
 
@@ -808,7 +821,7 @@ function buildPreparedPsdLayerEntries() {
 
       for (let x = 0; x < layer.width; x += 1) {
         const localIndex = y * layer.width + x;
-        if (!layer.maskPixels[localIndex]) {
+        if (!effectiveMaskPixels[localIndex]) {
           continue;
         }
 
@@ -825,12 +838,12 @@ function buildPreparedPsdLayerEntries() {
         const globalIndex = globalY * renderState.imageWidth + globalX;
         let effectiveDepth = clamp(Math.round(baseDepth * depthScale + depthOffset), 1, 255);
         const upperLimit = upperDepthLimit[globalIndex];
-        if (upperLimit <= 255) {
+        if (!layer.hasDirectDepth && upperLimit <= 255) {
           effectiveDepth = Math.min(effectiveDepth, Math.max(1, upperLimit - 1));
         }
 
         effectiveDepthPixels[localIndex] = effectiveDepth;
-        renderDepthMask[localIndex] = 1;
+      renderDepthMask[localIndex] = 1;
       }
     }
 
@@ -854,7 +867,9 @@ function buildPreparedPsdLayerEntries() {
           }
 
           const globalIndex = globalY * renderState.imageWidth + globalX;
-          upperDepthLimit[globalIndex] = Math.min(upperDepthLimit[globalIndex], effectiveDepth);
+          if (!layer.hasDirectDepth) {
+            upperDepthLimit[globalIndex] = Math.min(upperDepthLimit[globalIndex], effectiveDepth);
+          }
         }
       }
     }
@@ -881,6 +896,7 @@ function buildPreparedPsdLayerEntries() {
       ...layer,
       depthPixels: effectiveDepthPixels,
       renderDepthMask,
+      maskPixels: effectiveMaskPixels,
       depthTexture,
       maskTexture,
       depthPreviewUrl,
@@ -888,6 +904,128 @@ function buildPreparedPsdLayerEntries() {
   }
 
   return preparedLayers;
+}
+
+async function saveCurrentPsdDepthAsPsd() {
+  if (renderState.sourceMode !== "psd" || !renderState.psdColorDocument) {
+    throw new Error("PSD pair mode is not active.");
+  }
+  if (typeof agPsd === "undefined" || typeof agPsd.writePsd !== "function") {
+    throw new Error("PSD writer is not available.");
+  }
+
+  statusEl.textContent = "Saving Midori-full-depth.psd...";
+
+  const preparedLayers = buildPreparedPsdLayerEntries();
+  const exportDocument = buildPsdDepthExportDocument(renderState.psdColorDocument, preparedLayers);
+  const buffer = agPsd.writePsd(exportDocument, { generateThumbnail: true });
+  triggerArrayBufferDownload(buffer, "Midori-full-depth.psd");
+
+  statusEl.textContent = "Saved Midori-full-depth.psd";
+}
+
+function buildPsdDepthExportDocument(psdDocument, preparedLayers) {
+  const sourceLayers = flattenPsdLayers(psdDocument.children || []);
+  const preparedBySourceIndex = new Array(sourceLayers.length).fill(null);
+
+  for (let i = 0; i < preparedLayers.length; i += 1) {
+    const prepared = preparedLayers[i];
+    const sourceIndices = prepared.sourceIndices || [];
+    for (let j = 0; j < sourceIndices.length; j += 1) {
+      const sourceIndex = sourceIndices[j];
+      if (sourceIndex >= 0 && sourceIndex < preparedBySourceIndex.length) {
+        preparedBySourceIndex[sourceIndex] = {
+          layer: prepared,
+          visibilityIndex: i,
+        };
+      }
+    }
+  }
+
+  const children = [];
+  for (let i = 0; i < sourceLayers.length; i += 1) {
+    const sourceLayer = sourceLayers[i];
+    const preparedInfo = preparedBySourceIndex[i];
+    const canvas = createPsdExportDepthCanvas(sourceLayer, preparedInfo ? preparedInfo.layer : null);
+    children.push({
+      name: sourceLayer.name || `Layer ${i + 1}`,
+      left: sourceLayer.left || 0,
+      top: sourceLayer.top || 0,
+      canvas,
+      hidden: preparedInfo ? !renderState.psdLayerVisibility[preparedInfo.visibilityIndex] : false,
+    });
+  }
+
+  const compositeCanvas = document.createElement("canvas");
+  compositeCanvas.width = psdDocument.width;
+  compositeCanvas.height = psdDocument.height;
+  const compositeContext = compositeCanvas.getContext("2d", { willReadFrequently: true });
+  compositeContext.clearRect(0, 0, compositeCanvas.width, compositeCanvas.height);
+  for (let i = children.length - 1; i >= 0; i -= 1) {
+    const layer = children[i];
+    if (layer.hidden || !layer.canvas) {
+      continue;
+    }
+    compositeContext.drawImage(layer.canvas, layer.left || 0, layer.top || 0);
+  }
+
+  return {
+    width: psdDocument.width,
+    height: psdDocument.height,
+    canvas: compositeCanvas,
+    children,
+  };
+}
+
+function createPsdExportDepthCanvas(sourceLayer, preparedLayer) {
+  const canvas = document.createElement("canvas");
+  canvas.width = sourceLayer.width;
+  canvas.height = sourceLayer.height;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  const output = context.createImageData(canvas.width, canvas.height);
+
+  for (let y = 0; y < sourceLayer.height; y += 1) {
+    const globalY = sourceLayer.top + y;
+    for (let x = 0; x < sourceLayer.width; x += 1) {
+      const localIndex = y * sourceLayer.width + x;
+      const rgbaIndex = localIndex * 4;
+      let depth = 0;
+      if (preparedLayer) {
+        const globalX = sourceLayer.left + x;
+        const preparedLocalX = globalX - preparedLayer.left;
+        const preparedLocalY = globalY - preparedLayer.top;
+        if (
+          preparedLocalX >= 0 &&
+          preparedLocalX < preparedLayer.width &&
+          preparedLocalY >= 0 &&
+          preparedLocalY < preparedLayer.height
+        ) {
+          const preparedIndex = preparedLocalY * preparedLayer.width + preparedLocalX;
+          depth = preparedLayer.depthPixels[preparedIndex] || 0;
+        }
+      }
+
+      output.data[rgbaIndex] = depth;
+      output.data[rgbaIndex + 1] = depth;
+      output.data[rgbaIndex + 2] = depth;
+      output.data[rgbaIndex + 3] = 255;
+    }
+  }
+
+  context.putImageData(output, 0, 0);
+  return canvas;
+}
+
+function triggerArrayBufferDownload(buffer, filename) {
+  const blob = new Blob([buffer], { type: "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  setTimeout(() => {
+    URL.revokeObjectURL(url);
+  }, 1000);
 }
 
 function buildMaskedPlaneGeometry(width, height, depthPixels, segmentMap, segmentDepthMeans, gapMask, step, options = {}) {
@@ -2600,6 +2738,14 @@ async function fetchArrayBuffer(url) {
   return response.arrayBuffer();
 }
 
+async function fetchOptionalArrayBuffer(url) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    return null;
+  }
+  return response.arrayBuffer();
+}
+
 async function loadPsdPair(colorBuffer) {
   const previousDebugLayerName = renderState.psdDebugLayerIndex >= 0
     ? renderState.psdLayerEntries[renderState.psdDebugLayerIndex]?.name
@@ -2619,12 +2765,14 @@ async function loadPsdPair(colorBuffer) {
   disposePsdLayerTextures();
   const colorPsd = agPsd.readPsd(colorBuffer);
   const scaledPsd = prepareScaledPsdDocument(colorPsd, 1280);
-  const stableDepthResult = await ensurePsdStableDepthPixels(scaledPsd);
-  const layerEntries = createPsdLayerEntries(scaledPsd, stableDepthResult.pixels);
+  const depthPsdBuffer = await fetchOptionalArrayBuffer(defaultPsdDepthPsdUrl);
+  const depthPsd = depthPsdBuffer ? prepareScaledPsdDocument(agPsd.readPsd(depthPsdBuffer), 1280) : null;
+  const stableDepthResult = depthPsd ? null : await ensurePsdStableDepthPixels(scaledPsd);
+  const layerEntries = createPsdLayerEntries(scaledPsd, depthPsd, stableDepthResult ? stableDepthResult.pixels : null);
 
   renderState.psdColorDocument = scaledPsd;
-  renderState.psdDepthDocument = null;
-  renderState.psdStableDepthPixels = stableDepthResult.pixels;
+  renderState.psdDepthDocument = depthPsd;
+  renderState.psdStableDepthPixels = stableDepthResult ? stableDepthResult.pixels : null;
   renderState.psdLayerEntries = layerEntries;
   renderState.psdLayerVisibility = layerEntries.map((layer) => previousVisibilityByName.get(layer.name) ?? true);
   renderState.psdLayerDepthOffsets = layerEntries.map((layer) => previousOffsetByName.get(layer.name) ?? 0);
@@ -2636,7 +2784,9 @@ async function loadPsdPair(colorBuffer) {
   renderState.imageWidth = scaledPsd.width;
   renderState.imageHeight = scaledPsd.height;
   renderState.psdColorPreviewUrl = scaledPsd.canvas ? scaledPsd.canvas.toDataURL("image/png") : "";
-  renderState.psdDepthPreviewUrl = stableDepthResult.previewUrl;
+  renderState.psdDepthPreviewUrl = depthPsd?.canvas
+    ? depthPsd.canvas.toDataURL("image/png")
+    : (stableDepthResult ? stableDepthResult.previewUrl : "");
   rebuildSegmentList();
   updatePsdDebugPanel();
 }
@@ -2691,7 +2841,7 @@ function prepareScaledPsdDocument(psd, maxHeight) {
   const compositeCanvas = document.createElement("canvas");
   compositeCanvas.width = scaledWidth;
   compositeCanvas.height = scaledHeight;
-  const compositeContext = compositeCanvas.getContext("2d");
+  const compositeContext = compositeCanvas.getContext("2d", { willReadFrequently: true });
   compositeContext.drawImage(psd.canvas, 0, 0, scaledWidth, scaledHeight);
 
   const scaledLayers = flattenPsdLayers(psd.children || []).map((layer, index) => {
@@ -2700,7 +2850,7 @@ function prepareScaledPsdDocument(psd, maxHeight) {
     const canvas = document.createElement("canvas");
     canvas.width = width;
     canvas.height = height;
-    const context = canvas.getContext("2d");
+    const context = canvas.getContext("2d", { willReadFrequently: true });
     context.drawImage(layer.canvas, 0, 0, width, height);
     return {
       ...layer,
@@ -2798,7 +2948,7 @@ function alignStableDepthToMergedMask(stableImage, mergedMask, targetWidth, targ
   const cropCanvas = document.createElement("canvas");
   cropCanvas.width = stableBounds.width;
   cropCanvas.height = stableBounds.height;
-  const cropContext = cropCanvas.getContext("2d");
+  const cropContext = cropCanvas.getContext("2d", { willReadFrequently: true });
   cropContext.putImageData(
     new ImageData(
       stableImage.data.slice(
@@ -2867,7 +3017,7 @@ function alignStableDepthToMergedMask(stableImage, mergedMask, targetWidth, targ
   const alignedCanvas = document.createElement("canvas");
   alignedCanvas.width = targetWidth;
   alignedCanvas.height = targetHeight;
-  const alignedContext = alignedCanvas.getContext("2d");
+  const alignedContext = alignedCanvas.getContext("2d", { willReadFrequently: true });
   alignedContext.clearRect(0, 0, targetWidth, targetHeight);
   alignedContext.imageSmoothingEnabled = true;
   alignedContext.drawImage(
@@ -2956,8 +3106,13 @@ function scoreStableAlignment(cropMask, cropWidth, cropHeight, mergedMask, targe
   return diff - overlap * 0.25;
 }
 
-function createPsdLayerEntries(colorPsd, stableDepthPixels) {
+function createPsdLayerEntries(colorPsd, depthPsd, stableDepthPixels) {
   const colorLayers = flattenPsdLayers(colorPsd.children || []);
+  const depthLayers = depthPsd ? flattenPsdLayers(depthPsd.children || []) : null;
+  const depthLayerLookup = depthLayers ? buildPsdLayerLookup(depthLayers) : null;
+  if (!depthPsd && !stableDepthPixels) {
+    throw new Error("Midori-depth-st.png could not be loaded.");
+  }
 
   const layerSources = [];
 
@@ -2974,11 +3129,40 @@ function createPsdLayerEntries(colorPsd, stableDepthPixels) {
     colorTexture.needsUpdate = true;
 
     const colorImageData = getCanvasImageData(colorLayer.canvas);
-    const maskPixels = extractLayerMaskPixels(colorImageData.data);
+    const colorMaskPixels = extractLayerMaskPixels(colorImageData.data);
+    const depthLayer = depthLayerLookup
+      ? takeMatchedPsdLayer(depthLayerLookup, colorLayer, i)
+      : (depthLayers && depthLayers[i] ? depthLayers[i] : null);
+    const depthImageData = depthLayer ? getCanvasImageData(depthLayer.canvas) : null;
+    const sampledDepthRgba = depthImageData && depthLayer
+      ? sampleLayerRgbaToTargetLayer(depthImageData, depthLayer, colorLayer)
+      : null;
+    const rawDepthPixels = depthImageData
+      ? sampleDepthPixelsToTargetLayer(
+        depthImageData,
+        depthLayer,
+        colorLayer,
+        {
+          ignoreAlpha: !!depthPsd,
+          minAlpha: depthPsd ? 0 : 1,
+        },
+      )
+      : (depthPsd ? new Uint8Array(colorLayer.width * colorLayer.height) : null);
+    const depthPixels = depthPsd && depthImageData
+      ? repairDirectDepthEdgePixels(
+        rawDepthPixels,
+        sampledDepthRgba,
+        colorMaskPixels,
+        colorLayer.width,
+        colorLayer.height,
+      )
+      : rawDepthPixels;
+    const maskPixels = colorMaskPixels;
 
     layerSources.push({
       name: colorLayer.name || `Layer ${layerSources.length + 1}`,
       sourceIndex: i,
+      sourceIndices: [i],
       left: colorLayer.left,
       top: colorLayer.top,
       width: colorLayer.width,
@@ -2986,22 +3170,50 @@ function createPsdLayerEntries(colorPsd, stableDepthPixels) {
       colorTexture,
       colorImageData,
       maskPixels,
+      depthImageData,
+      directDepthPixels: depthPixels,
       depthMaskPixels: maskPixels,
     });
   }
 
-  const mergedLayerSources = mergePsdFaceFeatureLayers(layerSources, colorPsd.width, colorPsd.height);
-
-  const visibleLayerMap = buildVisiblePsdLayerMap(
+  const mergedLayerSources = mergePsdFaceFeatureLayers(
+    layerSources,
     colorPsd.width,
     colorPsd.height,
-    mergedLayerSources,
+    { mergeDepth: !depthPsd },
   );
+
+  const visibleLayerMap = depthPsd
+    ? null
+    : buildVisiblePsdLayerMap(
+      colorPsd.width,
+      colorPsd.height,
+      mergedLayerSources,
+    );
+  const pendingLayers = [];
   const entries = [];
 
   for (let i = 0; i < mergedLayerSources.length; i += 1) {
     const layer = mergedLayerSources[i];
     const maskPixels = extractLayerMaskPixels(layer.colorImageData.data);
+    if (depthPsd) {
+      const rawDepthPixels = (layer.directDepthPixels || new Uint8Array(layer.width * layer.height)).slice();
+      pendingLayers.push({
+        layer,
+        hasDirectDepth: true,
+        maskPixels,
+        pruneResult: {
+          pixels: rawDepthPixels,
+          debugState: new Uint8Array(rawDepthPixels.length),
+          debugScore: new Uint8Array(rawDepthPixels.length),
+        },
+        removedDepthPixels: 0,
+        inpaintFilledMask: new Uint8Array(rawDepthPixels.length),
+        inpaintedDepthPixels: rawDepthPixels,
+      });
+      continue;
+    }
+
     const seededDepthPixels = seedPsdLayerDepthPixels(
       layer,
       i,
@@ -3057,9 +3269,25 @@ function createPsdLayerEntries(colorPsd, stableDepthPixels) {
     }
 
     const inpaintResult = inpaintMaskedLayerDepth(depthPixels, maskPixels, layer.width, layer.height);
-    const inpaintedDepthPixels = inpaintResult.pixels;
-    const smoothedDepthPixels = inpaintedDepthPixels;
-    const finalDepthPixels = depthModeEl.value === "raw"
+    pendingLayers.push({
+      layer,
+      maskPixels,
+      pruneResult,
+      removedDepthPixels,
+      inpaintFilledMask: inpaintResult.filledMask,
+      inpaintedDepthPixels: inpaintResult.pixels,
+    });
+  }
+
+  if (!depthPsd) {
+    applyPsdSymmetryToPendingLayers(pendingLayers);
+  }
+
+  for (let i = 0; i < pendingLayers.length; i += 1) {
+    const pending = pendingLayers[i];
+    const { layer, maskPixels, pruneResult } = pending;
+    const smoothedDepthPixels = pending.inpaintedDepthPixels;
+    const finalDepthPixels = pending.hasDirectDepth || depthModeEl.value === "raw"
       ? smoothedDepthPixels
       : createMaskedGridDepthPixels(
         layer.width,
@@ -3084,7 +3312,7 @@ function createPsdLayerEntries(colorPsd, stableDepthPixels) {
       layer.height,
       finalDepthPixels,
       maskPixels,
-      inpaintResult.filledMask,
+      pending.inpaintFilledMask,
     );
     depthTexture.minFilter = THREE.NearestFilter;
     depthTexture.magFilter = THREE.NearestFilter;
@@ -3092,6 +3320,7 @@ function createPsdLayerEntries(colorPsd, stableDepthPixels) {
 
     entries.push({
       name: layer.name,
+      sourceIndices: layer.sourceIndices ? layer.sourceIndices.slice() : [layer.sourceIndex],
       left: layer.left,
       top: layer.top,
       width: layer.width,
@@ -3102,12 +3331,13 @@ function createPsdLayerEntries(colorPsd, stableDepthPixels) {
       debugTexture: debugTexture.texture,
       debugPreviewUrl: debugTexture.url,
       depthPreviewUrl,
-      inpaintFilledMask: inpaintResult.filledMask,
+      inpaintFilledMask: pending.inpaintFilledMask,
       baseDepthPixels: finalDepthPixels.slice(),
       depthPixels: finalDepthPixels,
       renderDepthMask,
+      hasDirectDepth: !!pending.hasDirectDepth,
       maskPixels,
-      removedDepthPixels,
+      removedDepthPixels: pending.removedDepthPixels,
       visible: true,
     });
   }
@@ -3120,8 +3350,17 @@ function getCanvasImageData(canvas) {
   return context.getImageData(0, 0, canvas.width, canvas.height);
 }
 
-function mergePsdFaceFeatureLayers(layerSources, imageWidth, imageHeight) {
+function intersectBinaryMasks(maskA, maskB) {
+  const output = new Uint8Array(maskA.length);
+  for (let i = 0; i < maskA.length; i += 1) {
+    output[i] = maskA[i] && maskB[i] ? 1 : 0;
+  }
+  return output;
+}
+
+function mergePsdFaceFeatureLayers(layerSources, imageWidth, imageHeight, options = {}) {
   const merged = layerSources.slice();
+  const mergeDepth = options.mergeDepth !== false;
   const featureRegex = /(?:^|[\s_:#-])(nose|mouth|lower[\s_-]?lip|upper[\s_-]?lip|lower[\s_-]?teeth|upper[\s_-]?teeth|tongue|eyewhite|eyebrow\d*|irides?|eyelash|eyelid\d*|eylid\d*|eye|iris|sclera)(?:$|[\s_:#-])/i;
   const faceRegex = /(?:^|[\s_:#-])#?face(?:$|[\s_:#-])/i;
   const mergePlans = [];
@@ -3146,7 +3385,11 @@ function mergePsdFaceFeatureLayers(layerSources, imageWidth, imageHeight) {
     if (removed[sourceIndex] || removed[targetIndex]) {
       continue;
     }
-    compositePsdLayerIntoTarget(merged[targetIndex], merged[sourceIndex], imageWidth, imageHeight);
+    compositePsdLayerIntoTarget(merged[targetIndex], merged[sourceIndex], imageWidth, imageHeight, { mergeDepth });
+    merged[targetIndex].sourceIndices = [
+      ...(merged[targetIndex].sourceIndices || [merged[targetIndex].sourceIndex]),
+      ...(merged[sourceIndex].sourceIndices || [merged[sourceIndex].sourceIndex]),
+    ];
     removed[sourceIndex] = 1;
   }
 
@@ -3157,6 +3400,289 @@ function mergePsdFaceFeatureLayers(layerSources, imageWidth, imageHeight) {
   }
 
   return merged;
+}
+
+function buildPsdLayerLookup(layers) {
+  const lookup = new Map();
+  for (let i = 0; i < layers.length; i += 1) {
+    const layer = layers[i];
+    const key = getPsdLayerMatchKey(layer);
+    if (!lookup.has(key)) {
+      lookup.set(key, []);
+    }
+    lookup.get(key).push({ layer, index: i });
+  }
+  return lookup;
+}
+
+function getPsdLayerMatchKey(layer) {
+  return [
+    layer.name || "",
+    layer.left || 0,
+    layer.top || 0,
+    layer.canvas ? layer.canvas.width : (layer.width || 0),
+    layer.canvas ? layer.canvas.height : (layer.height || 0),
+  ].join("|");
+}
+
+function takeMatchedPsdLayer(lookup, colorLayer, fallbackIndex) {
+  const exactKey = getPsdLayerMatchKey(colorLayer);
+  const exactMatches = lookup.get(exactKey);
+  if (exactMatches && exactMatches.length) {
+    return exactMatches.shift().layer;
+  }
+
+  let bestEntries = null;
+  let bestEntryIndex = -1;
+  let bestScore = -1;
+
+  for (const entries of lookup.values()) {
+    for (let i = 0; i < entries.length; i += 1) {
+      const entry = entries[i];
+      const score = scorePsdLayerMatch(colorLayer, entry.layer, fallbackIndex, entry.index);
+      if (score > bestScore) {
+        bestScore = score;
+        bestEntries = entries;
+        bestEntryIndex = i;
+      }
+    }
+  }
+
+  if (bestEntries && bestEntryIndex >= 0 && bestScore > 0) {
+    return bestEntries.splice(bestEntryIndex, 1)[0].layer;
+  }
+
+  return null;
+}
+
+function scorePsdLayerMatch(colorLayer, depthLayer, fallbackColorIndex, fallbackDepthIndex) {
+  const colorName = normalizePsdLayerName(colorLayer.name || "");
+  const depthName = normalizePsdLayerName(depthLayer.name || "");
+  const overlap = estimatePsdLayerRectOverlap(colorLayer, depthLayer);
+  const exactPosition = (
+    (depthLayer.left || 0) === (colorLayer.left || 0) &&
+    (depthLayer.top || 0) === (colorLayer.top || 0)
+  ) ? 1 : 0;
+  const indexBonus = fallbackColorIndex === fallbackDepthIndex ? 0.01 : 0;
+
+  if (colorName && depthName && colorName === depthName) {
+    return 1000000 + overlap + exactPosition + indexBonus;
+  }
+  return overlap + exactPosition + indexBonus;
+}
+
+function normalizePsdLayerName(name) {
+  return String(name || "").trim().toLowerCase();
+}
+
+function estimatePsdLayerRectOverlap(layerA, layerB) {
+  const left = Math.max(layerA.left || 0, layerB.left || 0);
+  const top = Math.max(layerA.top || 0, layerB.top || 0);
+  const right = Math.min(
+    (layerA.left || 0) + (layerA.width || (layerA.canvas ? layerA.canvas.width : 0)),
+    (layerB.left || 0) + (layerB.width || (layerB.canvas ? layerB.canvas.width : 0)),
+  );
+  const bottom = Math.min(
+    (layerA.top || 0) + (layerA.height || (layerA.canvas ? layerA.canvas.height : 0)),
+    (layerB.top || 0) + (layerB.height || (layerB.canvas ? layerB.canvas.height : 0)),
+  );
+  if (right <= left || bottom <= top) {
+    return 0;
+  }
+  return (right - left) * (bottom - top);
+}
+
+function shouldSymmetrizePsdLayerDepth(layerName) {
+  return /(?:^|[\s_:#-])(face|body|torso|chest|breast|arm|hand|finger|leg|boot|boots|foot)(?:$|[\s_:#-])/i.test(layerName);
+}
+
+function applyPsdSymmetryToPendingLayers(pendingLayers) {
+  for (let i = 0; i < pendingLayers.length; i += 1) {
+    const pending = pendingLayers[i];
+    if (isSingleSymmetryPsdLayer(pending.layer.name)) {
+      pending.inpaintedDepthPixels = symmetrizeMaskedDepthHorizontally(
+        pending.inpaintedDepthPixels,
+        pending.maskPixels,
+        pending.layer.width,
+        pending.layer.height,
+      );
+    }
+  }
+
+  const pairGroups = new Map();
+  for (let i = 0; i < pendingLayers.length; i += 1) {
+    const sideInfo = parsePairedSymmetryLayerName(pendingLayers[i].layer.name);
+    if (!sideInfo) {
+      continue;
+    }
+    const existing = pairGroups.get(sideInfo.key) || {};
+    existing[sideInfo.side] = pendingLayers[i];
+    pairGroups.set(sideInfo.key, existing);
+  }
+
+  for (const pair of pairGroups.values()) {
+    if (pair.left && pair.right) {
+      symmetrizePsdLayerPair(pair.left, pair.right);
+    }
+  }
+}
+
+function isSingleSymmetryPsdLayer(layerName) {
+  return /(?:^|[\s_:#-])(face|body|torso|chest|breast)(?:$|[\s_:#-])/i.test(layerName);
+}
+
+function parsePairedSymmetryLayerName(layerName) {
+  let side = null;
+  if (/(?:^|::|\b)(l|left)(?:$|::|\b)/i.test(layerName)) {
+    side = "left";
+  } else if (/(?:^|::|\b)(r|right)(?:$|::|\b)/i.test(layerName)) {
+    side = "right";
+  }
+
+  if (!side) {
+    return null;
+  }
+
+  const key = layerName
+    .replace(/(?:^|::|\b)(l|left|r|right)(?:$|::|\b)/gi, "::")
+    .replace(/:+/g, "::")
+    .replace(/^[\s:]+|[\s:]+$/g, "")
+    .toLowerCase();
+
+  return { key, side };
+}
+
+function symmetrizeMaskedDepthHorizontally(sourceDepthPixels, maskPixels, width, height) {
+  const output = sourceDepthPixels.slice();
+  const bounds = computeBinaryMaskBounds(maskPixels, width, height);
+  if (!bounds) {
+    return output;
+  }
+
+  const axisX = bounds.left + (bounds.width - 1) * 0.5;
+
+  for (let y = bounds.top; y < bounds.top + bounds.height; y += 1) {
+    for (let x = bounds.left; x < bounds.left + bounds.width; x += 1) {
+      const mirrorX = Math.round(axisX + (axisX - x));
+      if (mirrorX < bounds.left || mirrorX >= bounds.left + bounds.width) {
+        continue;
+      }
+      if (mirrorX < x) {
+        continue;
+      }
+
+      const leftIndex = y * width + x;
+      const rightIndex = y * width + mirrorX;
+      const leftMasked = maskPixels[leftIndex] > 0;
+      const rightMasked = maskPixels[rightIndex] > 0;
+      if (!leftMasked && !rightMasked) {
+        continue;
+      }
+
+      const leftDepth = leftMasked ? output[leftIndex] : 0;
+      const rightDepth = rightMasked ? output[rightIndex] : 0;
+
+      if (leftMasked && rightMasked && leftDepth > 0 && rightDepth > 0) {
+        const averaged = clampByte(Math.round((leftDepth + rightDepth) * 0.5));
+        output[leftIndex] = averaged;
+        output[rightIndex] = averaged;
+        continue;
+      }
+
+      if (leftMasked && rightMasked) {
+        const propagated = leftDepth > 0 ? leftDepth : rightDepth;
+        if (propagated > 0) {
+          output[leftIndex] = propagated;
+          output[rightIndex] = propagated;
+        }
+      }
+    }
+  }
+
+  return output;
+}
+
+function symmetrizePsdLayerPair(leftPending, rightPending) {
+  const leftBounds = computeLayerGlobalBounds(leftPending.layer, leftPending.maskPixels);
+  const rightBounds = computeLayerGlobalBounds(rightPending.layer, rightPending.maskPixels);
+  if (!leftBounds || !rightBounds) {
+    return;
+  }
+
+  const axisX = (
+    leftBounds.left +
+    leftBounds.right +
+    rightBounds.left +
+    rightBounds.right
+  ) * 0.25;
+
+  const nextLeft = leftPending.inpaintedDepthPixels.slice();
+  const nextRight = rightPending.inpaintedDepthPixels.slice();
+
+  for (let y = leftBounds.top; y <= leftBounds.bottom; y += 1) {
+    for (let x = leftBounds.left; x <= leftBounds.right; x += 1) {
+      const leftLocalX = x - leftPending.layer.left;
+      const leftLocalY = y - leftPending.layer.top;
+      if (
+        leftLocalX < 0 ||
+        leftLocalX >= leftPending.layer.width ||
+        leftLocalY < 0 ||
+        leftLocalY >= leftPending.layer.height
+      ) {
+        continue;
+      }
+
+      const leftIndex = leftLocalY * leftPending.layer.width + leftLocalX;
+      if (!leftPending.maskPixels[leftIndex]) {
+        continue;
+      }
+
+      const mirrorX = Math.round(axisX + (axisX - x));
+      const rightLocalX = mirrorX - rightPending.layer.left;
+      const rightLocalY = y - rightPending.layer.top;
+      if (
+        rightLocalX < 0 ||
+        rightLocalX >= rightPending.layer.width ||
+        rightLocalY < 0 ||
+        rightLocalY >= rightPending.layer.height
+      ) {
+        continue;
+      }
+
+      const rightIndex = rightLocalY * rightPending.layer.width + rightLocalX;
+      if (!rightPending.maskPixels[rightIndex]) {
+        continue;
+      }
+
+      const leftDepth = nextLeft[leftIndex];
+      const rightDepth = nextRight[rightIndex];
+      if (leftDepth > 0 && rightDepth > 0) {
+        const averaged = clampByte(Math.round((leftDepth + rightDepth) * 0.5));
+        nextLeft[leftIndex] = averaged;
+        nextRight[rightIndex] = averaged;
+      } else if (leftDepth > 0 || rightDepth > 0) {
+        const propagated = leftDepth > 0 ? leftDepth : rightDepth;
+        nextLeft[leftIndex] = propagated;
+        nextRight[rightIndex] = propagated;
+      }
+    }
+  }
+
+  leftPending.inpaintedDepthPixels = nextLeft;
+  rightPending.inpaintedDepthPixels = nextRight;
+}
+
+function computeLayerGlobalBounds(layer, maskPixels) {
+  const bounds = computeBinaryMaskBounds(maskPixels, layer.width, layer.height);
+  if (!bounds) {
+    return null;
+  }
+  return {
+    left: layer.left + bounds.left,
+    top: layer.top + bounds.top,
+    right: layer.left + bounds.left + bounds.width - 1,
+    bottom: layer.top + bounds.top + bounds.height - 1,
+  };
 }
 
 function findPsdFeatureMergeTarget(layerSources, featureIndex, faceRegex, imageWidth, imageHeight) {
@@ -3215,7 +3741,8 @@ function estimateLayerMaskOverlap(layerA, layerB, imageWidth, imageHeight) {
   return overlap;
 }
 
-function compositePsdLayerIntoTarget(targetLayer, featureLayer, imageWidth, imageHeight) {
+function compositePsdLayerIntoTarget(targetLayer, featureLayer, imageWidth, imageHeight, options = {}) {
+  const mergeDepth = options.mergeDepth !== false;
   const left = Math.max(targetLayer.left, featureLayer.left, 0);
   const top = Math.max(targetLayer.top, featureLayer.top, 0);
   const right = Math.min(targetLayer.left + targetLayer.width, featureLayer.left + featureLayer.width, imageWidth);
@@ -3226,6 +3753,8 @@ function compositePsdLayerIntoTarget(targetLayer, featureLayer, imageWidth, imag
 
   const targetPixels = targetLayer.colorImageData.data;
   const featurePixels = featureLayer.colorImageData.data;
+  const targetDepthPixels = mergeDepth && targetLayer.depthImageData ? targetLayer.depthImageData.data : null;
+  const featureDepthPixels = mergeDepth && featureLayer.depthImageData ? featureLayer.depthImageData.data : null;
 
   for (let y = top; y < bottom; y += 1) {
     const ty = y - targetLayer.top;
@@ -3254,13 +3783,20 @@ function compositePsdLayerIntoTarget(targetLayer, featureLayer, imageWidth, imag
         targetPixels[targetOffset + c] = clampByte(Math.round(out * 255));
       }
       targetPixels[targetOffset + 3] = clampByte(Math.round(outAlpha * 255));
+
+      if (targetDepthPixels && featureDepthPixels) {
+        targetDepthPixels[targetOffset] = featureDepthPixels[featureOffset];
+        targetDepthPixels[targetOffset + 1] = featureDepthPixels[featureOffset + 1];
+        targetDepthPixels[targetOffset + 2] = featureDepthPixels[featureOffset + 2];
+        targetDepthPixels[targetOffset + 3] = featureDepthPixels[featureOffset + 3];
+      }
     }
   }
 
   const targetCanvas = document.createElement("canvas");
   targetCanvas.width = targetLayer.width;
   targetCanvas.height = targetLayer.height;
-  const targetContext = targetCanvas.getContext("2d");
+  const targetContext = targetCanvas.getContext("2d", { willReadFrequently: true });
   targetContext.putImageData(targetLayer.colorImageData, 0, 0);
 
   targetLayer.colorTexture.dispose();
@@ -3271,7 +3807,12 @@ function compositePsdLayerIntoTarget(targetLayer, featureLayer, imageWidth, imag
   colorTexture.needsUpdate = true;
   targetLayer.colorTexture = colorTexture;
   targetLayer.maskPixels = extractLayerMaskPixels(targetLayer.colorImageData.data);
-  targetLayer.depthMaskPixels = targetLayer.maskPixels;
+  if (mergeDepth && targetLayer.depthImageData) {
+    targetLayer.directDepthPixels = extractDepthPixelsFromCanvas(createCanvasFromImageData(targetLayer.depthImageData));
+    targetLayer.depthMaskPixels = extractLayerMaskPixels(targetLayer.depthImageData.data);
+  } else if (!targetLayer.depthMaskPixels) {
+    targetLayer.depthMaskPixels = targetLayer.maskPixels;
+  }
 }
 
 function extractLayerMaskPixels(rgbaPixels) {
@@ -4443,22 +4984,201 @@ function flattenPsdLayers(layers, output = []) {
   return output;
 }
 
-function extractDepthPixelsFromCanvas(canvas) {
-  const context = canvas.getContext("2d");
+function extractDepthPixelsFromCanvas(canvas, options = {}) {
+  const ignoreAlpha = !!options.ignoreAlpha;
+  const minAlpha = options.minAlpha == null ? (ignoreAlpha ? 0 : 1) : options.minAlpha;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
   const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
   const pixels = new Uint8Array(canvas.width * canvas.height);
 
   for (let i = 0, p = 0; i < imageData.data.length; i += 4, p += 1) {
     const alpha = imageData.data[i + 3];
-    if (alpha === 0) {
+    if (alpha < minAlpha || (!ignoreAlpha && alpha === 0)) {
       pixels[p] = 0;
       continue;
     }
-    const gray = imageData.data[i];
-    pixels[p] = gray;
+    pixels[p] = imageData.data[i];
   }
 
   return pixels;
+}
+
+function sampleDepthPixelsToTargetLayer(depthImageData, depthLayer, targetLayer, options = {}) {
+  const ignoreAlpha = !!options.ignoreAlpha;
+  const minAlpha = options.minAlpha == null ? (ignoreAlpha ? 0 : 1) : options.minAlpha;
+  const targetWidth = targetLayer.width || (targetLayer.canvas ? targetLayer.canvas.width : 0);
+  const targetHeight = targetLayer.height || (targetLayer.canvas ? targetLayer.canvas.height : 0);
+  const sourceWidth = depthImageData.width;
+  const sourceHeight = depthImageData.height;
+  const pixels = new Uint8Array(targetWidth * targetHeight);
+  const sourceLeft = depthLayer.left || 0;
+  const sourceTop = depthLayer.top || 0;
+  const sourceLayerWidth = depthLayer.width || sourceWidth;
+  const sourceLayerHeight = depthLayer.height || sourceHeight;
+  const targetLeft = targetLayer.left || 0;
+  const targetTop = targetLayer.top || 0;
+
+  for (let y = 0; y < targetHeight; y += 1) {
+    for (let x = 0; x < targetWidth; x += 1) {
+      const globalX = targetLeft + x + 0.5;
+      const globalY = targetTop + y + 0.5;
+      const sourceLocalX = globalX - sourceLeft;
+      const sourceLocalY = globalY - sourceTop;
+      if (
+        sourceLocalX < 0 ||
+        sourceLocalY < 0 ||
+        sourceLocalX >= sourceLayerWidth ||
+        sourceLocalY >= sourceLayerHeight
+      ) {
+        continue;
+      }
+      const sx = clamp(
+        Math.round((sourceLocalX * sourceWidth) / Math.max(1, sourceLayerWidth) - 0.5),
+        0,
+        sourceWidth - 1,
+      );
+      const sy = clamp(
+        Math.round((sourceLocalY * sourceHeight) / Math.max(1, sourceLayerHeight) - 0.5),
+        0,
+        sourceHeight - 1,
+      );
+      const srcIndex = (sy * sourceWidth + sx) * 4;
+      const alpha = depthImageData.data[srcIndex + 3];
+      if (alpha < minAlpha || (!ignoreAlpha && alpha === 0)) {
+        continue;
+      }
+      pixels[y * targetWidth + x] = depthImageData.data[srcIndex];
+    }
+  }
+
+  return pixels;
+}
+
+function sampleLayerRgbaToTargetLayer(imageData, sourceLayer, targetLayer) {
+  const targetWidth = targetLayer.width || (targetLayer.canvas ? targetLayer.canvas.width : 0);
+  const targetHeight = targetLayer.height || (targetLayer.canvas ? targetLayer.canvas.height : 0);
+  const sourceWidth = imageData.width;
+  const sourceHeight = imageData.height;
+  const sampled = new Uint8ClampedArray(targetWidth * targetHeight * 4);
+  const sourceLeft = sourceLayer.left || 0;
+  const sourceTop = sourceLayer.top || 0;
+  const sourceLayerWidth = sourceLayer.width || sourceWidth;
+  const sourceLayerHeight = sourceLayer.height || sourceHeight;
+  const targetLeft = targetLayer.left || 0;
+  const targetTop = targetLayer.top || 0;
+
+  for (let y = 0; y < targetHeight; y += 1) {
+    for (let x = 0; x < targetWidth; x += 1) {
+      const globalX = targetLeft + x + 0.5;
+      const globalY = targetTop + y + 0.5;
+      const sourceLocalX = globalX - sourceLeft;
+      const sourceLocalY = globalY - sourceTop;
+      if (
+        sourceLocalX < 0 ||
+        sourceLocalY < 0 ||
+        sourceLocalX >= sourceLayerWidth ||
+        sourceLocalY >= sourceLayerHeight
+      ) {
+        continue;
+      }
+      const sx = clamp(
+        Math.round((sourceLocalX * sourceWidth) / Math.max(1, sourceLayerWidth) - 0.5),
+        0,
+        sourceWidth - 1,
+      );
+      const sy = clamp(
+        Math.round((sourceLocalY * sourceHeight) / Math.max(1, sourceLayerHeight) - 0.5),
+        0,
+        sourceHeight - 1,
+      );
+      const srcIndex = (sy * sourceWidth + sx) * 4;
+      const dstIndex = (y * targetWidth + x) * 4;
+      sampled[dstIndex] = imageData.data[srcIndex];
+      sampled[dstIndex + 1] = imageData.data[srcIndex + 1];
+      sampled[dstIndex + 2] = imageData.data[srcIndex + 2];
+      sampled[dstIndex + 3] = imageData.data[srcIndex + 3];
+    }
+  }
+
+  return sampled;
+}
+
+function repairDirectDepthEdgePixels(sourceDepthPixels, rgbaPixels, maskPixels, width, height) {
+  const depthPixels = sourceDepthPixels.slice();
+  const targetMask = new Uint8Array(depthPixels.length);
+  const queue = new Int32Array(depthPixels.length);
+  const queued = new Uint8Array(depthPixels.length);
+  let head = 0;
+  let tail = 0;
+
+  for (let i = 0; i < depthPixels.length; i += 1) {
+    if (!maskPixels[i]) {
+      depthPixels[i] = 0;
+      continue;
+    }
+    const alpha = rgbaPixels[i * 4 + 3];
+    if (alpha < 254) {
+      targetMask[i] = 1;
+      depthPixels[i] = 0;
+    }
+  }
+
+  for (let i = 0; i < depthPixels.length; i += 1) {
+    if (!targetMask[i] || depthPixels[i] > 0) {
+      continue;
+    }
+    if (sampleMaskedMedianDepth(depthPixels, maskPixels, width, height, i) > 0) {
+      queue[tail++] = i;
+      queued[i] = 1;
+    }
+  }
+
+  while (head < tail) {
+    const index = queue[head++];
+    const fillDepth = sampleMaskedMedianDepth(depthPixels, maskPixels, width, height, index);
+    if (fillDepth <= 0) {
+      continue;
+    }
+    depthPixels[index] = fillDepth;
+    tail = enqueueMaskedGapNeighbors(queue, queued, depthPixels, targetMask, width, height, index, tail);
+  }
+
+  return depthPixels;
+}
+
+function sampleMaskedMedianDepth(depthPixels, maskPixels, width, height, index) {
+  const x = index % width;
+  const y = Math.floor(index / width);
+  const values = [];
+
+  for (let dy = -1; dy <= 1; dy += 1) {
+    for (let dx = -1; dx <= 1; dx += 1) {
+      if (dx === 0 && dy === 0) {
+        continue;
+      }
+      const sx = x + dx;
+      const sy = y + dy;
+      if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+        continue;
+      }
+      const sampleIndex = sy * width + sx;
+      if (!maskPixels[sampleIndex] || depthPixels[sampleIndex] <= 0) {
+        continue;
+      }
+      values.push(depthPixels[sampleIndex]);
+    }
+  }
+
+  return values.length ? medianOfNumbers(values) : 0;
+}
+
+function createCanvasFromImageData(imageData) {
+  const canvas = document.createElement("canvas");
+  canvas.width = imageData.width;
+  canvas.height = imageData.height;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  context.putImageData(imageData, 0, 0);
+  return canvas;
 }
 
 async function replaceImage(kind, file) {
@@ -4605,7 +5325,7 @@ function createSegmentThumbDataUrl(rgbPixels, width, height) {
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
-  const context = canvas.getContext("2d");
+  const context = canvas.getContext("2d", { willReadFrequently: true });
   const imageData = context.createImageData(width, height);
 
   for (let src = 0, dst = 0; src < rgbPixels.length; src += 3, dst += 4) {
@@ -6512,7 +7232,7 @@ function createDepthTextureResources(width, height, pixels) {
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
-  const context = canvas.getContext("2d");
+  const context = canvas.getContext("2d", { willReadFrequently: true });
   const imageData = context.createImageData(width, height);
 
   for (let pixelIndex = 0; pixelIndex < pixels.length; pixelIndex += 1) {
@@ -6538,7 +7258,7 @@ function createBinaryMaskTexture(width, height, maskPixels) {
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
-  const context = canvas.getContext("2d");
+  const context = canvas.getContext("2d", { willReadFrequently: true });
   const imageData = context.createImageData(width, height);
 
   for (let pixelIndex = 0; pixelIndex < maskPixels.length; pixelIndex += 1) {
@@ -6699,7 +7419,7 @@ function createPsdDebugTexture(width, height, maskPixels, debugState, debugScore
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
-  const context = canvas.getContext("2d");
+  const context = canvas.getContext("2d", { willReadFrequently: true });
   const imageData = context.createImageData(width, height);
 
   for (let pixelIndex = 0; pixelIndex < maskPixels.length; pixelIndex += 1) {
@@ -6764,7 +7484,7 @@ function createPsdDepthPreviewUrl(width, height, depthPixels, maskPixels, filled
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
-  const context = canvas.getContext("2d");
+  const context = canvas.getContext("2d", { willReadFrequently: true });
   const imageData = context.createImageData(width, height);
 
   for (let pixelIndex = 0; pixelIndex < depthPixels.length; pixelIndex += 1) {
