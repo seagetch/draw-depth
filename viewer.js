@@ -947,11 +947,13 @@ function buildPsdDepthExportDocument(psdDocument, preparedLayers) {
     const sourceLayer = sourceLayers[i];
     const preparedInfo = preparedBySourceIndex[i];
     const canvas = createPsdExportDepthCanvas(sourceLayer, preparedInfo ? preparedInfo.layer : null);
+    const mask = createPsdExportLayerMask(sourceLayer);
     children.push({
       name: sourceLayer.name || `Layer ${i + 1}`,
       left: sourceLayer.left || 0,
       top: sourceLayer.top || 0,
       canvas,
+      mask,
       hidden: preparedInfo ? !renderState.psdLayerVisibility[preparedInfo.visibilityIndex] : false,
     });
   }
@@ -1014,6 +1016,35 @@ function createPsdExportDepthCanvas(sourceLayer, preparedLayer) {
 
   context.putImageData(output, 0, 0);
   return canvas;
+}
+
+function createPsdExportLayerMask(sourceLayer) {
+  const width = sourceLayer.width || 0;
+  const height = sourceLayer.height || 0;
+  if (width <= 0 || height <= 0) {
+    return undefined;
+  }
+
+  const sourceImageData = sourceLayer.colorImageData || getCanvasImageData(sourceLayer.canvas);
+  const maskImageData = new ImageData(width, height);
+
+  for (let i = 0, p = 0; p < width * height; i += 4, p += 1) {
+    const alpha = sourceImageData.data[i + 3];
+    maskImageData.data[i] = alpha;
+    maskImageData.data[i + 1] = alpha;
+    maskImageData.data[i + 2] = alpha;
+    maskImageData.data[i + 3] = 255;
+  }
+
+  return {
+    top: sourceLayer.top || 0,
+    left: sourceLayer.left || 0,
+    bottom: (sourceLayer.top || 0) + height,
+    right: (sourceLayer.left || 0) + width,
+    defaultColor: 0,
+    disabled: false,
+    imageData: maskImageData,
+  };
 }
 
 function triggerArrayBufferDownload(buffer, filename) {
@@ -3183,7 +3214,7 @@ function createPsdLayerEntries(colorPsd, depthPsd, stableDepthPixels) {
     { mergeDepth: !depthPsd },
   );
 
-  const visibleLayerMap = depthPsd
+  const visibleLayerMap = depthPsd || !stableDepthPixels
     ? null
     : buildVisiblePsdLayerMap(
       colorPsd.width,
@@ -4296,6 +4327,9 @@ function buildVisiblePsdLayerMap(imageWidth, imageHeight, layers) {
 
 function seedPsdLayerDepthPixels(layer, layerIndex, imageWidth, imageHeight, stableDepthPixels, visibleLayerMap, maskPixels, layers) {
   const depthPixels = new Uint8Array(layer.width * layer.height);
+  if (!stableDepthPixels || !visibleLayerMap) {
+    return depthPixels;
+  }
   const stableSeedMask = buildLayerContourBandMask(maskPixels, layer.width, layer.height, 2);
 
   for (let y = 0; y < layer.height; y += 1) {
