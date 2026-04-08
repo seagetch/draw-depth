@@ -494,7 +494,8 @@
         psdScript.src = `./node_modules/ag-psd/dist/bundle.js?v=${bust}`;
         psdScript.onload = function () {
           const viewerScript = document.createElement("script");
-          viewerScript.src = `./viewer.js?v=${bust}`;
+          viewerScript.type = "module";
+          viewerScript.src = `./src/main.js?v=${bust}`;
           document.body.appendChild(viewerScript);
         };
         document.body.appendChild(psdScript);
