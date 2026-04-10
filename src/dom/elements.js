@@ -23,6 +23,7 @@ export function getViewerElements(doc = document) {
     interpModeEl: doc.querySelector("#interpMode"),
     segmentListEl: doc.querySelector("#segmentList"),
     segmentHudEl: doc.querySelector("#segmentHud"),
+    puppetSwapSidesButtonEl: doc.querySelector("#puppetSwapSidesButton"),
     colorThumbButtonEl: doc.querySelector("#colorThumbButton"),
     depthThumbButtonEl: doc.querySelector("#depthThumbButton"),
     segmentThumbButtonEl: doc.querySelector("#segmentThumbButton"),
@@ -37,5 +38,7 @@ export function getViewerElements(doc = document) {
     psdDebugTitleEl: doc.querySelector("#psdDebugTitle"),
     psdDebugImageEl: doc.querySelector("#psdDebugImage"),
     psdDepthImageEl: doc.querySelector("#psdDepthImage"),
+    puppetBodyMaskImageEl: doc.querySelector("#puppetBodyMaskImage"),
+    puppetSkeletonImageEl: doc.querySelector("#puppetSkeletonImage"),
   };
 }

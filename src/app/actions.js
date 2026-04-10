@@ -64,6 +64,7 @@ export function createAppActions(deps) {
 
     if (renderState.sourceMode === "psd") {
       buildPsdLayerMeshes();
+      rebuildSegmentList();
       refreshStatusCounts();
       return;
     }

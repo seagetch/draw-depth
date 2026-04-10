@@ -10,6 +10,8 @@ export function createSegmentPanel(deps) {
     updatePsdDebugPanel,
     rebuildPsdLayerEntriesIfNeeded,
     applySegmentDepthAdjustments,
+    puppetBoneIds = [],
+    setLayerBindingPrimary,
     onError,
   } = deps;
 
@@ -52,6 +54,20 @@ export function createSegmentPanel(deps) {
     return button;
   }
 
+  function createGroupControlButton(label, groupTitle) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "segment-button";
+    button.textContent = label;
+    button.dataset.groupAction = "rig-toggle";
+    button.dataset.groupTitle = groupTitle;
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      applyGroupPuppetFitToggle(groupTitle);
+    });
+    return button;
+  }
+
   function syncSegmentCheckboxes() {
     const checkboxes = segmentListEl.querySelectorAll('input[type="checkbox"]');
     checkboxes.forEach((checkbox) => {
@@ -75,6 +91,35 @@ export function createSegmentPanel(deps) {
       }
     });
 
+    const puppetLabels = segmentListEl.querySelectorAll("[data-segment-puppet-binding]");
+    puppetLabels.forEach((label) => {
+      const index = Number(label.dataset.segmentPuppetBinding);
+      const binding = renderState.puppetLayerBindings[index];
+      if (!binding) {
+        label.textContent = "rig:-";
+        label.title = "No puppet layer binding";
+        return;
+      }
+      const dominant = (binding.dominantBoneIds || []).slice(0, 3);
+      const dominantSummary = dominant.length
+        ? dominant.map((item) => `${item.boneId} ${item.weight.toFixed(2)}`).join(", ")
+        : "none";
+      label.textContent = `rig:${binding.primaryBoneId}`;
+      label.title =
+        `class=${binding.classification} | allowed=${binding.allowedBoneIds.join(", ")} | dominant=${dominantSummary}`;
+    });
+
+    const puppetSelects = segmentListEl.querySelectorAll("[data-segment-puppet-primary]");
+    puppetSelects.forEach((select) => {
+      const index = Number(select.dataset.segmentPuppetPrimary);
+      const binding = renderState.puppetLayerBindings[index];
+      const override = renderState.puppetLayerBindingOverrides[index];
+      select.value = override?.primaryBoneId || binding?.primaryBoneId || "";
+      select.title = override?.primaryBoneId
+        ? "Manual puppet binding override"
+        : "Auto puppet binding";
+    });
+
     const debugButtons = segmentListEl.querySelectorAll('[data-segment-action="debug-toggle"]');
     debugButtons.forEach((button) => {
       const index = Number(button.dataset.segmentIndex);
@@ -92,7 +137,47 @@ export function createSegmentPanel(deps) {
       button.style.background = active ? "rgba(255, 200, 120, 0.28)" : "rgba(255, 255, 255, 0.05)";
     });
 
+    const rigButtons = segmentListEl.querySelectorAll('[data-segment-action="rig-toggle"]');
+    rigButtons.forEach((button) => {
+      const index = Number(button.dataset.segmentIndex);
+      const active = renderState.puppetLayerFitEnabled[index] ?? true;
+      button.textContent = active ? "R" : "X";
+      button.title = active ? "Exclude from puppet fit" : "Include in puppet fit";
+      button.style.background = active ? "rgba(100, 210, 140, 0.25)" : "rgba(255, 120, 120, 0.28)";
+    });
+
+    const groupRigButtons = segmentListEl.querySelectorAll('[data-group-action="rig-toggle"]');
+    groupRigButtons.forEach((button) => {
+      const groupTitle = button.dataset.groupTitle || "";
+      const groupIndexes = [...segmentListEl.querySelectorAll(`.segment-item[data-group-title="${CSS.escape(groupTitle)}"]`)]
+        .map((row) => Number(row.dataset.segmentIndex));
+      const enabledCount = groupIndexes.filter((index) => renderState.puppetLayerFitEnabled[index] ?? true).length;
+      const allEnabled = enabledCount === groupIndexes.length;
+      const noneEnabled = enabledCount === 0;
+      button.textContent = allEnabled ? "R" : (noneEnabled ? "X" : "~");
+      button.title = allEnabled
+        ? "Exclude whole group from puppet fit"
+        : (noneEnabled ? "Include whole group in puppet fit" : "Toggle whole group puppet fit");
+      button.style.background = allEnabled
+        ? "rgba(100, 210, 140, 0.25)"
+        : (noneEnabled ? "rgba(255, 120, 120, 0.28)" : "rgba(255, 210, 120, 0.28)");
+    });
+
     updatePsdDebugPanel();
+  }
+
+  function applyGroupPuppetFitToggle(groupTitle) {
+    const groupIndexes = [...segmentListEl.querySelectorAll(`.segment-item[data-group-title="${CSS.escape(groupTitle)}"]`)]
+      .map((row) => Number(row.dataset.segmentIndex));
+    if (!groupIndexes.length) {
+      return;
+    }
+    const shouldEnable = groupIndexes.some((index) => !(renderState.puppetLayerFitEnabled[index] ?? true));
+    for (let i = 0; i < groupIndexes.length; i += 1) {
+      renderState.puppetLayerFitEnabled[groupIndexes[i]] = shouldEnable;
+    }
+    syncSegmentAdjustmentLabels();
+    buildMesh();
   }
 
   function applySegmentToggle(segmentIndex, invertOthers) {
@@ -146,6 +231,13 @@ export function createSegmentPanel(deps) {
       return;
     }
 
+    if (action === "rig-toggle" && renderState.sourceMode === "psd") {
+      renderState.puppetLayerFitEnabled[segmentIndex] = !(renderState.puppetLayerFitEnabled[segmentIndex] ?? true);
+      syncSegmentAdjustmentLabels();
+      buildMesh();
+      return;
+    }
+
     const offsets = renderState.sourceMode === "psd"
       ? renderState.psdLayerDepthOffsets
       : renderState.segmentDepthOffsets;
@@ -182,7 +274,10 @@ export function createSegmentPanel(deps) {
         if (group.title) {
           const titleEl = document.createElement("div");
           titleEl.className = "segment-group-title";
-          titleEl.textContent = group.title;
+          const titleLabel = document.createElement("span");
+          titleLabel.textContent = group.title;
+          const groupRigButton = createGroupControlButton("R", group.title);
+          titleEl.append(titleLabel, groupRigButton);
           groupEl.appendChild(titleEl);
         }
 
@@ -190,6 +285,7 @@ export function createSegmentPanel(deps) {
           const row = document.createElement("div");
           row.className = "segment-item";
           row.dataset.segmentIndex = String(index);
+          row.dataset.groupTitle = group.title;
 
           const checkbox = document.createElement("input");
           checkbox.type = "checkbox";
@@ -219,6 +315,7 @@ export function createSegmentPanel(deps) {
 
           const debugButton = createSegmentControlButton("D", "debug-toggle", index);
           const pruneButton = createSegmentControlButton("P", "prune-toggle", index);
+          const rigButton = createSegmentControlButton("R", "rig-toggle", index);
           const offsetDown = createSegmentControlButton("-", "offset-down", index);
           const offsetUp = createSegmentControlButton("+", "offset-up", index);
           const scaleDown = createSegmentControlButton("<", "scale-down", index);
@@ -226,8 +323,32 @@ export function createSegmentPanel(deps) {
           const metrics = document.createElement("span");
           metrics.className = "segment-metrics";
           metrics.dataset.segmentMetrics = String(index);
+          const puppetBinding = document.createElement("span");
+          puppetBinding.className = "segment-metrics";
+          puppetBinding.dataset.segmentPuppetBinding = String(index);
+          const puppetSelect = document.createElement("select");
+          puppetSelect.className = "segment-select";
+          puppetSelect.dataset.segmentPuppetPrimary = String(index);
+          const autoOption = document.createElement("option");
+          autoOption.value = "";
+          autoOption.textContent = "auto";
+          puppetSelect.appendChild(autoOption);
+          puppetBoneIds.forEach((boneId) => {
+            const option = document.createElement("option");
+            option.value = boneId;
+            option.textContent = boneId;
+            puppetSelect.appendChild(option);
+          });
+          puppetSelect.addEventListener("click", (event) => {
+            event.stopPropagation();
+          });
+          puppetSelect.addEventListener("change", (event) => {
+            event.stopPropagation();
+            setLayerBindingPrimary?.(index, event.currentTarget.value || null);
+            syncSegmentAdjustmentLabels();
+          });
 
-          controls.append(debugButton, pruneButton, offsetDown, offsetUp, scaleDown, scaleUp, metrics);
+          controls.append(debugButton, pruneButton, rigButton, offsetDown, offsetUp, scaleDown, scaleUp, metrics, puppetBinding, puppetSelect);
           row.append(checkbox, swatch, name, size, controls);
           groupEl.appendChild(row);
         });

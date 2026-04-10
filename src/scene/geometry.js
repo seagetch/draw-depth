@@ -305,6 +305,7 @@ export function createGeometryHelpers(deps) {
     geometry.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
+    geometry.userData.restPositions = positions.slice();
     return geometry;
   }
   

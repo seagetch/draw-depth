@@ -466,22 +466,27 @@
       <div id="status">Loading...</div>
     </section>
     <section id="segmentHud">
-      <div class="segment-header">
-        <div class="segment-title">Segments</div>
-        <div class="segment-hint">Shift+click: invert target vs others</div>
-      </div>
+        <div class="segment-header">
+          <div class="segment-title">Segments</div>
+          <button class="action-button" id="puppetSwapSidesButton" type="button" style="width:auto;padding:4px 8px;font-size:11px;">Swap L/R Off</button>
+          <div class="segment-hint">Shift+click: invert target vs others | R/X: include or exclude from puppet fit | Middle-drag bone handle: move rest control point</div>
+        </div>
       <div class="segment-list" id="segmentList"></div>
       <div class="debug-panel" id="psdDebugPanel">
         <div class="debug-title" id="psdDebugTitle">PSD debug</div>
         <img class="debug-image" id="psdDebugImage" alt="PSD debug map">
         <img class="debug-image" id="psdDepthImage" alt="PSD depth grayscale">
+        <img class="debug-image" id="puppetBodyMaskImage" alt="Puppet body mask">
+        <img class="debug-image" id="puppetSkeletonImage" alt="Puppet skeletonized mask">
         <div class="debug-legend" id="psdDebugLegend">
           Blue: kept seed<br>
           Orange: pixel-pruned<br>
           Magenta: component-pruned<br>
           Cyan: cluster-pruned<br>
           Yellow: contour zeroed<br>
-          Dark: no seed / empty
+          Dark: no seed / empty<br>
+          Puppet body mask: yellow<br>
+          Puppet skeleton: cyan
         </div>
       </div>
     </section>
