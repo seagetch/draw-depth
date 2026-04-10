@@ -10,13 +10,13 @@ import {
   segmentMinAnchorPixels,
   segmentMinAnchorRatio,
 } from "./constants.js";
-import { createAppActions } from "./actions.js";
+import { createAppActions } from "./actions.js?v=20260409_1";
 import { createAppResources } from "./resources.js";
-import { createRenderState } from "./state.js";
+import { createRenderState } from "./state.js?v=20260410_3";
 import { createDepthCore } from "../depth/core.js";
 import { wireControls } from "../dom/controls.js";
-import { getViewerElements } from "../dom/elements.js";
-import { createSegmentPanel } from "../dom/segmentPanel.js";
+import { getViewerElements } from "../dom/elements.js?v=20260410_1";
+import { createSegmentPanel } from "../dom/segmentPanel.js?v=20260410_2";
 import {
   createSegmentThumbDataUrl,
   syncThumbs as syncThumbsView,
@@ -24,13 +24,15 @@ import {
 } from "../dom/thumbs.js";
 import { createImageLoaders } from "../io/imageLoader.js";
 import { revokeObjectUrl as revokeObjectUrlState } from "../io/objectUrls.js";
-import { updatePsdDebugPanel as updatePsdDebugPanelView } from "../psd/debug.js";
+import { updatePsdDebugPanel as updatePsdDebugPanelView } from "../psd/debug.js?v=20260409_2";
 import { createPsdExport } from "../psd/export.js?v=20260408_1";
 import { createPsdLayers } from "../psd/layers.js?v=20260408_4";
-import { createPsdLoader } from "../psd/loader.js?v=20260408_3";
+import { createPsdLoader } from "../psd/loader.js?v=20260409_1";
+import { createPuppetRuntime } from "../puppet/runtime.js?v=20260410_18";
+import { PUPPET_BONE_IDS } from "../puppet/layerBinding.js?v=20260410_1";
 import { initializePsdSupport } from "../psd/psdSupport.js";
-import { createGeometryHelpers } from "../scene/geometry.js?v=20260408_3";
-import { createSceneBuilder } from "../scene/meshBuilder.js?v=20260408_1";
+import { createGeometryHelpers } from "../scene/geometry.js?v=20260409_1";
+import { createSceneBuilder } from "../scene/meshBuilder.js?v=20260409_3";
 import { createSceneRuntime } from "../scene/runtime.js";
 import { createShaders } from "../scene/shaders.js";
 import { createThreeContext } from "../scene/threeContext.js";
@@ -66,6 +68,7 @@ export function createApp() {
     interpModeEl,
     segmentListEl,
     segmentHudEl,
+    puppetSwapSidesButtonEl,
     colorThumbButtonEl,
     depthThumbButtonEl,
     segmentThumbButtonEl,
@@ -80,13 +83,33 @@ export function createApp() {
     psdDebugTitleEl,
     psdDebugImageEl,
     psdDepthImageEl,
+    puppetBodyMaskImageEl,
+    puppetSkeletonImageEl,
   } = elements;
 
   const defaults = createDefaultAssetUrls();
   const renderState = createRenderState();
+  globalThis.__depthDrawRenderState = renderState;
   const { renderer, scene, camera, controls } = createThreeContext(THREE, app);
+  globalThis.__depthDrawRenderer = renderer;
+  globalThis.__depthDrawCamera = camera;
+  globalThis.__depthDrawControls = controls;
   const { onResize, animate } = createSceneRuntime({ renderer, scene, camera, controls });
   const { loadTexture, loadImage, loadImagePixels, loadDepthPixels, loadRgbPixels } = createImageLoaders(THREE);
+  const puppetRuntime = createPuppetRuntime({
+    THREE,
+    scene,
+    camera,
+    controls,
+    renderer,
+    renderState,
+    onStateChanged: updatePsdDebugPanel,
+    onSwapChanged: () => {
+      rebuildSegmentList();
+      syncPuppetSwapButton();
+    },
+  });
+  globalThis.__depthDrawPuppet = puppetRuntime.getDebugApi();
   const depthCore = createDepthCore(THREE);
   const {
     clamp,
@@ -202,6 +225,7 @@ export function createApp() {
     clamp,
     buildPsdLayerGeometry,
     createPsdDepthPreviewUrl,
+    puppetRuntime,
   });
   const { clearSceneVisuals, buildPsdLayerMeshes, buildPreparedPsdLayerEntries } = sceneBuilder;
 
@@ -268,9 +292,18 @@ export function createApp() {
 
   function updatePsdDebugPanel() {
     updatePsdDebugPanelView(
-      { psdDebugPanelEl, psdDebugTitleEl, psdDebugImageEl, psdDepthImageEl },
+      { psdDebugPanelEl, psdDebugTitleEl, psdDebugImageEl, psdDepthImageEl, puppetBodyMaskImageEl, puppetSkeletonImageEl },
       renderState,
     );
+  }
+
+  function syncPuppetSwapButton() {
+    if (!puppetSwapSidesButtonEl) {
+      return;
+    }
+    const active = !!renderState.puppetSwapLeftRightMapping;
+    puppetSwapSidesButtonEl.textContent = active ? "Swap L/R On" : "Swap L/R Off";
+    puppetSwapSidesButtonEl.style.background = active ? "rgba(255, 180, 120, 0.28)" : "";
   }
 
   const { buildMesh, replaceImage, rebuildDepthModeResources } = createAppActions({
@@ -327,12 +360,25 @@ export function createApp() {
     updatePsdDebugPanel,
     rebuildPsdLayerEntriesIfNeeded,
     applySegmentDepthAdjustments,
+    puppetBoneIds: PUPPET_BONE_IDS,
+    setLayerBindingPrimary: (layerIndex, primaryBoneId) => {
+      puppetRuntime.setLayerBindingPrimary(layerIndex, primaryBoneId);
+      rebuildSegmentList();
+    },
     onError: (error) => {
       console.error(error);
       statusEl.textContent = `Failed: ${error.message}`;
     },
   });
   rebuildSegmentList = segmentPanel.rebuildSegmentList;
+
+  if (puppetSwapSidesButtonEl) {
+    puppetSwapSidesButtonEl.addEventListener("click", () => {
+      puppetRuntime.setSwapLeftRightMapping(!renderState.puppetSwapLeftRightMapping);
+      rebuildSegmentList();
+      syncPuppetSwapButton();
+    });
+  }
 
   wireControls({
     elements: {
@@ -427,8 +473,10 @@ export function createApp() {
     syncViewerModeUi();
     rebuildSegmentList();
     buildMesh();
+    syncPuppetSwapButton();
     syncThumbs();
     updatePsdDebugPanel();
+    puppetRuntime.attachInteraction();
     onResize();
     animate();
   }

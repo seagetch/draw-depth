@@ -92,6 +92,12 @@ export function createPsdLoader(deps) {
     const previousPruneByName = new Map(
       renderState.psdLayerEntries.map((layer, index) => [layer.name, !!renderState.psdLayerOutlierPruneEnabled[index]]),
     );
+    const previousPuppetFitByName = new Map(
+      renderState.psdLayerEntries.map((layer, index) => [layer.name, renderState.puppetLayerFitEnabled[index] ?? true]),
+    );
+    const previousPuppetBindingOverrideByName = new Map(
+      renderState.psdLayerEntries.map((layer, index) => [layer.name, renderState.puppetLayerBindingOverrides[index] ?? null]),
+    );
     disposePsdLayerTexturesExternal();
     const colorPsd = agPsd.readPsd(colorBuffer);
     const scaledPsd = prepareScaledPsdDocument(colorPsd, 1280);
@@ -108,6 +114,8 @@ export function createPsdLoader(deps) {
     renderState.psdLayerDepthOffsets = layerEntries.map((layer) => previousOffsetByName.get(layer.name) ?? 0);
     renderState.psdLayerDepthScales = layerEntries.map((layer) => previousScaleByName.get(layer.name) ?? 1);
     renderState.psdLayerOutlierPruneEnabled = layerEntries.map((layer) => previousPruneByName.get(layer.name) ?? false);
+    renderState.puppetLayerFitEnabled = layerEntries.map((layer) => previousPuppetFitByName.get(layer.name) ?? true);
+    renderState.puppetLayerBindingOverrides = layerEntries.map((layer) => previousPuppetBindingOverrideByName.get(layer.name) ?? null);
     renderState.psdDebugLayerIndex = previousDebugLayerName
       ? layerEntries.findIndex((layer) => layer.name === previousDebugLayerName)
       : -1;

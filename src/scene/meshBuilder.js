@@ -10,6 +10,7 @@ export function createSceneBuilder(deps) {
     clamp,
     buildPsdLayerGeometry,
     createPsdDepthPreviewUrl,
+    puppetRuntime,
   } = deps
 
   const { meshDetailEl, surfaceSmoothEl, depthScaleEl, invertDepthEl } = elements
@@ -51,7 +52,9 @@ export function createSceneBuilder(deps) {
   
   function buildPsdLayerMeshes() {
     const layers = buildPreparedPsdLayerEntries();
+    const usePuppetDeform = !!renderState.puppetEnabled;
     const useSurfaceSmooth = surfaceSmoothEl.checked;
+    const bakeDepth = useSurfaceSmooth || usePuppetDeform;
     for (let i = 0; i < layers.length; i += 1) {
       const layer = layers[i];
       if (!renderState.psdLayerVisibility[i]) {
@@ -64,7 +67,7 @@ export function createSceneBuilder(deps) {
         layer,
         Number(meshDetailEl.value),
         {
-          bakeDepth: useSurfaceSmooth,
+          bakeDepth,
           depthScale: Number(depthScaleEl.value),
           invertDepth: invertDepthEl.checked,
           surfaceSmooth: useSurfaceSmooth,
@@ -74,14 +77,14 @@ export function createSceneBuilder(deps) {
         uniforms: {
           uColorTexture: { value: layer.colorTexture },
           uMaskTexture: { value: layer.maskTexture },
-          ...(useSurfaceSmooth ? {} : {
+          ...(bakeDepth ? {} : {
             uDepthTexture: { value: layer.depthTexture },
             uDepthScale: { value: Number(depthScaleEl.value) },
             uInvertDepth: { value: invertDepthEl.checked ? 1 : 0 },
           }),
         },
-        vertexShader: useSurfaceSmooth ? staticVertexShader : psdLayerVertexShader,
-        fragmentShader: useSurfaceSmooth ? staticPsdLayerFragmentShader : psdLayerFragmentShader,
+        vertexShader: bakeDepth ? staticVertexShader : psdLayerVertexShader,
+        fragmentShader: bakeDepth ? staticPsdLayerFragmentShader : psdLayerFragmentShader,
         side: THREE.DoubleSide,
         transparent: true,
         depthWrite: true,
@@ -95,6 +98,9 @@ export function createSceneBuilder(deps) {
         depthTexture: layer.depthTexture,
         maskTexture: layer.maskTexture,
       });
+    }
+    if (puppetRuntime) {
+      puppetRuntime.sync(renderState.psdLayerMeshes);
     }
   }
   
