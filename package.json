@@ -4,6 +4,8 @@
   "description": "Minimal 3D viewer for `data/Midori-color.jpg` and `data/Midori-depth.jpg`.",
   "main": "viewer.js",
   "scripts": {
+    "start": "node scripts/serve.js",
+    "dev": "node scripts/serve.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
