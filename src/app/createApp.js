@@ -31,6 +31,7 @@ import { createPsdLayers } from "../psd/layers.js?v=20260408_4";
 import { createPsdLoader } from "../psd/loader.js?v=20260409_1";
 import { createPuppetRuntime } from "../puppet/runtime.js?v=20260411_13";
 import { PUPPET_BONE_IDS } from "../puppet/layerBinding.js?v=20260411_2";
+import { createMeshEditRuntime } from "../meshEdit/runtime.js";
 import { initializePsdSupport } from "../psd/psdSupport.js";
 import { createGeometryHelpers } from "../scene/geometry.js?v=20260409_1";
 import { createSceneBuilder } from "../scene/meshBuilder.js?v=20260409_3";
@@ -40,6 +41,7 @@ import { createThreeContext } from "../scene/threeContext.js";
 import { createSegmentAnalysis } from "../segments/analysis.js";
 import { createSegmentDepthRuntime } from "../segments/segmentDepth.js";
 import { createSegmentRuntime } from "../segments/segmentRuntime.js";
+import { createMeshEditPanel } from "../dom/meshEditPanel.js";
 
 export function createApp() {
   const THREE = globalThis.THREE;
@@ -86,6 +88,14 @@ export function createApp() {
     psdDepthImageEl,
     puppetBodyMaskImageEl,
     puppetSkeletonImageEl,
+    meshEditPanelEl,
+    meshEditEnabledEl,
+    meshEditTargetEl,
+    meshEditRadiusEl,
+    meshEditRadiusValueEl,
+    meshEditUndoButtonEl,
+    meshEditRedoButtonEl,
+    meshEditResetButtonEl,
   } = elements;
 
   const defaults = createDefaultAssetUrls();
@@ -98,9 +108,11 @@ export function createApp() {
   const { onResize, animate } = createSceneRuntime({ renderer, scene, camera, controls });
   const { loadTexture, loadImage, loadImagePixels, loadDepthPixels, loadRgbPixels } = createImageLoaders(THREE);
   let puppetPanel = null;
+  let meshEditPanel = null;
   const handlePuppetUiStateChanged = () => {
     updatePsdDebugPanel();
     puppetPanel?.sync();
+    meshEditPanel?.sync();
   };
   const puppetRuntime = createPuppetRuntime({
     THREE,
@@ -116,6 +128,18 @@ export function createApp() {
     },
   });
   globalThis.__depthDrawPuppet = puppetRuntime.getDebugApi();
+  const meshEditRuntime = createMeshEditRuntime({
+    THREE,
+    scene,
+    camera,
+    controls,
+    renderer,
+    renderState,
+    onStateChanged: () => {
+      meshEditPanel?.sync();
+    },
+    onGeometryChanged: null,
+  });
   puppetPanel = createPuppetPanel({
     elements,
     puppetRuntime,
@@ -236,6 +260,7 @@ export function createApp() {
     buildPsdLayerGeometry,
     createPsdDepthPreviewUrl,
     puppetRuntime,
+    meshEditRuntime,
   });
   const { clearSceneVisuals, buildPsdLayerMeshes, buildPreparedPsdLayerEntries } = sceneBuilder;
 
@@ -357,6 +382,10 @@ export function createApp() {
     disposeRepairedBaseDepthTexture,
     createSegmentedGridDepthResources,
     rebuildRepairedBaseDepth,
+    meshEditRuntime,
+  });
+  meshEditRuntime.setOnGeometryChanged(() => {
+    buildMesh();
   });
 
   const segmentPanel = createSegmentPanel({
@@ -381,6 +410,20 @@ export function createApp() {
     },
   });
   rebuildSegmentList = segmentPanel.rebuildSegmentList;
+  meshEditPanel = createMeshEditPanel({
+    elements: {
+      meshEditPanelEl,
+      meshEditEnabledEl,
+      meshEditTargetEl,
+      meshEditRadiusEl,
+      meshEditRadiusValueEl,
+      meshEditUndoButtonEl,
+      meshEditRedoButtonEl,
+      meshEditResetButtonEl,
+    },
+    renderState,
+    meshEditRuntime,
+  });
 
   if (puppetSwapSidesButtonEl) {
     puppetSwapSidesButtonEl.addEventListener("click", () => {
@@ -486,7 +529,9 @@ export function createApp() {
     syncPuppetSwapButton();
     syncThumbs();
     updatePsdDebugPanel();
+    meshEditPanel?.sync();
     puppetRuntime.attachInteraction();
+    meshEditRuntime.attachInteraction();
     onResize();
     animate();
   }

@@ -11,6 +11,7 @@ export function createSceneBuilder(deps) {
     buildPsdLayerGeometry,
     createPsdDepthPreviewUrl,
     puppetRuntime,
+    meshEditRuntime,
   } = deps
 
   const { meshDetailEl, surfaceSmoothEl, depthScaleEl, invertDepthEl } = elements
@@ -90,14 +91,20 @@ export function createSceneBuilder(deps) {
         depthWrite: true,
       });
       const mesh = new THREE.Mesh(geometry, material);
+      mesh.userData.targetKey = `psd:${i}`;
       mesh.renderOrder = i;
       scene.add(mesh);
       renderState.psdLayerMeshes.push({
         mesh,
         layerIndex: i,
+        targetKey: `psd:${i}`,
         depthTexture: layer.depthTexture,
         maskTexture: layer.maskTexture,
       });
+    }
+    if (meshEditRuntime) {
+      meshEditRuntime.applyToEntries(renderState.psdLayerMeshes);
+      meshEditRuntime.sync(renderState.psdLayerMeshes);
     }
     if (puppetRuntime) {
       puppetRuntime.sync(renderState.psdLayerMeshes);

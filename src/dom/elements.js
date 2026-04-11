@@ -52,5 +52,13 @@ export function getViewerElements(doc = document) {
     psdDepthImageEl: doc.querySelector("#psdDepthImage"),
     puppetBodyMaskImageEl: doc.querySelector("#puppetBodyMaskImage"),
     puppetSkeletonImageEl: doc.querySelector("#puppetSkeletonImage"),
+    meshEditPanelEl: doc.querySelector("#meshEditPanel"),
+    meshEditEnabledEl: doc.querySelector("#meshEditEnabled"),
+    meshEditTargetEl: doc.querySelector("#meshEditTarget"),
+    meshEditRadiusEl: doc.querySelector("#meshEditRadius"),
+    meshEditRadiusValueEl: doc.querySelector("#meshEditRadiusValue"),
+    meshEditUndoButtonEl: doc.querySelector("#meshEditUndoButton"),
+    meshEditRedoButtonEl: doc.querySelector("#meshEditRedoButton"),
+    meshEditResetButtonEl: doc.querySelector("#meshEditResetButton"),
   };
 }

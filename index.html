@@ -253,6 +253,16 @@
         background: rgba(255, 255, 255, 0.03);
       }
 
+      .mesh-edit-panel {
+        display: grid;
+        gap: 8px;
+        margin: 0 0 10px;
+        padding: 10px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.03);
+      }
+
       .puppet-panel-title {
         font-size: 12px;
         color: var(--text);
@@ -503,10 +513,38 @@
     </section>
     <section id="segmentHud">
         <div class="segment-header">
-          <div class="segment-title">Segments</div>
+        <div class="segment-title">Segments</div>
           <button class="action-button" id="puppetSwapSidesButton" type="button" style="width:auto;padding:4px 8px;font-size:11px;">Swap L/R Off</button>
-          <div class="segment-hint">Shift+click: invert target vs others | R/X: include or exclude from puppet fit | Middle-drag bone handle: move rest control point</div>
+          <div class="segment-hint">Alt+click: add mesh handle | Drag: move handle | Shift+drag: depth only | Del: delete handle</div>
         </div>
+      <div class="mesh-edit-panel" id="meshEditPanel">
+        <div class="segment-header" style="margin-bottom:0;">
+          <div class="puppet-panel-title">Mesh Edit</div>
+          <div class="segment-hint">Cmd/Ctrl+Z: undo</div>
+        </div>
+        <div class="control-row">
+          <label for="meshEditEnabled">Enable mesh edit</label>
+          <input id="meshEditEnabled" type="checkbox">
+        </div>
+        <div class="control">
+          <div class="control-row">
+            <label for="meshEditTarget">Target</label>
+          </div>
+          <select id="meshEditTarget"></select>
+        </div>
+        <div class="control">
+          <div class="control-row">
+            <label for="meshEditRadius">Handle radius</label>
+            <output class="value" id="meshEditRadiusValue">0.18</output>
+          </div>
+          <input id="meshEditRadius" type="range" min="0.03" max="0.80" step="0.01" value="0.18">
+        </div>
+        <div class="control-row" style="gap:6px;">
+          <button class="action-button" id="meshEditUndoButton" type="button">Undo</button>
+          <button class="action-button" id="meshEditRedoButton" type="button">Redo</button>
+          <button class="action-button" id="meshEditResetButton" type="button">Reset target</button>
+        </div>
+      </div>
       <div class="puppet-panel" id="puppetPanel" style="display:none;">
         <div class="segment-header" style="margin-bottom:0;">
           <div class="puppet-panel-title">Puppet Controls</div>

@@ -31,6 +31,7 @@ export function createAppActions(deps) {
     disposeRepairedBaseDepthTexture,
     createSegmentedGridDepthResources,
     rebuildRepairedBaseDepth,
+    meshEditRuntime,
   } = deps;
 
   const {
@@ -111,6 +112,7 @@ export function createAppActions(deps) {
     });
 
     const mesh = new THREE.Mesh(geometry, material);
+    mesh.userData.targetKey = "raster:base";
     scene.add(mesh);
 
     const edgeGeometry = buildRenderedBoundaryPointGeometry(
@@ -146,6 +148,8 @@ export function createAppActions(deps) {
     renderState.material = material;
     renderState.edgePoints = edgePoints;
     renderState.edgePointMaterial = edgePointMaterial;
+    meshEditRuntime?.applyToEntries([{ mesh, targetKey: "raster:base" }]);
+    meshEditRuntime?.sync([{ mesh, targetKey: "raster:base" }]);
 
     refreshStatusCounts();
   }
