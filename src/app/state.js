@@ -79,5 +79,13 @@ export function createRenderState() {
     puppetDebugBodyMaskUrl: "",
     puppetDebugSkeletonUrl: "",
     puppetDebugSummary: "",
+    meshEditEnabled: false,
+    meshEditTargetKey: "raster:base",
+    meshEditSelection: null,
+    meshEditHandlesByTarget: {},
+    meshEditHistory: [],
+    meshEditHistoryIndex: -1,
+    meshEditOverlayVisible: true,
+    meshEditDragSnapshot: null,
   };
 }

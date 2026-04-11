@@ -624,6 +624,9 @@ export function createPuppetRuntime({
   }
 
   function onPointerDown(event) {
+    if (renderState.meshEditEnabled) {
+      return;
+    }
     if (!renderState.puppetEnabled || !renderState.puppetOverlayVisible || !renderState.puppetRig) {
       return;
     }
@@ -649,6 +652,12 @@ export function createPuppetRuntime({
   }
 
   function onPointerMove(event) {
+    if (renderState.meshEditEnabled) {
+      hoveredBoneId = null;
+      hideHoverPopup();
+      renderer.domElement.style.cursor = "";
+      return;
+    }
     if (!draggingBoneId) {
       updateCursor(event);
       return;
