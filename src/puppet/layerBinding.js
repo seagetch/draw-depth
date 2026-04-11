@@ -52,6 +52,46 @@ function classifyLayer(name) {
   return "unknown";
 }
 
+function classifyDeformClass(classification, name, side) {
+  if (classification === "head") {
+    if (hasAny(name, [/face/, /eye/, /brow/, /nose/, /mouth/, /lip/, /tooth/, /tongue/, /ear/])) {
+      return "rigid_face";
+    }
+    if (hasAny(name, [/hair/, /bang/])) {
+      return "cloth_follow";
+    }
+    return "rigid_head";
+  }
+  if (classification === "neck") {
+    return "neck_seam";
+  }
+  if (classification === "shoulder") {
+    return side ? `shoulder_seam_${side}` : "shoulder_seam";
+  }
+  if (classification === "upper_arm" || classification === "forearm" || classification === "hand") {
+    return side ? `arm_chain_${side}` : "arm_chain";
+  }
+  if (classification === "sleeve") {
+    return side ? `shoulder_seam_${side}` : "cloth_follow";
+  }
+  if (classification === "torso") {
+    return "torso_core";
+  }
+  if (classification === "thigh" || classification === "shin" || classification === "foot") {
+    return side ? `leg_chain_${side}` : "leg_chain";
+  }
+  if (classification === "outerwear") {
+    return side ? `shoulder_seam_${side}` : "cloth_follow";
+  }
+  if (classification === "hip_accessory") {
+    return "hip_seam";
+  }
+  if (classification === "tail") {
+    return "cloth_follow";
+  }
+  return "cloth_follow";
+}
+
 function sideBones(side, names) {
   if (!side) {
     return [];
@@ -89,9 +129,9 @@ function inferAllowedBoneIds(primaryBoneId) {
   if (!primaryBoneId) {
     return ["pelvis", "spine", "chest"];
   }
-  if (primaryBoneId === "pelvis") return ["pelvis", "spine", "chest", "thigh_l", "thigh_r"];
-  if (primaryBoneId === "spine") return ["pelvis", "spine", "chest"];
-  if (primaryBoneId === "chest") return ["pelvis", "spine", "chest", "neck", "clavicle_l", "clavicle_r"];
+  if (primaryBoneId === "pelvis") return ["pelvis", "spine", "chest", "thigh_l", "thigh_r", "shin_l", "shin_r"];
+  if (primaryBoneId === "spine") return ["pelvis", "spine", "chest", "neck", "clavicle_l", "clavicle_r", "thigh_l", "thigh_r"];
+  if (primaryBoneId === "chest") return ["pelvis", "spine", "chest", "neck", "clavicle_l", "clavicle_r", "upper_arm_l", "upper_arm_r", "thigh_l", "thigh_r"];
   if (primaryBoneId === "neck") return ["chest", "neck", "head"];
   if (primaryBoneId === "head") return ["chest", "neck", "head"];
   if (/^clavicle_(l|r)$/.test(primaryBoneId)) {
@@ -133,6 +173,7 @@ export function applyLayerBindingOverride(layerBinding, override = null) {
     ...layerBinding,
     primaryBoneId: override.primaryBoneId,
     allowedBoneIds: inferAllowedBoneIds(override.primaryBoneId),
+    deformClass: layerBinding.deformClass || "cloth_follow",
     overridePrimaryBoneId: override.primaryBoneId,
   };
 }
@@ -142,6 +183,7 @@ export function createLayerBindingPolicy(layer, options = {}) {
   const normalizedName = normalizeName(layer?.name);
   const side = swapSide(detectSide(normalizedName), swapLeftRight);
   const classification = classifyLayer(normalizedName);
+  const deformClass = classifyDeformClass(classification, normalizedName, side);
   let primaryBoneId = "chest";
   let allowedBoneIds = ["pelvis", "spine", "chest"];
 
@@ -156,7 +198,7 @@ export function createLayerBindingPolicy(layer, options = {}) {
       break;
     case "torso":
       primaryBoneId = "spine";
-      allowedBoneIds = ["pelvis", "spine", "chest"];
+      allowedBoneIds = ["pelvis", "spine", "chest", "neck", "clavicle_l", "clavicle_r", "upper_arm_l", "upper_arm_r", "thigh_l", "thigh_r"];
       break;
     case "shoulder":
       primaryBoneId = side ? `clavicle_${side}` : "chest";
@@ -193,12 +235,12 @@ export function createLayerBindingPolicy(layer, options = {}) {
     case "outerwear":
       primaryBoneId = side ? `clavicle_${side}` : "chest";
       allowedBoneIds = side
-        ? unique(["pelvis", "spine", "chest", ...sideBones(side, ["clavicle", "upper_arm", "forearm"])])
-        : ["pelvis", "spine", "chest", "neck"];
+        ? unique(["pelvis", "spine", "chest", "neck", ...sideBones(side, ["clavicle", "upper_arm", "forearm"])])
+        : ["pelvis", "spine", "chest", "neck", "clavicle_l", "clavicle_r", "upper_arm_l", "upper_arm_r"];
       break;
     case "hip_accessory":
       primaryBoneId = "pelvis";
-      allowedBoneIds = ["pelvis", "thigh_l", "thigh_r", "shin_l", "shin_r"];
+      allowedBoneIds = ["pelvis", "spine", "thigh_l", "thigh_r", "shin_l", "shin_r"];
       break;
     case "tail":
       primaryBoneId = "pelvis";
@@ -217,6 +259,7 @@ export function createLayerBindingPolicy(layer, options = {}) {
     layerName: layer?.name || "",
     side,
     classification,
+    deformClass,
     primaryBoneId,
     allowedBoneIds,
   };

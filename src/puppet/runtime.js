@@ -1,7 +1,7 @@
-import { createMeshBindingWithPolicy } from "./bindWeights.js?v=20260409_1";
+import { createMeshBindingWithPolicy } from "./bindWeights.js?v=20260411_5";
 import { applySkinningToGeometry, restoreRestGeometry } from "./deform.js";
 import { createPuppetOverlay } from "./overlay.js";
-import { applyLayerBindingOverride, createLayerBindingPolicy, PUPPET_BONE_IDS } from "./layerBinding.js?v=20260410_1";
+import { applyLayerBindingOverride, createLayerBindingPolicy, PUPPET_BONE_IDS } from "./layerBinding.js?v=20260411_2";
 import {
   createRigState,
   moveBoneRestTailTarget,
@@ -9,11 +9,12 @@ import {
   setBoneEuler,
   setBoneWorldQuaternion,
   setBoneWorldTailTarget,
+  setBoneWorldTailTargetWithOptions,
   solveIkChainToTarget,
   solveRigPose,
-} from "./rigState.js?v=20260410_1";
+} from "./rigState.js?v=20260411_2";
 import { createBinaryMaskPreviewUrl } from "./debugPreview.js";
-import { createHumanoidRigData } from "./rigTemplate.js?v=20260410_10";
+import { createHumanoidRigData } from "./rigTemplate.js?v=20260411_2";
 
 function buildMeshSignature(layerMeshEntries, puppetSwapLeftRightMapping) {
   return layerMeshEntries
@@ -30,12 +31,69 @@ function buildRigSignature(psdLayerEntries, puppetLayerFitEnabled, puppetLayerBi
   }).join("|")}`;
 }
 
-const IK_EFFECTOR_CHAINS = {
-  hand_l: ["upper_arm_l", "forearm_l", "hand_l"],
-  hand_r: ["upper_arm_r", "forearm_r", "hand_r"],
-  foot_l: ["thigh_l", "shin_l", "foot_l"],
-  foot_r: ["thigh_r", "shin_r", "foot_r"],
-};
+function buildAncestorPath(rig, boneId) {
+  const path = [];
+  let current = rig?.boneMap?.get(boneId) || null;
+  while (current) {
+    path.push(current.id);
+    current = current.parentId ? rig.boneMap.get(current.parentId) : null;
+  }
+  return path.reverse();
+}
+
+function buildIkChains(rig, boneId) {
+  const fullPath = buildAncestorPath(rig, boneId);
+  if (fullPath.length <= 1) {
+    return [];
+  }
+  const starts = [];
+  const pushStart = (startId) => {
+    const startIndex = fullPath.indexOf(startId);
+    if (startIndex >= 0) {
+      const chain = fullPath.slice(startIndex);
+      if (chain.length > 1 && !starts.some((candidate) => candidate.join("|") === chain.join("|"))) {
+        starts.push(chain);
+      }
+    }
+  };
+
+  if (/_l$|_r$/.test(boneId) && (boneId.includes("arm") || boneId.includes("clavicle") || boneId.includes("hand"))) {
+    pushStart(`clavicle${boneId.endsWith("_l") ? "_l" : "_r"}`);
+    pushStart("neck");
+    pushStart("chest");
+  } else if (/_l$|_r$/.test(boneId) && (boneId.includes("thigh") || boneId.includes("shin") || boneId.includes("foot"))) {
+    pushStart("pelvis");
+  } else if (boneId === "head" || boneId === "neck") {
+    pushStart("spine");
+    pushStart("pelvis");
+  }
+
+  if (!starts.length) {
+    starts.push(fullPath);
+  }
+  return starts;
+}
+
+function snapshotRigPose(rig) {
+  return rig.bones.map((bone) => ({
+    id: bone.id,
+    poseEuler: bone.poseEuler.clone(),
+    poseTranslation: bone.poseTranslation.clone(),
+  }));
+}
+
+function restoreRigPoseSnapshot(THREE, rig, snapshot) {
+  for (let i = 0; i < snapshot.length; i += 1) {
+    const saved = snapshot[i];
+    const bone = rig.boneMap.get(saved.id);
+    if (!bone) {
+      continue;
+    }
+    bone.poseEuler.copy(saved.poseEuler);
+    bone.poseTranslation.copy(saved.poseTranslation);
+  }
+  solveRigPose(THREE, rig);
+}
 
 export function createPuppetRuntime({
   THREE,
@@ -53,9 +111,27 @@ export function createPuppetRuntime({
   const dragPlane = new THREE.Plane();
   const dragPoint = new THREE.Vector3();
   const planeNormal = new THREE.Vector3();
+  const projectedHandle = new THREE.Vector3();
   let draggingBoneId = null;
   let draggingRestEdit = false;
   let interactionAttached = false;
+  let hoveredBoneId = null;
+  const hoverPopupEl = document.createElement("div");
+  hoverPopupEl.style.position = "fixed";
+  hoverPopupEl.style.zIndex = "30";
+  hoverPopupEl.style.pointerEvents = "none";
+  hoverPopupEl.style.padding = "5px 8px";
+  hoverPopupEl.style.border = "1px solid rgba(255,255,255,0.18)";
+  hoverPopupEl.style.borderRadius = "999px";
+  hoverPopupEl.style.background = "rgba(12, 18, 26, 0.92)";
+  hoverPopupEl.style.color = "#e6edf3";
+  hoverPopupEl.style.font = '11px/1.2 "Segoe UI", sans-serif';
+  hoverPopupEl.style.letterSpacing = "0.02em";
+  hoverPopupEl.style.whiteSpace = "nowrap";
+  hoverPopupEl.style.transform = "translate(-50%, calc(-100% - 12px))";
+  hoverPopupEl.style.boxShadow = "0 8px 24px rgba(0,0,0,0.28)";
+  hoverPopupEl.style.display = "none";
+  (renderer.domElement.parentElement || document.body).appendChild(hoverPopupEl);
 
   function computeFlipPenalty(points) {
     if (!points) {
@@ -125,6 +201,7 @@ export function createPuppetRuntime({
           layerName: previousBinding.layerName || layer?.name || "",
           side: previousBinding.side ?? null,
           classification: previousBinding.classification || "unknown",
+          deformClass: previousBinding.deformClass || "cloth_follow",
           primaryBoneId: previousBinding.primaryBoneId || "chest",
           allowedBoneIds: [...(previousBinding.allowedBoneIds || [])],
         }
@@ -215,14 +292,16 @@ export function createPuppetRuntime({
       for (let i = 0; i < layerMeshEntries.length; i += 1) {
         restoreRestGeometry(layerMeshEntries[i].mesh.geometry);
       }
-      overlay.update(null, false, renderState.puppetSelectedBoneId);
+      overlay.update(null, false, renderState.puppetSelectedBoneId, hoveredBoneId);
+      hideHoverPopup();
       onStateChanged?.();
       return;
     }
 
     const rig = ensureRig(layerMeshEntries);
     if (!rig) {
-      overlay.update(null, false, renderState.puppetSelectedBoneId);
+      overlay.update(null, false, renderState.puppetSelectedBoneId, hoveredBoneId);
+      hideHoverPopup();
       onStateChanged?.();
       return;
     }
@@ -231,8 +310,35 @@ export function createPuppetRuntime({
     for (let i = 0; i < layerMeshEntries.length; i += 1) {
       applySkinningToGeometry(THREE, rig, layerMeshEntries[i].mesh.geometry);
     }
-    overlay.update(rig, renderState.puppetOverlayVisible, renderState.puppetSelectedBoneId);
+    overlay.update(rig, renderState.puppetOverlayVisible, renderState.puppetSelectedBoneId, hoveredBoneId);
+    updateHoverPopup();
     onStateChanged?.();
+  }
+
+  function hideHoverPopup() {
+    hoverPopupEl.style.display = "none";
+  }
+
+  function updateHoverPopup() {
+    if (!renderState.puppetEnabled || !renderState.puppetOverlayVisible || !renderState.puppetRig || !hoveredBoneId) {
+      hideHoverPopup();
+      return;
+    }
+    const bone = renderState.puppetRig.boneMap.get(hoveredBoneId);
+    if (!bone) {
+      hideHoverPopup();
+      return;
+    }
+    const rect = renderer.domElement.getBoundingClientRect();
+    projectedHandle.copy(bone.worldTail).project(camera);
+    if (projectedHandle.z < -1 || projectedHandle.z > 1) {
+      hideHoverPopup();
+      return;
+    }
+    hoverPopupEl.textContent = hoveredBoneId;
+    hoverPopupEl.style.left = `${rect.left + (projectedHandle.x * 0.5 + 0.5) * rect.width}px`;
+    hoverPopupEl.style.top = `${rect.top + (-projectedHandle.y * 0.5 + 0.5) * rect.height}px`;
+    hoverPopupEl.style.display = "block";
   }
 
   function reset() {
@@ -262,9 +368,81 @@ export function createPuppetRuntime({
     }
     const updated = setBoneEuler(renderState.puppetRig, boneId, euler);
     if (updated) {
+      renderState.puppetSelectedBoneId = boneId;
       sync();
     }
     return updated;
+  }
+
+  function setBoneTranslation(boneId, translation) {
+    if (!renderState.puppetRig) {
+      sync();
+    }
+    if (!renderState.puppetRig) {
+      return false;
+    }
+    const bone = renderState.puppetRig.boneMap.get(boneId);
+    if (!bone || bone.lockTranslation) {
+      return false;
+    }
+    bone.poseTranslation.set(
+      translation.x ?? bone.poseTranslation.x,
+      translation.y ?? bone.poseTranslation.y,
+      translation.z ?? bone.poseTranslation.z,
+    );
+    renderState.puppetSelectedBoneId = boneId;
+    renderState.puppetRig.version += 1;
+    sync();
+    return true;
+  }
+
+  function setSelectedBone(boneId) {
+    if (boneId && !renderState.puppetRig?.boneMap?.has(boneId)) {
+      return false;
+    }
+    renderState.puppetSelectedBoneId = boneId || null;
+    hoveredBoneId = boneId || null;
+    sync();
+    return true;
+  }
+
+  function getSelectedBoneId() {
+    return renderState.puppetSelectedBoneId || null;
+  }
+
+  function getBoneState(boneId) {
+    if (!renderState.puppetRig) {
+      return null;
+    }
+    const bone = renderState.puppetRig.boneMap.get(boneId);
+    if (!bone) {
+      return null;
+    }
+    return {
+      id: bone.id,
+      lockRotation: !!bone.lockRotation,
+      lockTranslation: !!bone.lockTranslation,
+      poseEuler: {
+        x: bone.poseEuler.x,
+        y: bone.poseEuler.y,
+        z: bone.poseEuler.z,
+      },
+      poseTranslation: {
+        x: bone.poseTranslation.x,
+        y: bone.poseTranslation.y,
+        z: bone.poseTranslation.z,
+      },
+      worldHead: {
+        x: bone.worldHead.x,
+        y: bone.worldHead.y,
+        z: bone.worldHead.z,
+      },
+      worldTail: {
+        x: bone.worldTail.x,
+        y: bone.worldTail.y,
+        z: bone.worldTail.z,
+      },
+    };
   }
 
   function setBoneTargetWorld(boneId, target) {
@@ -289,25 +467,51 @@ export function createPuppetRuntime({
     if (!renderState.puppetRig) {
       return false;
     }
-    const chain = IK_EFFECTOR_CHAINS[boneId];
+    const chains = buildIkChains(renderState.puppetRig, boneId);
     let updated = false;
-    if (chain) {
-      updated = solveIkChainToTarget(THREE, renderState.puppetRig, chain, target, { iterations: 10 });
+    if (chains.length) {
+      const poseSnapshot = snapshotRigPose(renderState.puppetRig);
+      let bestDistance = Number.POSITIVE_INFINITY;
+      let bestSnapshot = poseSnapshot;
+      for (let i = 0; i < chains.length; i += 1) {
+        restoreRigPoseSnapshot(THREE, renderState.puppetRig, poseSnapshot);
+        const chainUpdated = solveIkChainToTarget(THREE, renderState.puppetRig, chains[i], target, {
+          iterations: 24,
+          epsilon: 1e-4,
+          acceptDistance: 0.01,
+          ignoreStepLimit: true,
+        });
+        const endBone = renderState.puppetRig.boneMap.get(boneId);
+        const distance = endBone ? endBone.worldTail.distanceTo(target) : Number.POSITIVE_INFINITY;
+        if (chainUpdated && distance < bestDistance) {
+          bestDistance = distance;
+          bestSnapshot = snapshotRigPose(renderState.puppetRig);
+          updated = true;
+        }
+      }
+      restoreRigPoseSnapshot(THREE, renderState.puppetRig, bestSnapshot);
       if (updated) {
         const endBone = renderState.puppetRig.boneMap.get(boneId);
         if (endBone) {
+          const distanceBeforeOrientation = endBone.worldTail.distanceTo(target);
+          const poseBeforeOrientation = endBone.poseEuler.clone();
           const desiredDirection = new THREE.Vector3().subVectors(target, endBone.worldHead);
           if (desiredDirection.lengthSq() > 1e-8) {
             const desiredWorldQuaternion = new THREE.Quaternion().setFromUnitVectors(
               new THREE.Vector3(0, 1, 0),
               desiredDirection.normalize(),
             );
-            setBoneWorldQuaternion(renderState.puppetRig, boneId, desiredWorldQuaternion);
+            setBoneWorldQuaternion(renderState.puppetRig, boneId, desiredWorldQuaternion, { ignoreStepLimit: true });
+            solveRigPose(THREE, renderState.puppetRig);
+            if (endBone.worldTail.distanceTo(target) > distanceBeforeOrientation + 1e-6) {
+              endBone.poseEuler.copy(poseBeforeOrientation);
+              solveRigPose(THREE, renderState.puppetRig);
+            }
           }
         }
       }
     } else {
-      updated = setBoneWorldTailTarget(THREE, renderState.puppetRig, boneId, target);
+      updated = setBoneWorldTailTargetWithOptions(THREE, renderState.puppetRig, boneId, target, { ignoreStepLimit: true });
     }
     if (updated) {
       renderState.puppetSelectedBoneId = boneId;
@@ -372,14 +576,50 @@ export function createPuppetRuntime({
     return pointer;
   }
 
+  function findHandleHit(event) {
+    if (!renderState.puppetEnabled || !renderState.puppetOverlayVisible || !renderState.puppetRig) {
+      return null;
+    }
+    const rect = renderer.domElement.getBoundingClientRect();
+    const pointerX = event.clientX - rect.left;
+    const pointerY = event.clientY - rect.top;
+    const thresholdPx = 22;
+    let best = null;
+    let bestDistanceSq = thresholdPx * thresholdPx;
+    const handles = overlay.getHandleMeshes();
+    for (let i = 0; i < handles.length; i += 1) {
+      const handle = handles[i];
+      if (!handle.visible) {
+        continue;
+      }
+      projectedHandle.copy(handle.position).project(camera);
+      if (projectedHandle.z < -1 || projectedHandle.z > 1) {
+        continue;
+      }
+      const screenX = (projectedHandle.x * 0.5 + 0.5) * rect.width;
+      const screenY = (-projectedHandle.y * 0.5 + 0.5) * rect.height;
+      const dx = screenX - pointerX;
+      const dy = screenY - pointerY;
+      const distanceSq = dx * dx + dy * dy;
+      if (distanceSq <= bestDistanceSq) {
+        bestDistanceSq = distanceSq;
+        best = handle;
+      }
+    }
+    return best ? { object: best } : null;
+  }
+
   function updateCursor(event) {
     if (!renderState.puppetEnabled || !renderState.puppetOverlayVisible || !renderState.puppetRig) {
+      hoveredBoneId = null;
+      hideHoverPopup();
       renderer.domElement.style.cursor = "";
       return;
     }
-    const ndc = getPointerNdc(event);
-    raycaster.setFromCamera(ndc, camera);
-    const hit = raycaster.intersectObjects(overlay.getHandleMeshes().filter((mesh) => mesh.visible), false)[0];
+    const hit = findHandleHit(event);
+    hoveredBoneId = hit?.object?.userData?.boneId || null;
+    updateHoverPopup();
+    overlay.update(renderState.puppetRig, renderState.puppetOverlayVisible, renderState.puppetSelectedBoneId, hoveredBoneId);
     renderer.domElement.style.cursor = hit ? "grab" : "";
   }
 
@@ -390,18 +630,17 @@ export function createPuppetRuntime({
     if (event.button !== 0 && event.button !== 1) {
       return;
     }
-    const ndc = getPointerNdc(event);
-    raycaster.setFromCamera(ndc, camera);
-    const hit = raycaster.intersectObjects(overlay.getHandleMeshes().filter((mesh) => mesh.visible), false)[0];
+    const hit = findHandleHit(event);
     if (!hit) {
       return;
     }
     draggingBoneId = hit.object.userData.boneId;
     draggingRestEdit = event.button === 1;
     renderState.puppetSelectedBoneId = draggingBoneId;
+    hoveredBoneId = draggingBoneId;
     const bone = renderState.puppetRig.boneMap.get(draggingBoneId);
     camera.getWorldDirection(planeNormal);
-    dragPlane.setFromNormalAndCoplanarPoint(planeNormal, draggingRestEdit ? bone.worldTail : bone.worldHead);
+    dragPlane.setFromNormalAndCoplanarPoint(planeNormal, bone.worldTail);
     controls.enabled = false;
     renderer.domElement.setPointerCapture?.(event.pointerId);
     renderer.domElement.style.cursor = draggingRestEdit ? "move" : "grabbing";
@@ -440,6 +679,7 @@ export function createPuppetRuntime({
     draggingRestEdit = false;
     controls.enabled = true;
     renderer.domElement.style.cursor = "";
+    updateHoverPopup();
   }
 
   function suppressAuxiliaryDefault(event) {
@@ -467,6 +707,7 @@ export function createPuppetRuntime({
       setEnabled,
       setOverlayVisible,
       setBonePose,
+      setBoneTranslation,
       solveIkTargetWorld: (boneId, target) => solveIkTargetWorld(
         boneId,
         new THREE.Vector3(target.x, target.y, target.z),
@@ -482,8 +723,11 @@ export function createPuppetRuntime({
       setLayerFitEnabled,
       setLayerBindingPrimary,
       setSwapLeftRightMapping,
+      setSelectedBone,
       reset,
       sync: () => sync(),
+      getSelectedBoneId,
+      getBoneState,
       getBoneIds: () => renderState.puppetRig ? renderState.puppetRig.bones.map((bone) => bone.id) : [],
       getRig: () => renderState.puppetRig,
       getLayerBindings: () => renderState.puppetLayerBindings,
@@ -496,9 +740,13 @@ export function createPuppetRuntime({
     setEnabled,
     setOverlayVisible,
     setBonePose,
+    setBoneTranslation,
     setBoneTargetWorld,
     setBoneRestTargetWorld,
     solveIkTargetWorld,
+    setSelectedBone,
+    getSelectedBoneId,
+    getBoneState,
     setLayerFitEnabled,
     setLayerBindingPrimary,
     setSwapLeftRightMapping,

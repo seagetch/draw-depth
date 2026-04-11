@@ -16,6 +16,10 @@ function roll(value) {
   return deg(value);
 }
 
+function step(value) {
+  return deg(value);
+}
+
 function limits(xMin, xMax, yMin, yMax, zMin, zMax) {
   return {
     x: { min: deg(xMin), max: deg(xMax) },
@@ -272,33 +276,34 @@ export function createHumanoidRigData(context) {
 
   const points = normalizeHumanoidPoints(structuredClone(fit.points), imageWidth, imageHeight);
   const p = (point) => pixelToWorld(imageWidth, imageHeight, bounds, point.x, point.y);
+  const upperChestPoint = { x: points.chest.x, y: mix(points.chest.y, points.neck.y, 0.6) };
 
   return {
     fit,
     template: [
-    { id: "pelvis", head: p(points.pelvis), tail: p(points.spine), limits: limits(-18, 18, -25, 25, -20, 20) },
-    { id: "spine", parentId: "pelvis", head: p(points.spine), tail: p(points.chest), limits: limits(-20, 20, -18, 18, -24, 24) },
-    { id: "chest", parentId: "spine", head: p(points.chest), tail: p({ x: points.chest.x, y: mix(points.chest.y, points.neck.y, 0.6) }), limits: limits(-18, 18, -20, 20, -30, 30) },
-    { id: "neck", parentId: "chest", head: p({ x: points.chest.x, y: mix(points.chest.y, points.neck.y, 0.6) }), tail: p(points.neck), limits: limits(-30, 30, -35, 35, -45, 45) },
-    { id: "head", parentId: "neck", head: p(points.neck), tail: p(points.head), limits: limits(-35, 35, -45, 45, -60, 60) },
+    { id: "pelvis", head: p(points.pelvis), tail: p(points.spine), lockRotation: true, lockTranslation: true, maxStepRadians: 0, limits: limits(0, 0, 0, 0, 0, 0) },
+    { id: "spine", parentId: "pelvis", head: p(points.spine), tail: p(points.chest), maxStepRadians: step(6), limits: limits(-20, 20, -18, 18, -24, 24) },
+    { id: "chest", parentId: "spine", head: p(points.chest), tail: p(upperChestPoint), maxStepRadians: step(6), limits: limits(-18, 18, -20, 20, -30, 30) },
+    { id: "neck", parentId: "chest", head: p(upperChestPoint), tail: p(points.neck), maxStepRadians: step(8), limits: limits(-30, 30, -35, 35, -45, 45) },
+    { id: "head", parentId: "neck", head: p(points.neck), tail: p(points.head), maxStepRadians: step(8), limits: limits(-35, 35, -45, 45, -60, 60) },
 
-    { id: "clavicle_l", parentId: "chest", head: p(points.chest), tail: p(points.shoulder_l), restRoll: roll(180), limits: limits(-20, 30, -25, 40, -35, 20) },
-    { id: "upper_arm_l", parentId: "clavicle_l", head: p(points.shoulder_l), tail: p(points.elbow_l), restRoll: roll(180), limits: limits(-110, 80, -85, 85, -140, 60) },
-    { id: "forearm_l", parentId: "upper_arm_l", head: p(points.elbow_l), tail: p(points.hand_l), restRoll: roll(180), limits: limits(-5, 145, -35, 35, -10, 10) },
-    { id: "hand_l", parentId: "forearm_l", head: p(points.hand_l), tail: p(points.hand_l_tip), restRoll: roll(180), limits: limits(-35, 35, -30, 30, -45, 45) },
+    { id: "clavicle_l", parentId: "neck", head: p(upperChestPoint), tail: p(points.shoulder_l), restRoll: roll(180), maxStepRadians: step(8), limits: limits(-20, 30, -25, 40, -35, 20) },
+    { id: "upper_arm_l", parentId: "clavicle_l", head: p(points.shoulder_l), tail: p(points.elbow_l), restRoll: roll(180), maxStepRadians: step(10), limits: limits(-110, 80, -85, 85, -140, 60) },
+    { id: "forearm_l", parentId: "upper_arm_l", head: p(points.elbow_l), tail: p(points.hand_l), restRoll: roll(180), constraintType: "hinge", hingeAxis: "x", maxStepRadians: step(12), limits: limits(-5, 145, 0, 0, 0, 0) },
+    { id: "hand_l", parentId: "forearm_l", head: p(points.hand_l), tail: p(points.hand_l_tip), restRoll: roll(180), maxStepRadians: step(10), limits: limits(-35, 35, -30, 30, -45, 45) },
 
-    { id: "clavicle_r", parentId: "chest", head: p(points.chest), tail: p(points.shoulder_r), restRoll: roll(180), limits: limits(-20, 30, -40, 25, -20, 35) },
-    { id: "upper_arm_r", parentId: "clavicle_r", head: p(points.shoulder_r), tail: p(points.elbow_r), restRoll: roll(180), limits: limits(-110, 80, -85, 85, -60, 140) },
-    { id: "forearm_r", parentId: "upper_arm_r", head: p(points.elbow_r), tail: p(points.hand_r), restRoll: roll(180), limits: limits(-5, 145, -35, 35, -10, 10) },
-    { id: "hand_r", parentId: "forearm_r", head: p(points.hand_r), tail: p(points.hand_r_tip), restRoll: roll(180), limits: limits(-35, 35, -30, 30, -45, 45) },
+    { id: "clavicle_r", parentId: "neck", head: p(upperChestPoint), tail: p(points.shoulder_r), restRoll: roll(180), maxStepRadians: step(8), limits: limits(-20, 30, -40, 25, -20, 35) },
+    { id: "upper_arm_r", parentId: "clavicle_r", head: p(points.shoulder_r), tail: p(points.elbow_r), restRoll: roll(180), maxStepRadians: step(10), limits: limits(-110, 80, -85, 85, -60, 140) },
+    { id: "forearm_r", parentId: "upper_arm_r", head: p(points.elbow_r), tail: p(points.hand_r), restRoll: roll(180), constraintType: "hinge", hingeAxis: "x", maxStepRadians: step(12), limits: limits(-5, 145, 0, 0, 0, 0) },
+    { id: "hand_r", parentId: "forearm_r", head: p(points.hand_r), tail: p(points.hand_r_tip), restRoll: roll(180), maxStepRadians: step(10), limits: limits(-35, 35, -30, 30, -45, 45) },
 
-    { id: "thigh_l", parentId: "pelvis", head: p(points.hip_l), tail: p(points.knee_l), restRoll: roll(180), limits: limits(-110, 45, -35, 35, -40, 25) },
-    { id: "shin_l", parentId: "thigh_l", head: p(points.knee_l), tail: p(points.foot_l), restRoll: roll(180), limits: limits(-5, 150, -10, 10, -8, 8) },
-    { id: "foot_l", parentId: "shin_l", head: p(points.foot_l), tail: p(points.foot_l_tip), restRoll: roll(180), limits: limits(-35, 35, -20, 20, -20, 20) },
+    { id: "thigh_l", parentId: "pelvis", head: p(points.hip_l), tail: p(points.knee_l), restRoll: roll(180), maxStepRadians: step(10), limits: limits(-110, 45, -35, 35, -40, 25) },
+    { id: "shin_l", parentId: "thigh_l", head: p(points.knee_l), tail: p(points.foot_l), restRoll: roll(180), constraintType: "hinge", hingeAxis: "x", maxStepRadians: step(12), limits: limits(-5, 150, 0, 0, 0, 0) },
+    { id: "foot_l", parentId: "shin_l", head: p(points.foot_l), tail: p(points.foot_l_tip), restRoll: roll(180), maxStepRadians: step(10), limits: limits(-35, 35, -20, 20, -20, 20) },
 
-    { id: "thigh_r", parentId: "pelvis", head: p(points.hip_r), tail: p(points.knee_r), restRoll: roll(180), limits: limits(-110, 45, -35, 35, -25, 40) },
-    { id: "shin_r", parentId: "thigh_r", head: p(points.knee_r), tail: p(points.foot_r), restRoll: roll(180), limits: limits(-5, 150, -10, 10, -8, 8) },
-    { id: "foot_r", parentId: "shin_r", head: p(points.foot_r), tail: p(points.foot_r_tip), restRoll: roll(180), limits: limits(-35, 35, -20, 20, -20, 20) },
+    { id: "thigh_r", parentId: "pelvis", head: p(points.hip_r), tail: p(points.knee_r), restRoll: roll(180), maxStepRadians: step(10), limits: limits(-110, 45, -35, 35, -25, 40) },
+    { id: "shin_r", parentId: "thigh_r", head: p(points.knee_r), tail: p(points.foot_r), restRoll: roll(180), constraintType: "hinge", hingeAxis: "x", maxStepRadians: step(12), limits: limits(-5, 150, 0, 0, 0, 0) },
+    { id: "foot_r", parentId: "shin_r", head: p(points.foot_r), tail: p(points.foot_r_tip), restRoll: roll(180), maxStepRadians: step(10), limits: limits(-35, 35, -20, 20, -20, 20) },
     ],
   };
 }

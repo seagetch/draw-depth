@@ -15,6 +15,7 @@ export function createPuppetOverlay(THREE, scene) {
   const handleGeometry = new THREE.SphereGeometry(0.012, 12, 12);
   const defaultHandleMaterial = new THREE.MeshBasicMaterial({ color: 0xffc837 });
   const selectedHandleMaterial = new THREE.MeshBasicMaterial({ color: 0xff4d6d });
+  const hoveredHandleMaterial = new THREE.MeshBasicMaterial({ color: 0x6af2ff });
   const handleMeshes = [];
 
   function ensureHandleCount(count) {
@@ -29,7 +30,7 @@ export function createPuppetOverlay(THREE, scene) {
     }
   }
 
-  function update(rig, visible, selectedBoneId = null) {
+  function update(rig, visible, selectedBoneId = null, hoveredBoneId = null) {
     lines.visible = !!visible && !!rig && rig.bones.length > 0;
     handleGroup.visible = lines.visible;
     if (!lines.visible) {
@@ -51,7 +52,10 @@ export function createPuppetOverlay(THREE, scene) {
       handleMeshes[i].position.copy(rig.bones[i].worldTail);
       handleMeshes[i].material = rig.bones[i].id === selectedBoneId
         ? selectedHandleMaterial
-        : defaultHandleMaterial;
+        : rig.bones[i].id === hoveredBoneId
+          ? hoveredHandleMaterial
+          : defaultHandleMaterial;
+      handleMeshes[i].scale.setScalar(rig.bones[i].id === selectedBoneId ? 1.45 : rig.bones[i].id === hoveredBoneId ? 1.25 : 1);
       handleMeshes[i].userData.boneId = rig.bones[i].id;
     }
     geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
@@ -66,6 +70,7 @@ export function createPuppetOverlay(THREE, scene) {
     handleGeometry.dispose();
     defaultHandleMaterial.dispose();
     selectedHandleMaterial.dispose();
+    hoveredHandleMaterial.dispose();
   }
 
   return {
