@@ -34,6 +34,13 @@ export function createMeshEditRuntime({
   let draggingTargetKey = null;
   let dragChanged = false;
   let geometryChangedCallback = onGeometryChanged || null;
+  let altPressed = false;
+
+  function isAddHandleGesture(event) {
+    return !!(event.altKey
+      || event.getModifierState?.("Alt")
+      || altPressed);
+  }
 
   function getTargetKey(entry) {
     return entry?.targetKey || null;
@@ -305,6 +312,14 @@ export function createMeshEditRuntime({
     sync(activeEntries);
   }
 
+  function setAddMode(enabled) {
+    renderState.meshEditAddMode = !!enabled;
+    renderer.domElement.style.cursor = renderState.meshEditEnabled
+      ? (renderState.meshEditAddMode ? "copy" : "crosshair")
+      : "";
+    sync(activeEntries);
+  }
+
   function setTarget(targetKey) {
     renderState.meshEditTargetKey = targetKey || "raster:base";
     renderState.meshEditSelection = null;
@@ -358,7 +373,7 @@ export function createMeshEditRuntime({
       return;
     }
 
-    if (event.altKey) {
+    if (renderState.meshEditAddMode || isAddHandleGesture(event)) {
       const meshHit = findMeshHit(event);
       if (meshHit && addHandleFromHit(meshHit)) {
         event.preventDefault();
@@ -379,7 +394,9 @@ export function createMeshEditRuntime({
   function onPointerMove(event) {
     if (!draggingHandleId) {
       const handleHit = findHandleHit(event);
-      renderer.domElement.style.cursor = handleHit ? "grab" : (renderState.meshEditEnabled ? "crosshair" : "");
+      renderer.domElement.style.cursor = handleHit
+        ? "grab"
+        : (renderState.meshEditEnabled ? (renderState.meshEditAddMode ? "copy" : "crosshair") : "");
       return;
     }
 
@@ -415,11 +432,14 @@ export function createMeshEditRuntime({
     draggingTargetKey = null;
     dragChanged = false;
     controls.enabled = true;
-    renderer.domElement.style.cursor = renderState.meshEditEnabled ? "crosshair" : "";
+    renderer.domElement.style.cursor = renderState.meshEditEnabled ? (renderState.meshEditAddMode ? "copy" : "crosshair") : "";
     sync(activeEntries);
   }
 
   function onKeyDown(event) {
+    if (event.key === "Alt") {
+      altPressed = true;
+    }
     if (!renderState.meshEditEnabled) {
       return;
     }
@@ -441,6 +461,16 @@ export function createMeshEditRuntime({
     }
   }
 
+  function onKeyUp(event) {
+    if (event.key === "Alt") {
+      altPressed = false;
+    }
+  }
+
+  function onWindowBlur() {
+    altPressed = false;
+  }
+
   function attachInteraction() {
     if (interactionAttached) {
       return;
@@ -453,6 +483,8 @@ export function createMeshEditRuntime({
     renderer.domElement.addEventListener("pointerleave", onPointerUp);
     renderer.domElement.addEventListener("pointercancel", onPointerUp);
     window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onWindowBlur);
   }
 
   return {
@@ -460,6 +492,7 @@ export function createMeshEditRuntime({
     sync,
     attachInteraction,
     setEnabled,
+    setAddMode,
     setTarget,
     setSelectedHandle,
     getSelectedHandle,

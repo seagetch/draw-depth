@@ -80,6 +80,7 @@ export function createRenderState() {
     puppetDebugSkeletonUrl: "",
     puppetDebugSummary: "",
     meshEditEnabled: false,
+    meshEditAddMode: false,
     meshEditTargetKey: "raster:base",
     meshEditSelection: null,
     meshEditHandlesByTarget: {},

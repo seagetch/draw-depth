@@ -9,6 +9,7 @@ export function createMeshEditPanel({ elements, renderState, meshEditRuntime }) 
   const {
     meshEditPanelEl,
     meshEditEnabledEl,
+    meshEditAddModeEl,
     meshEditTargetEl,
     meshEditRadiusEl,
     meshEditRadiusValueEl,
@@ -41,6 +42,7 @@ export function createMeshEditPanel({ elements, renderState, meshEditRuntime }) 
     syncTargetOptions();
     meshEditPanelEl.style.display = "";
     meshEditEnabledEl.checked = !!renderState.meshEditEnabled;
+    meshEditAddModeEl.checked = !!renderState.meshEditAddMode;
     meshEditTargetEl.value = renderState.meshEditTargetKey || "raster:base";
     const selectedHandle = meshEditRuntime.getSelectedHandle();
     const radius = selectedHandle?.radius ?? Number(meshEditRadiusEl.value);
@@ -54,6 +56,9 @@ export function createMeshEditPanel({ elements, renderState, meshEditRuntime }) 
 
   meshEditEnabledEl.addEventListener("change", () => {
     meshEditRuntime.setEnabled(meshEditEnabledEl.checked);
+  });
+  meshEditAddModeEl.addEventListener("change", () => {
+    meshEditRuntime.setAddMode(meshEditAddModeEl.checked);
   });
   meshEditTargetEl.addEventListener("change", () => {
     meshEditRuntime.setTarget(meshEditTargetEl.value);
