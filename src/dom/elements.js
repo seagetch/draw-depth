@@ -54,6 +54,7 @@ export function getViewerElements(doc = document) {
     puppetSkeletonImageEl: doc.querySelector("#puppetSkeletonImage"),
     meshEditPanelEl: doc.querySelector("#meshEditPanel"),
     meshEditEnabledEl: doc.querySelector("#meshEditEnabled"),
+    meshEditAddModeEl: doc.querySelector("#meshEditAddMode"),
     meshEditTargetEl: doc.querySelector("#meshEditTarget"),
     meshEditRadiusEl: doc.querySelector("#meshEditRadius"),
     meshEditRadiusValueEl: doc.querySelector("#meshEditRadiusValue"),

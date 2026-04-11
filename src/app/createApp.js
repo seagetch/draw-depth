@@ -15,7 +15,7 @@ import { createAppResources } from "./resources.js";
 import { createRenderState } from "./state.js?v=20260410_3";
 import { createDepthCore } from "../depth/core.js";
 import { wireControls } from "../dom/controls.js";
-import { getViewerElements } from "../dom/elements.js?v=20260411_1";
+import { getViewerElements } from "../dom/elements.js?v=20260411_2";
 import { createPuppetPanel } from "../dom/puppetPanel.js?v=20260411_2";
 import { createSegmentPanel } from "../dom/segmentPanel.js?v=20260410_2";
 import {
@@ -29,9 +29,9 @@ import { updatePsdDebugPanel as updatePsdDebugPanelView } from "../psd/debug.js?
 import { createPsdExport } from "../psd/export.js?v=20260408_1";
 import { createPsdLayers } from "../psd/layers.js?v=20260408_4";
 import { createPsdLoader } from "../psd/loader.js?v=20260409_1";
-import { createPuppetRuntime } from "../puppet/runtime.js?v=20260411_13";
+import { createPuppetRuntime } from "../puppet/runtime.js?v=20260411_14";
 import { PUPPET_BONE_IDS } from "../puppet/layerBinding.js?v=20260411_2";
-import { createMeshEditRuntime } from "../meshEdit/runtime.js";
+import { createMeshEditRuntime } from "../meshEdit/runtime.js?v=20260411_2";
 import { initializePsdSupport } from "../psd/psdSupport.js";
 import { createGeometryHelpers } from "../scene/geometry.js?v=20260409_1";
 import { createSceneBuilder } from "../scene/meshBuilder.js?v=20260409_3";
@@ -41,7 +41,7 @@ import { createThreeContext } from "../scene/threeContext.js";
 import { createSegmentAnalysis } from "../segments/analysis.js";
 import { createSegmentDepthRuntime } from "../segments/segmentDepth.js";
 import { createSegmentRuntime } from "../segments/segmentRuntime.js";
-import { createMeshEditPanel } from "../dom/meshEditPanel.js";
+import { createMeshEditPanel } from "../dom/meshEditPanel.js?v=20260411_1";
 
 export function createApp() {
   const THREE = globalThis.THREE;
@@ -90,6 +90,7 @@ export function createApp() {
     puppetSkeletonImageEl,
     meshEditPanelEl,
     meshEditEnabledEl,
+    meshEditAddModeEl,
     meshEditTargetEl,
     meshEditRadiusEl,
     meshEditRadiusValueEl,
@@ -414,6 +415,7 @@ export function createApp() {
     elements: {
       meshEditPanelEl,
       meshEditEnabledEl,
+      meshEditAddModeEl,
       meshEditTargetEl,
       meshEditRadiusEl,
       meshEditRadiusValueEl,

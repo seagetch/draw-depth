@@ -18,7 +18,10 @@ import { createHumanoidRigData } from "./rigTemplate.js?v=20260411_2";
 
 function buildMeshSignature(layerMeshEntries, puppetSwapLeftRightMapping) {
   return layerMeshEntries
-    .map((entry) => `${entry.layerIndex}:${entry.mesh.geometry.getAttribute("position")?.count || 0}`)
+    .map((entry) => {
+      const geometry = entry.mesh.geometry;
+      return `${entry.layerIndex}:${geometry.id}:${geometry.getAttribute("position")?.count || 0}`;
+    })
     .join("|")
     + `::swap=${puppetSwapLeftRightMapping ? "1" : "0"}`;
 }
