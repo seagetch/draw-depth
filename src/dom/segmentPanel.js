@@ -106,7 +106,7 @@ export function createSegmentPanel(deps) {
         : "none";
       label.textContent = `rig:${binding.primaryBoneId}`;
       label.title =
-        `class=${binding.classification} | allowed=${binding.allowedBoneIds.join(", ")} | dominant=${dominantSummary}`;
+        `class=${binding.classification} | deform=${binding.deformClass || "-"} | allowed=${binding.allowedBoneIds.join(", ")} | dominant=${dominantSummary}`;
     });
 
     const puppetSelects = segmentListEl.querySelectorAll("[data-segment-puppet-primary]");
