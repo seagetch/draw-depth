@@ -764,12 +764,13 @@ export function createDepthCore(THREE) {
     return kernel;
   }
   
-  function createDepthTextureResources(width, height, pixels) {
+  function createDepthTextureResources(width, height, pixels, options = {}) {
     const canvas = document.createElement("canvas");
     canvas.width = width;
     canvas.height = height;
     const context = canvas.getContext("2d", { willReadFrequently: true });
     const imageData = context.createImageData(width, height);
+    const alphaValue = options.opaqueAlpha ? 255 : null;
   
     for (let pixelIndex = 0; pixelIndex < pixels.length; pixelIndex += 1) {
       const rounded = pixels[pixelIndex];
@@ -777,7 +778,7 @@ export function createDepthCore(THREE) {
       imageData.data[imageIndex] = rounded;
       imageData.data[imageIndex + 1] = rounded;
       imageData.data[imageIndex + 2] = rounded;
-      imageData.data[imageIndex + 3] = rounded > 0 ? 255 : 0;
+      imageData.data[imageIndex + 3] = alphaValue ?? (rounded > 0 ? 255 : 0);
     }
   
     context.putImageData(imageData, 0, 0);

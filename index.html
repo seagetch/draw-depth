@@ -200,6 +200,10 @@
         image-rendering: pixelated;
       }
 
+      .debug-image:not([src]) {
+        display: none;
+      }
+
       .debug-legend {
         font-size: 11px;
         color: var(--muted);
@@ -214,6 +218,16 @@
         border: 1px solid var(--line);
         border-radius: 8px;
         background: rgba(255, 255, 255, 0.04);
+        color: var(--text);
+      }
+
+      select option {
+        background: #0d1117;
+        color: var(--text);
+      }
+
+      select option:checked {
+        background: #18212b;
         color: var(--text);
       }
 
@@ -370,7 +384,16 @@
     <div id="app"></div>
     <section id="hud">
       <h1>Depth Draw Viewer</h1>
-      <p>`depth == 0` is treated as invalid and is not rendered.</p>
+      <p>Raster depth maps use zero depth as invalid. PSD depth layers use their grayscale values directly.</p>
+
+      <div class="control">
+        <div class="control-row">
+          <label for="modelSelect">Model</label>
+        </div>
+        <select id="modelSelect">
+          <option value="">Loading models...</option>
+        </select>
+      </div>
 
       <div class="control">
         <div class="control-row">
@@ -421,8 +444,13 @@
         <input id="surfaceSmooth" type="checkbox">
       </div>
 
+      <div class="control-row">
+        <label for="generatedMeshDebugEnabled">Show generated vertices</label>
+        <input id="generatedMeshDebugEnabled" type="checkbox">
+      </div>
+
       <div class="control">
-        <button class="action-button" id="saveDepthPsdButton" type="button">Save Midori-full-depth.psd</button>
+        <button class="action-button" id="saveDepthPsdButton" type="button">Save depth PSD</button>
       </div>
 
       <div class="control">
@@ -601,6 +629,9 @@
           Magenta: component-pruned<br>
           Cyan: cluster-pruned<br>
           Yellow: contour zeroed<br>
+          Thin surface: magenta excluded / green kept<br>
+          Color alpha: orange A1-254 / green A255<br>
+          Depth alpha leak: red<br>
           Dark: no seed / empty<br>
           Puppet body mask: yellow<br>
           Puppet skeleton: cyan

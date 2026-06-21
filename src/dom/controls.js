@@ -12,6 +12,7 @@ export function wireControls(deps) {
     updatePsdDebugPanel,
     ensureDefaultPsdPairLoaded,
     saveCurrentPsdDepthAsPsd,
+    setGeneratedMeshDebugEnabled,
     replaceImage,
     onResize,
   } = deps;
@@ -28,6 +29,7 @@ export function wireControls(deps) {
     sourceModeEl,
     contourRepairEl,
     surfaceSmoothEl,
+    generatedMeshDebugEnabledEl,
     depthModeEl,
     gridSpecModeEl,
     gridXEl,
@@ -154,6 +156,17 @@ export function wireControls(deps) {
     }
     applySegmentDepthAdjustments();
     buildMesh();
+  });
+
+  generatedMeshDebugEnabledEl?.addEventListener("change", async () => {
+    try {
+      await setGeneratedMeshDebugEnabled(generatedMeshDebugEnabledEl.checked);
+    } catch (error) {
+      console.error(error);
+      generatedMeshDebugEnabledEl.checked = false;
+      renderState.generatedMeshDebugEnabled = false;
+      statusEl.textContent = `Failed: ${error.message}`;
+    }
   });
 
   depthModeEl.addEventListener("change", async () => {

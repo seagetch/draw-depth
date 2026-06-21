@@ -2,6 +2,11 @@ function isPsdFilename(name) {
   return /\.psd$/i.test(name || "");
 }
 
+function withCacheBust(url) {
+  const separator = url.includes("?") ? "&" : "?";
+  return `${url}${separator}v=${Date.now()}`;
+}
+
 export function createAppActions(deps) {
   const {
     THREE,
@@ -99,6 +104,7 @@ export function createAppActions(deps) {
       uniforms: {
         uColorTexture: { value: renderState.colorTexture },
         uSegmentMaskTexture: { value: renderState.segmentMaskTexture },
+        uOpacity: { value: 1 },
         ...(useSurfaceSmooth ? {} : {
           uDepthTexture: { value: renderState.meshDepthTexture },
           uDepthScale: { value: Number(depthScaleEl.value) },
@@ -127,11 +133,13 @@ export function createAppActions(deps) {
       uniforms: useSurfaceSmooth
         ? {
           uSegmentMaskTexture: { value: renderState.segmentMaskTexture },
+          uOpacity: { value: 1 },
           uPointSize: { value: 2.2 },
         }
         : {
           uDepthTexture: { value: renderState.meshDepthTexture },
           uSegmentMaskTexture: { value: renderState.segmentMaskTexture },
+          uOpacity: { value: 1 },
           uDepthScale: { value: Number(depthScaleEl.value) },
           uInvertDepth: { value: invertDepthEl.checked ? 1 : 0 },
           uPointSize: { value: 2.2 },
@@ -152,6 +160,71 @@ export function createAppActions(deps) {
     meshEditRuntime?.sync([{ mesh, targetKey: "raster:base" }]);
 
     refreshStatusCounts();
+  }
+
+  async function loadRasterModel(model) {
+    if (!model?.colorUrl || !model?.depthUrl) {
+      throw new Error("Model is missing color or depth image URLs.");
+    }
+
+    const colorUrl = withCacheBust(model.colorUrl);
+    const depthUrl = withCacheBust(model.depthUrl);
+    statusEl.textContent = `Loading ${model.label || model.id || "model"}...`;
+
+    const [colorTexture, depthTexture, depthPixels] = await Promise.all([
+      loadTexture(colorUrl),
+      loadTexture(depthUrl),
+      loadDepthPixels(depthUrl),
+    ]);
+
+    const imageWidth = colorTexture.image.width;
+    const imageHeight = colorTexture.image.height;
+    if (imageWidth !== depthTexture.image.width || imageHeight !== depthTexture.image.height) {
+      colorTexture.dispose();
+      depthTexture.dispose();
+      throw new Error("Color and depth image sizes do not match.");
+    }
+
+    if (renderState.colorTexture) {
+      renderState.colorTexture.dispose();
+    }
+    if (renderState.sourceDepthTexture) {
+      renderState.sourceDepthTexture.dispose();
+    }
+
+    revokeObjectUrl("color");
+    revokeObjectUrl("depth");
+    revokeObjectUrl("segment");
+
+    colorTexture.encoding = THREE.sRGBEncoding;
+    colorTexture.minFilter = THREE.LinearFilter;
+    colorTexture.magFilter = THREE.LinearFilter;
+    depthTexture.minFilter = THREE.LinearFilter;
+    depthTexture.magFilter = THREE.LinearFilter;
+
+    renderState.sourceMode = "raster";
+    sourceModeEl.value = "raster";
+    renderState.colorTexture = colorTexture;
+    renderState.sourceDepthTexture = depthTexture;
+    renderState.sourceDepthPixels = depthPixels;
+    renderState.imageWidth = imageWidth;
+    renderState.imageHeight = imageHeight;
+    renderState.rasterImageWidth = imageWidth;
+    renderState.rasterImageHeight = imageHeight;
+    renderState.segmentSourcePixels = new Uint8Array(imageWidth * imageHeight * 3).fill(255);
+    renderState.segmentThumbUrl = createSegmentThumbDataUrl(renderState.segmentSourcePixels, imageWidth, imageHeight);
+    renderState.meshEditHandlesByTarget = {};
+    renderState.meshEditHistory = [];
+    renderState.meshEditHistoryIndex = -1;
+    defaults.defaultColorUrl = colorUrl;
+    defaults.defaultDepthUrl = depthUrl;
+
+    rebuildSegments();
+    rebuildDepthModeResources();
+    syncViewerModeUi();
+    rebuildSegmentList();
+    buildMesh();
+    syncThumbs();
   }
 
   async function replaceImage(kind, file) {
@@ -304,6 +377,7 @@ export function createAppActions(deps) {
 
   return {
     buildMesh,
+    loadRasterModel,
     replaceImage,
     rebuildDepthModeResources,
     defaults,

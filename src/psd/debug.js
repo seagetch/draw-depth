@@ -1,15 +1,22 @@
 function ensureDebugImage(panelEl, imageEl, id, alt) {
   if (imageEl) {
+    if (!imageEl.getAttribute("src")) {
+      imageEl.hidden = true;
+    }
     return imageEl;
   }
   const existing = panelEl.querySelector(`#${id}`);
   if (existing) {
+    if (!existing.getAttribute("src")) {
+      existing.hidden = true;
+    }
     return existing;
   }
   const created = panelEl.ownerDocument.createElement("img");
   created.className = "debug-image";
   created.id = id;
   created.alt = alt;
+  created.hidden = true;
   const legend = panelEl.querySelector("#psdDebugLegend");
   if (legend) {
     panelEl.insertBefore(created, legend);
@@ -17,6 +24,19 @@ function ensureDebugImage(panelEl, imageEl, id, alt) {
     panelEl.appendChild(created);
   }
   return created;
+}
+
+function setDebugImageSource(imageEl, sourceUrl) {
+  if (!imageEl) {
+    return;
+  }
+  if (sourceUrl) {
+    imageEl.src = sourceUrl;
+    imageEl.hidden = false;
+    return;
+  }
+  imageEl.removeAttribute("src");
+  imageEl.hidden = true;
 }
 
 export function updatePsdDebugPanel(elements, renderState) {
@@ -45,56 +65,68 @@ export function updatePsdDebugPanel(elements, renderState) {
     "puppetSkeletonImage",
     "Puppet skeletonized mask",
   );
+  const psdThinSurfaceImageEl = ensureDebugImage(
+    psdDebugPanelEl,
+    null,
+    "psdThinSurfaceImage",
+    "PSD thin alpha surface mask",
+  );
+  const psdColorAlphaImageEl = ensureDebugImage(
+    psdDebugPanelEl,
+    null,
+    "psdColorAlphaImage",
+    "PSD color layer alpha map",
+  );
+  const psdDepthAlphaImageEl = ensureDebugImage(
+    psdDebugPanelEl,
+    null,
+    "psdDepthAlphaImage",
+    "PSD depth alpha leak map",
+  );
 
   const hasLayerDebug = renderState.sourceMode === "psd" && renderState.psdDebugLayerIndex >= 0;
   const hasPuppetDebug = !!(renderState.puppetDebugBodyMaskUrl || renderState.puppetDebugSkeletonUrl);
 
   if (!hasLayerDebug && !hasPuppetDebug) {
     psdDebugPanelEl.classList.remove("is-visible");
-    psdDebugImageEl.removeAttribute("src");
-    if (psdDepthImageEl) {
-      psdDepthImageEl.removeAttribute("src");
-    }
-    if (puppetBodyMaskImageEl) {
-      puppetBodyMaskImageEl.removeAttribute("src");
-    }
-    if (puppetSkeletonImageEl) {
-      puppetSkeletonImageEl.removeAttribute("src");
-    }
+    setDebugImageSource(psdDebugImageEl, "");
+    setDebugImageSource(psdDepthImageEl, "");
+    setDebugImageSource(psdThinSurfaceImageEl, "");
+    setDebugImageSource(psdColorAlphaImageEl, "");
+    setDebugImageSource(psdDepthAlphaImageEl, "");
+    setDebugImageSource(puppetBodyMaskImageEl, "");
+    setDebugImageSource(puppetSkeletonImageEl, "");
     return;
   }
 
   const layer = hasLayerDebug ? renderState.psdLayerEntries[renderState.psdDebugLayerIndex] : null;
   if (layer && layer.debugPreviewUrl) {
-    psdDebugImageEl.src = layer.debugPreviewUrl;
-    if (psdDepthImageEl && (layer.currentDepthPreviewUrl || layer.depthPreviewUrl)) {
-      psdDepthImageEl.src = layer.currentDepthPreviewUrl || layer.depthPreviewUrl;
-    }
+    setDebugImageSource(psdDebugImageEl, layer.debugPreviewUrl);
+    setDebugImageSource(psdDepthImageEl, layer.currentDepthPreviewUrl || layer.depthPreviewUrl || "");
+    setDebugImageSource(psdThinSurfaceImageEl, layer.thinSurfacePreviewUrl || "");
+    setDebugImageSource(psdColorAlphaImageEl, layer.colorAlphaPreviewUrl || "");
+    setDebugImageSource(psdDepthAlphaImageEl, layer.depthAlphaPreviewUrl || "");
   } else {
-    psdDebugImageEl.removeAttribute("src");
-    if (psdDepthImageEl) {
-      psdDepthImageEl.removeAttribute("src");
-    }
+    setDebugImageSource(psdDebugImageEl, "");
+    setDebugImageSource(psdDepthImageEl, "");
+    setDebugImageSource(psdThinSurfaceImageEl, "");
+    setDebugImageSource(psdColorAlphaImageEl, "");
+    setDebugImageSource(psdDepthAlphaImageEl, "");
   }
 
-  if (puppetBodyMaskImageEl) {
-    if (renderState.puppetDebugBodyMaskUrl) {
-      puppetBodyMaskImageEl.src = renderState.puppetDebugBodyMaskUrl;
-    } else {
-      puppetBodyMaskImageEl.removeAttribute("src");
-    }
-  }
-  if (puppetSkeletonImageEl) {
-    if (renderState.puppetDebugSkeletonUrl) {
-      puppetSkeletonImageEl.src = renderState.puppetDebugSkeletonUrl;
-    } else {
-      puppetSkeletonImageEl.removeAttribute("src");
-    }
-  }
+  setDebugImageSource(psdDebugPanelEl.querySelector("#psdPremultipliedDepthImage"), "");
+  setDebugImageSource(psdDebugPanelEl.querySelector("#psdOverlapAlphaImage"), "");
+  setDebugImageSource(puppetBodyMaskImageEl, renderState.puppetDebugBodyMaskUrl || "");
+  setDebugImageSource(puppetSkeletonImageEl, renderState.puppetDebugSkeletonUrl || "");
 
   const titleParts = [];
   if (layer && layer.debugPreviewUrl) {
     titleParts.push(`PSD debug: ${layer.name || `Layer ${renderState.psdDebugLayerIndex + 1}`} | removed ${layer.removedDepthPixels || 0}px`);
+    if (layer.thinSurfacePixels) {
+      titleParts.push(`thin alpha surface excluded ${layer.thinSurfacePixels}px`);
+    }
+    titleParts.push(`color low alpha ${layer.colorLowAlphaPixels || 0}px`);
+    titleParts.push(`depth alpha leak ${layer.depthAlphaLeakPixels || 0}px`);
   }
   if (renderState.puppetDebugSummary) {
     titleParts.push(renderState.puppetDebugSummary);

@@ -12,10 +12,10 @@ import {
 } from "./constants.js";
 import { createAppActions } from "./actions.js?v=20260409_1";
 import { createAppResources } from "./resources.js";
-import { createRenderState } from "./state.js?v=20260410_3";
-import { createDepthCore } from "../depth/core.js";
-import { wireControls } from "../dom/controls.js";
-import { getViewerElements } from "../dom/elements.js?v=20260411_2";
+import { createRenderState } from "./state.js?v=20260411_5";
+import { createDepthCore } from "../depth/core.js?v=20260621_2";
+import { wireControls } from "../dom/controls.js?v=20260411_3";
+import { getViewerElements } from "../dom/elements.js?v=20260411_3";
 import { createPuppetPanel } from "../dom/puppetPanel.js?v=20260411_2";
 import { createSegmentPanel } from "../dom/segmentPanel.js?v=20260410_2";
 import {
@@ -25,23 +25,24 @@ import {
 } from "../dom/thumbs.js";
 import { createImageLoaders } from "../io/imageLoader.js";
 import { revokeObjectUrl as revokeObjectUrlState } from "../io/objectUrls.js";
-import { updatePsdDebugPanel as updatePsdDebugPanelView } from "../psd/debug.js?v=20260409_2";
-import { createPsdExport } from "../psd/export.js?v=20260408_1";
-import { createPsdLayers } from "../psd/layers.js?v=20260408_4";
-import { createPsdLoader } from "../psd/loader.js?v=20260409_1";
+import { updatePsdDebugPanel as updatePsdDebugPanelView } from "../psd/debug.js?v=20260621_7";
+import { createPsdExport } from "../psd/export.js?v=20260621_1";
+import { createPsdLayers } from "../psd/layers.js?v=20260621_15";
+import { createPsdLoader } from "../psd/loader.js?v=20260621_11";
 import { createPuppetRuntime } from "../puppet/runtime.js?v=20260411_14";
 import { PUPPET_BONE_IDS } from "../puppet/layerBinding.js?v=20260411_2";
 import { createMeshEditRuntime } from "../meshEdit/runtime.js?v=20260411_2";
 import { initializePsdSupport } from "../psd/psdSupport.js";
-import { createGeometryHelpers } from "../scene/geometry.js?v=20260409_1";
-import { createSceneBuilder } from "../scene/meshBuilder.js?v=20260409_3";
-import { createSceneRuntime } from "../scene/runtime.js";
-import { createShaders } from "../scene/shaders.js";
-import { createThreeContext } from "../scene/threeContext.js";
+import { createGeometryHelpers } from "../scene/geometry.js?v=20260621_12";
+import { createSceneBuilder } from "../scene/meshBuilder.js?v=20260621_22";
+import { createSceneRuntime } from "../scene/runtime.js?v=20260621_3";
+import { createShaders } from "../scene/shaders.js?v=20260621_1";
+import { createThreeContext, updateViewerCameraProjection } from "../scene/threeContext.js?v=20260621_1";
 import { createSegmentAnalysis } from "../segments/analysis.js";
 import { createSegmentDepthRuntime } from "../segments/segmentDepth.js";
 import { createSegmentRuntime } from "../segments/segmentRuntime.js";
 import { createMeshEditPanel } from "../dom/meshEditPanel.js?v=20260411_1";
+import { loadGeneratedMeshDebugData } from "../debug/generatedMeshDebug.js?v=20260412_9";
 
 export function createApp() {
   const THREE = globalThis.THREE;
@@ -50,6 +51,7 @@ export function createApp() {
   const {
     app,
     statusEl,
+    modelSelectEl,
     depthScaleEl,
     depthScaleValueEl,
     meshDetailEl,
@@ -60,6 +62,7 @@ export function createApp() {
     sourceModeEl,
     contourRepairEl,
     surfaceSmoothEl,
+    generatedMeshDebugEnabledEl,
     depthModeEl,
     gridSpecModeEl,
     gridXEl,
@@ -106,7 +109,13 @@ export function createApp() {
   globalThis.__depthDrawRenderer = renderer;
   globalThis.__depthDrawCamera = camera;
   globalThis.__depthDrawControls = controls;
-  const { onResize, animate } = createSceneRuntime({ renderer, scene, camera, controls });
+  const { onResize, animate } = createSceneRuntime({
+    renderer,
+    scene,
+    camera,
+    controls,
+    updateViewerCameraProjection,
+  });
   const { loadTexture, loadImage, loadImagePixels, loadDepthPixels, loadRgbPixels } = createImageLoaders(THREE);
   let puppetPanel = null;
   let meshEditPanel = null;
@@ -222,6 +231,7 @@ export function createApp() {
 
   const psdLayers = createPsdLayers({
     THREE,
+    renderState,
     createMaskedGridDepthPixels,
     createDepthTextureResources,
     createBinaryMaskTexture,
@@ -288,6 +298,8 @@ export function createApp() {
     renderState,
     statusEl,
     buildPreparedPsdLayerEntries,
+    flattenPsdLayers,
+    getCanvasImageData,
   });
   const { saveCurrentPsdDepthAsPsd } = psdExport;
 
@@ -307,6 +319,13 @@ export function createApp() {
   const { rebuildSegments } = segmentRuntime;
 
   function syncThumbs() {
+    if (!renderState.currentModel) {
+      colorThumbEl.removeAttribute("src");
+      depthThumbEl.removeAttribute("src");
+      segmentThumbEl.removeAttribute("src");
+      return;
+    }
+
     syncThumbsView(
       { colorThumbEl, depthThumbEl, segmentThumbEl },
       renderState,
@@ -342,7 +361,26 @@ export function createApp() {
     puppetSwapSidesButtonEl.style.background = active ? "rgba(255, 180, 120, 0.28)" : "";
   }
 
-  const { buildMesh, replaceImage, rebuildDepthModeResources } = createAppActions({
+  async function setGeneratedMeshDebugEnabled(enabled) {
+    if (enabled && !renderState.generatedMeshDebugData) {
+      statusEl.textContent = "Loading generated mesh debug data...";
+      renderState.generatedMeshDebugData = await loadGeneratedMeshDebugData();
+      const debugLayerCount = renderState.generatedMeshDebugData?.manifest?.layers?.length || 0;
+      statusEl.textContent = `Loaded generated mesh debug data (${debugLayerCount} layers).`;
+    }
+    renderState.generatedMeshDebugEnabled = !!enabled;
+    if (generatedMeshDebugEnabledEl) {
+      generatedMeshDebugEnabledEl.checked = !!enabled;
+    }
+    buildMesh();
+    if (enabled) {
+      const visibleDebugLayers = renderState.psdLayerDebugMeshes?.length || 0;
+      statusEl.textContent = `Generated meshes: ${visibleDebugLayers} debug overlays visible.`;
+    }
+    refreshStatusCounts();
+  }
+
+  const { buildMesh, loadRasterModel, replaceImage, rebuildDepthModeResources } = createAppActions({
     THREE,
     scene,
     renderState,
@@ -387,6 +425,162 @@ export function createApp() {
   });
   meshEditRuntime.setOnGeometryChanged(() => {
     buildMesh();
+  });
+
+  let rasterModels = [];
+
+  function normalizeAssetPath(url) {
+    return (url || "").replace(/^\./, "").split("?")[0];
+  }
+
+  function withCacheBust(url) {
+    const separator = url.includes("?") ? "&" : "?";
+    return `${url}${separator}v=${Date.now()}`;
+  }
+
+  function basenameFromUrl(url) {
+    const pathPart = normalizeAssetPath(url).split("/").pop() || "";
+    return pathPart.replace(/\.[^.]+$/, "");
+  }
+
+  function createPsdExportFileName(model) {
+    const colorStem = basenameFromUrl(model?.colorUrl || defaults.defaultPsdColorUrl || "depth");
+    const depthStem = basenameFromUrl(model?.depthPsdUrl || model?.stableDepthUrl || "");
+    if (!depthStem) {
+      return `${colorStem}-depth.psd`;
+    }
+    return `${depthStem}.psd`;
+  }
+
+  function syncPsdSaveButtonLabel() {
+    if (!saveDepthPsdButtonEl) {
+      return;
+    }
+    if (renderState.sourceMode !== "psd" || !renderState.currentPsdExportName) {
+      saveDepthPsdButtonEl.textContent = "Save depth PSD";
+      saveDepthPsdButtonEl.disabled = true;
+      return;
+    }
+    saveDepthPsdButtonEl.textContent = `Save ${renderState.currentPsdExportName}`;
+    saveDepthPsdButtonEl.disabled = false;
+  }
+
+  renderState.currentPsdColorUrl = "";
+  renderState.currentPsdDepthUrl = "";
+  renderState.currentPsdExportName = "";
+  syncPsdSaveButtonLabel();
+
+  function syncModelSelect(selectedModelId = "") {
+    if (!modelSelectEl) {
+      return;
+    }
+    modelSelectEl.innerHTML = "";
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "Select a model...";
+    modelSelectEl.append(placeholder);
+    if (!rasterModels.length) {
+      placeholder.textContent = "No data models found";
+      modelSelectEl.disabled = true;
+      return;
+    }
+
+    for (const model of rasterModels) {
+      const option = document.createElement("option");
+      option.value = model.id;
+      option.textContent = model.label;
+      modelSelectEl.append(option);
+    }
+    modelSelectEl.disabled = false;
+    modelSelectEl.value = selectedModelId || "";
+  }
+
+  async function loadRasterModelCatalog() {
+    if (!modelSelectEl) {
+      return;
+    }
+    try {
+      const response = await fetch("./api/models", { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const catalog = await response.json();
+      rasterModels = Array.isArray(catalog.models) ? catalog.models : [];
+      syncModelSelect();
+      statusEl.textContent = rasterModels.length
+        ? "Select a model."
+        : "No data models found.";
+    } catch (error) {
+      console.error(error);
+      rasterModels = [];
+      syncModelSelect();
+      statusEl.textContent = `Failed to load model list: ${error.message}`;
+    }
+  }
+
+  async function loadPsdModel(model) {
+    if (!model?.colorUrl || (!model?.depthPsdUrl && !model?.stableDepthUrl)) {
+      throw new Error("PSD model is missing color or depth URLs.");
+    }
+
+    const colorUrl = withCacheBust(model.colorUrl);
+    const depthPsdUrl = model.depthPsdUrl ? withCacheBust(model.depthPsdUrl) : null;
+    const stableDepthUrl = model.stableDepthUrl ? withCacheBust(model.stableDepthUrl) : defaults.defaultPsdStableDepthUrl;
+    statusEl.textContent = `Loading ${model.label || model.id || "PSD model"}...`;
+
+    defaults.defaultPsdColorUrl = colorUrl;
+    defaults.defaultPsdDepthPsdUrl = depthPsdUrl;
+    defaults.defaultPsdStableDepthUrl = stableDepthUrl;
+    renderState.currentModel = model;
+    renderState.currentPsdColorUrl = model.colorUrl || "";
+    renderState.currentPsdDepthUrl = model.depthPsdUrl || model.stableDepthUrl || "";
+    renderState.currentPsdExportName = createPsdExportFileName(model);
+    renderState.pendingPsdColorBuffer = await fetch(colorUrl).then((response) => {
+      if (!response.ok) {
+        throw new Error(`Failed to load ${colorUrl}`);
+      }
+      return response.arrayBuffer();
+    });
+    renderState.pendingPsdDepthBuffer = null;
+    renderState.psdStableDepthPixels = null;
+    renderState.psdStableDepthWidth = 0;
+    renderState.psdStableDepthHeight = 0;
+
+    await loadPsdPair(renderState.pendingPsdColorBuffer, { depthPsdUrl, stableDepthUrl });
+    renderState.sourceMode = "psd";
+    sourceModeEl.value = "psd";
+    renderState.meshEditHandlesByTarget = {};
+    renderState.meshEditHistory = [];
+    renderState.meshEditHistoryIndex = -1;
+    syncViewerModeUi();
+    rebuildSegmentList();
+    buildMesh();
+    updatePsdDebugPanel();
+    syncThumbs();
+    meshEditPanel?.sync();
+    syncPsdSaveButtonLabel();
+  }
+
+  modelSelectEl?.addEventListener("change", async () => {
+    const selectedModel = rasterModels.find((model) => model.id === modelSelectEl.value);
+    if (!selectedModel) {
+      return;
+    }
+    try {
+      if (selectedModel.type === "psd") {
+        await loadPsdModel(selectedModel);
+        return;
+      }
+      await loadRasterModel(selectedModel);
+      renderState.currentModel = selectedModel;
+      renderState.currentPsdColorUrl = "";
+      renderState.currentPsdDepthUrl = "";
+      renderState.currentPsdExportName = "";
+      syncPsdSaveButtonLabel();
+    } catch (error) {
+      console.error(error);
+      statusEl.textContent = `Failed: ${error.message}`;
+    }
   });
 
   const segmentPanel = createSegmentPanel({
@@ -448,6 +642,7 @@ export function createApp() {
       sourceModeEl,
       contourRepairEl,
       surfaceSmoothEl,
+      generatedMeshDebugEnabledEl,
       depthModeEl,
       gridSpecModeEl,
       gridXEl,
@@ -476,6 +671,7 @@ export function createApp() {
     updatePsdDebugPanel,
     ensureDefaultPsdPairLoaded,
     saveCurrentPsdDepthAsPsd,
+    setGeneratedMeshDebugEnabled,
     replaceImage,
     onResize,
   });
@@ -486,52 +682,15 @@ export function createApp() {
   });
 
   async function init() {
-    const [colorTexture, depthTexture, depthPixels, segmentImage] = await Promise.all([
-      loadTexture(defaults.defaultColorUrl),
-      loadTexture(defaults.defaultDepthUrl),
-      loadDepthPixels(defaults.defaultDepthUrl),
-      loadRgbPixels(defaults.defaultSegmentUrl),
-    ]);
-
-    const imageWidth = colorTexture.image.width;
-    const imageHeight = colorTexture.image.height;
-
-    if (imageWidth !== depthTexture.image.width || imageHeight !== depthTexture.image.height) {
-      throw new Error("Color and depth image sizes do not match.");
-    }
-    if (imageWidth !== segmentImage.width || imageHeight !== segmentImage.height) {
-      throw new Error("Segment image size must match the color/depth images.");
-    }
-
-    colorTexture.encoding = THREE.sRGBEncoding;
-    colorTexture.minFilter = THREE.LinearFilter;
-    colorTexture.magFilter = THREE.LinearFilter;
-    depthTexture.minFilter = THREE.LinearFilter;
-    depthTexture.magFilter = THREE.LinearFilter;
-
-    renderState.colorTexture = colorTexture;
-    renderState.sourceDepthTexture = depthTexture;
-    renderState.sourceDepthPixels = depthPixels;
-    renderState.segmentSourcePixels = segmentImage.pixels;
-    renderState.imageWidth = imageWidth;
-    renderState.imageHeight = imageHeight;
-    renderState.rasterImageWidth = imageWidth;
-    renderState.rasterImageHeight = imageHeight;
-    renderState.segmentThumbUrl = createSegmentThumbDataUrl(renderState.segmentSourcePixels, imageWidth, imageHeight);
-
-    rebuildSegments();
-    rebuildDepthModeResources();
-    sourceModeEl.value = "psd";
-    renderState.sourceMode = "psd";
-    statusEl.textContent = "Loading PSD pair...";
-    await ensureDefaultPsdPairLoaded();
+    sourceModeEl.value = "raster";
+    renderState.sourceMode = "raster";
     syncViewerModeUi();
     rebuildSegmentList();
-    buildMesh();
     syncPuppetSwapButton();
     syncThumbs();
     updatePsdDebugPanel();
     meshEditPanel?.sync();
+    await loadRasterModelCatalog();
     puppetRuntime.attachInteraction();
     meshEditRuntime.attachInteraction();
     onResize();

@@ -5,6 +5,7 @@ export function createPsdLayers(deps) {
     createDepthTextureResources,
     createBinaryMaskTexture,
     clamp,
+    renderState,
     elements,
   } = deps
   const {
@@ -18,6 +19,35 @@ export function createPsdLayers(deps) {
     interpModeEl,
   } = elements
 
+  function flattenPsdLayers(layers, output = []) {
+    for (let i = 0; i < layers.length; i += 1) {
+      const layer = layers[i];
+      if (layer.hidden) {
+        continue;
+      }
+
+      if (layer.children && layer.children.length) {
+        flattenPsdLayers(layer.children, output);
+        continue;
+      }
+
+      if (!layer.canvas) {
+        continue;
+      }
+
+      output.push({
+        name: layer.name || "",
+        left: layer.left || 0,
+        top: layer.top || 0,
+        width: layer.canvas.width,
+        height: layer.canvas.height,
+        canvas: layer.canvas,
+      });
+    }
+
+    return output;
+  }
+
   function createPsdLayerEntries(colorPsd, depthPsd, stableDepthPixels) {
     const colorLayers = flattenPsdLayers(colorPsd.children || []);
     const depthLayers = depthPsd ? flattenPsdLayers(depthPsd.children || []) : null;
@@ -27,6 +57,7 @@ export function createPsdLayers(deps) {
     }
   
     const layerSources = [];
+    const depthDebugStats = [];
   
     for (let i = 0; i < colorLayers.length; i += 1) {
       const colorLayer = colorLayers[i];
@@ -42,12 +73,12 @@ export function createPsdLayers(deps) {
   
       const colorImageData = getCanvasImageData(colorLayer.canvas);
       const colorMaskPixels = extractLayerMaskPixels(colorImageData.data);
+      const colorSurfaceMaskPixels = extractLayerMaskPixels(colorImageData.data);
       const depthLayer = depthLayerLookup
         ? takeMatchedPsdLayer(depthLayerLookup, colorLayer, i)
         : (depthLayers && depthLayers[i] ? depthLayers[i] : null);
-      const depthImageData = depthLayer ? getCanvasImageData(depthLayer.canvas) : null;
-      const sampledDepthRgba = depthImageData && depthLayer
-        ? sampleLayerRgbaToTargetLayer(depthImageData, depthLayer, colorLayer)
+      const depthImageData = depthLayer
+        ? getCanvasImageData(depthLayer.canvas)
         : null;
       const rawDepthPixels = depthImageData
         ? sampleDepthPixelsToTargetLayer(
@@ -59,17 +90,45 @@ export function createPsdLayers(deps) {
             minAlpha: depthPsd ? 0 : 1,
           },
         )
-        : (depthPsd ? new Uint8Array(colorLayer.width * colorLayer.height) : null);
-      const depthPixels = depthPsd && depthImageData
-        ? repairDirectDepthEdgePixels(
-          rawDepthPixels,
-          sampledDepthRgba,
-          colorMaskPixels,
-          colorLayer.width,
-          colorLayer.height,
-        )
-        : rawDepthPixels;
+        : (depthPsd ? null : null);
+      if (depthPsd && !rawDepthPixels) {
+        console.warn("[depth-draw] Missing matching PSD depth layer", {
+          colorLayer: colorLayer.name || `Layer ${i + 1}`,
+          left: colorLayer.left,
+          top: colorLayer.top,
+          width: colorLayer.width,
+          height: colorLayer.height,
+        });
+      }
+      const depthPixels = rawDepthPixels;
       const maskPixels = colorMaskPixels;
+      if (depthPsd) {
+        depthDebugStats.push({
+          name: colorLayer.name || `Layer ${i + 1}`,
+          depthLayerName: depthLayer ? depthLayer.name : "",
+          depthLayerLeft: depthLayer ? depthLayer.left : null,
+          depthLayerTop: depthLayer ? depthLayer.top : null,
+          depthLayerWidth: depthLayer ? depthLayer.width : null,
+          depthLayerHeight: depthLayer ? depthLayer.height : null,
+          source: depthImageData ? "matched-black-composited-depth-layer" : "empty",
+          left: colorLayer.left,
+          top: colorLayer.top,
+          ...computeMaskedDepthStats(
+            depthPixels || new Uint8Array(colorLayer.width * colorLayer.height),
+            maskPixels,
+            colorLayer.width,
+            colorLayer.height,
+          ),
+        });
+      }
+      const depthAlphaPreview = depthImageData
+        ? createDepthAlphaLeakPreviewUrl(depthImageData.width, depthImageData.height, depthImageData.data)
+        : null;
+      const colorAlphaPreview = createColorAlphaPreviewUrl(
+        colorLayer.width,
+        colorLayer.height,
+        colorImageData.data,
+      );
   
       layerSources.push({
         name: colorLayer.name || `Layer ${layerSources.length + 1}`,
@@ -82,7 +141,12 @@ export function createPsdLayers(deps) {
         colorTexture,
         colorImageData,
         maskPixels,
+        surfaceMaskPixels: colorSurfaceMaskPixels,
         depthImageData,
+        colorAlphaPreviewUrl: colorAlphaPreview.url,
+        colorLowAlphaPixels: colorAlphaPreview.lowAlphaCount,
+        depthAlphaPreviewUrl: depthAlphaPreview ? depthAlphaPreview.url : "",
+        depthAlphaLeakPixels: depthAlphaPreview ? depthAlphaPreview.count : 0,
         directDepthPixels: depthPixels,
         depthMaskPixels: maskPixels,
       });
@@ -108,20 +172,42 @@ export function createPsdLayers(deps) {
     for (let i = 0; i < mergedLayerSources.length; i += 1) {
       const layer = mergedLayerSources[i];
       const maskPixels = extractLayerMaskPixels(layer.colorImageData.data);
+      const surfaceMaskPixels = layer.surfaceMaskPixels || maskPixels;
       if (depthPsd) {
         const rawDepthPixels = (layer.directDepthPixels || new Uint8Array(layer.width * layer.height)).slice();
+        const pruneResult = {
+          pixels: rawDepthPixels,
+          debugState: new Uint8Array(rawDepthPixels.length),
+          debugScore: new Uint8Array(rawDepthPixels.length),
+        };
+        if (contourRepairEl.checked) {
+          const contourBandMask = buildLayerContourBandMask(maskPixels, layer.width, layer.height, 2);
+          for (let p = 0; p < rawDepthPixels.length; p += 1) {
+            if (contourBandMask[p]) {
+              rawDepthPixels[p] = 0;
+              pruneResult.debugState[p] = 5;
+            }
+          }
+        }
+        const erodedPositiveMask = erodePositiveDepthMask(rawDepthPixels, layer.width, layer.height, 1);
+        let removedDepthPixels = 0;
+        for (let p = 0; p < rawDepthPixels.length; p += 1) {
+          if (maskPixels[p] && rawDepthPixels[p] > 0 && !erodedPositiveMask[p]) {
+            rawDepthPixels[p] = 0;
+            pruneResult.debugState[p] = 5;
+            removedDepthPixels += 1;
+          }
+        }
+        const inpaintResult = inpaintMaskedLayerDepth(rawDepthPixels, maskPixels, layer.width, layer.height);
         pendingLayers.push({
           layer,
           hasDirectDepth: true,
           maskPixels,
-          pruneResult: {
-            pixels: rawDepthPixels,
-            debugState: new Uint8Array(rawDepthPixels.length),
-            debugScore: new Uint8Array(rawDepthPixels.length),
-          },
-          removedDepthPixels: 0,
-          inpaintFilledMask: new Uint8Array(rawDepthPixels.length),
-          inpaintedDepthPixels: rawDepthPixels,
+          surfaceMaskPixels,
+          pruneResult,
+          removedDepthPixels,
+          inpaintFilledMask: inpaintResult.filledMask,
+          inpaintedDepthPixels: inpaintResult.pixels,
         });
         continue;
       }
@@ -198,6 +284,7 @@ export function createPsdLayers(deps) {
     for (let i = 0; i < pendingLayers.length; i += 1) {
       const pending = pendingLayers[i];
       const { layer, maskPixels, pruneResult } = pending;
+      const surfaceMaskPixels = pending.surfaceMaskPixels || maskPixels;
       const smoothedDepthPixels = pending.inpaintedDepthPixels;
       const finalDepthPixels = pending.hasDirectDepth || depthModeEl.value === "raw"
         ? smoothedDepthPixels
@@ -214,11 +301,22 @@ export function createPsdLayers(deps) {
         );
       const renderDepthMask = new Uint8Array(finalDepthPixels.length);
       for (let p = 0; p < finalDepthPixels.length; p += 1) {
-        renderDepthMask[p] = maskPixels[p] && finalDepthPixels[p] > 0 ? 1 : 0;
+        renderDepthMask[p] = surfaceMaskPixels[p] && finalDepthPixels[p] > 0 ? 1 : 0;
       }
-      const depthTexture = createDepthTextureResources(layer.width, layer.height, finalDepthPixels).texture;
+      const depthTexture = createDepthTextureResources(
+        layer.width,
+        layer.height,
+        finalDepthPixels,
+      ).texture;
       const maskTexture = createBinaryMaskTexture(layer.width, layer.height, renderDepthMask);
       const debugTexture = createPsdDebugTexture(layer.width, layer.height, maskPixels, pruneResult.debugState, pruneResult.debugScore);
+      const thinSurfacePreview = createThinSurfacePreviewUrl(
+        layer.width,
+        layer.height,
+        layer.colorImageData.data,
+        maskPixels,
+        surfaceMaskPixels,
+      );
       const depthPreviewUrl = createPsdDepthPreviewUrl(
         layer.width,
         layer.height,
@@ -242,6 +340,12 @@ export function createPsdLayers(deps) {
         maskTexture,
         debugTexture: debugTexture.texture,
         debugPreviewUrl: debugTexture.url,
+        thinSurfacePreviewUrl: thinSurfacePreview.url,
+        thinSurfacePixels: thinSurfacePreview.count,
+        colorAlphaPreviewUrl: layer.colorAlphaPreviewUrl || "",
+        colorLowAlphaPixels: layer.colorLowAlphaPixels || 0,
+        depthAlphaPreviewUrl: layer.depthAlphaPreviewUrl || "",
+        depthAlphaLeakPixels: layer.depthAlphaLeakPixels || 0,
         depthPreviewUrl,
         inpaintFilledMask: pending.inpaintFilledMask,
         baseDepthPixels: finalDepthPixels.slice(),
@@ -249,12 +353,160 @@ export function createPsdLayers(deps) {
         renderDepthMask,
         hasDirectDepth: !!pending.hasDirectDepth,
         maskPixels,
+        surfaceMaskPixels,
         removedDepthPixels: pending.removedDepthPixels,
         visible: true,
       });
     }
-  
+
+    if (depthPsd) {
+      writeDepthDebugStats({
+        image: {
+          width: colorPsd.width,
+          height: colorPsd.height,
+        },
+        globalDepth: stableDepthPixels
+          ? computeMaskedDepthStats(stableDepthPixels, null, colorPsd.width, colorPsd.height)
+          : null,
+        sourceLayers: depthDebugStats,
+        finalLayers: entries.map((layer) => ({
+          name: layer.name,
+          left: layer.left,
+          top: layer.top,
+          ...computeMaskedDepthStats(layer.depthPixels, layer.renderDepthMask, layer.width, layer.height),
+        })),
+      });
+    }
+
     return entries;
+  }
+
+  function computeBinaryMaskBounds(maskPixels, width, height) {
+    let minX = width;
+    let minY = height;
+    let maxX = -1;
+    let maxY = -1;
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        if (!maskPixels[y * width + x]) {
+          continue;
+        }
+        if (x < minX) {
+          minX = x;
+        }
+        if (y < minY) {
+          minY = y;
+        }
+        if (x > maxX) {
+          maxX = x;
+        }
+        if (y > maxY) {
+          maxY = y;
+        }
+      }
+    }
+    if (maxX < minX || maxY < minY) {
+      return null;
+    }
+    return {
+      left: minX,
+      top: minY,
+      right: maxX,
+      bottom: maxY,
+      width: maxX - minX + 1,
+      height: maxY - minY + 1,
+    };
+  }
+
+  function computeMaskedDepthStats(depthPixels, maskPixels, width, height) {
+    let masked = 0;
+    let zero = 0;
+    let min = 255;
+    let max = 0;
+    let adjacentMax = 0;
+    let adjacentMaxAt = null;
+    const adjacentDeltas = [];
+
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const index = y * width + x;
+        if (maskPixels && !maskPixels[index]) {
+          continue;
+        }
+        const depth = depthPixels[index];
+        masked += 1;
+        if (depth === 0) {
+          zero += 1;
+        }
+        if (depth < min) {
+          min = depth;
+        }
+        if (depth > max) {
+          max = depth;
+        }
+        if (x + 1 < width && (!maskPixels || maskPixels[index + 1])) {
+          const delta = Math.abs(depth - depthPixels[index + 1]);
+          if (delta > adjacentMax) {
+            adjacentMax = delta;
+            adjacentMaxAt = {
+              x,
+              y,
+              direction: "x",
+              a: depth,
+              b: depthPixels[index + 1],
+            };
+          }
+          adjacentDeltas.push(delta);
+        }
+        if (y + 1 < height && (!maskPixels || maskPixels[index + width])) {
+          const delta = Math.abs(depth - depthPixels[index + width]);
+          if (delta > adjacentMax) {
+            adjacentMax = delta;
+            adjacentMaxAt = {
+              x,
+              y,
+              direction: "y",
+              a: depth,
+              b: depthPixels[index + width],
+            };
+          }
+          adjacentDeltas.push(delta);
+        }
+      }
+    }
+
+    adjacentDeltas.sort((a, b) => a - b);
+    const p95Index = adjacentDeltas.length ? Math.floor((adjacentDeltas.length - 1) * 0.95) : 0;
+    const p99Index = adjacentDeltas.length ? Math.floor((adjacentDeltas.length - 1) * 0.99) : 0;
+    return {
+      width,
+      height,
+      masked,
+      zero,
+      zeroRatio: masked ? zero / masked : 0,
+      min: masked ? min : 0,
+      max: masked ? max : 0,
+      range: masked ? max - min : 0,
+      adjacentMax,
+      adjacentMaxAt,
+      adjacentP95: adjacentDeltas[p95Index] || 0,
+      adjacentP99: adjacentDeltas[p99Index] || 0,
+    };
+  }
+
+  function writeDepthDebugStats(payload) {
+    try {
+      const serialized = JSON.stringify(payload);
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem("depthDrawDebugStats", serialized);
+      }
+      if (typeof document !== "undefined" && document.documentElement) {
+        document.documentElement.setAttribute("data-depth-draw-debug-stats", serialized);
+      }
+      console.info("[depth-draw] PSD depth debug stats", payload);
+    } catch (error) {
+      console.warn("[depth-draw] Failed to write PSD depth debug stats", error);
+    }
   }
 
   function pruneOutlierSeedDepthClusters(depthPixels, debugState, debugScore, maskPixels, width, height, threshold) {
@@ -427,6 +679,108 @@ export function createPsdLayers(deps) {
     };
   }
 
+  function createThinSurfacePreviewUrl(width, height, rgbaPixels, maskPixels, surfaceMaskPixels) {
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    const imageData = context.createImageData(width, height);
+    let count = 0;
+    for (let pixelIndex = 0; pixelIndex < maskPixels.length; pixelIndex += 1) {
+      const out = pixelIndex * 4;
+      const alpha = rgbaPixels[out + 3];
+      if (maskPixels[pixelIndex] && !surfaceMaskPixels[pixelIndex]) {
+        imageData.data[out] = 255;
+        imageData.data[out + 1] = Math.max(32, alpha);
+        imageData.data[out + 2] = 255;
+        imageData.data[out + 3] = 255;
+        count += 1;
+      } else if (surfaceMaskPixels[pixelIndex]) {
+        imageData.data[out] = 16;
+        imageData.data[out + 1] = 96;
+        imageData.data[out + 2] = 48;
+        imageData.data[out + 3] = 192;
+      } else {
+        imageData.data[out] = 0;
+        imageData.data[out + 1] = 0;
+        imageData.data[out + 2] = 0;
+        imageData.data[out + 3] = 255;
+      }
+    }
+    context.putImageData(imageData, 0, 0);
+    return {
+      count,
+      url: canvas.toDataURL("image/png"),
+    };
+  }
+
+  function createColorAlphaPreviewUrl(width, height, rgbaPixels) {
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    const imageData = context.createImageData(width, height);
+    let lowAlphaCount = 0;
+    let opaqueCount = 0;
+    for (let pixelIndex = 0; pixelIndex < rgbaPixels.length >> 2; pixelIndex += 1) {
+      const out = pixelIndex * 4;
+      const alpha = rgbaPixels[out + 3];
+      if (alpha === 0) {
+        imageData.data[out] = 0;
+        imageData.data[out + 1] = 0;
+        imageData.data[out + 2] = 0;
+      } else if (alpha < 255) {
+        imageData.data[out] = 255;
+        imageData.data[out + 1] = Math.max(24, alpha);
+        imageData.data[out + 2] = 0;
+        lowAlphaCount += 1;
+      } else {
+        imageData.data[out] = 16;
+        imageData.data[out + 1] = 110;
+        imageData.data[out + 2] = 64;
+        opaqueCount += 1;
+      }
+      imageData.data[out + 3] = 255;
+    }
+    context.putImageData(imageData, 0, 0);
+    return {
+      lowAlphaCount,
+      opaqueCount,
+      url: canvas.toDataURL("image/png"),
+    };
+  }
+
+  function createDepthAlphaLeakPreviewUrl(width, height, rgbaPixels) {
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    const imageData = context.createImageData(width, height);
+    let count = 0;
+    for (let pixelIndex = 0; pixelIndex < rgbaPixels.length >> 2; pixelIndex += 1) {
+      const out = pixelIndex * 4;
+      const depth = rgbaPixels[out];
+      const alpha = rgbaPixels[out + 3];
+      if (alpha !== 255) {
+        imageData.data[out] = 255;
+        imageData.data[out + 1] = 0;
+        imageData.data[out + 2] = 0;
+        imageData.data[out + 3] = 255;
+        count += 1;
+      } else {
+        imageData.data[out] = depth;
+        imageData.data[out + 1] = depth;
+        imageData.data[out + 2] = depth;
+        imageData.data[out + 3] = 255;
+      }
+    }
+    context.putImageData(imageData, 0, 0);
+    return {
+      count,
+      url: canvas.toDataURL("image/png"),
+    };
+  }
+
   function createPsdDepthPreviewUrl(width, height, depthPixels, maskPixels, filledMask = null) {
     const canvas = document.createElement("canvas");
     canvas.width = width;
@@ -437,7 +791,10 @@ export function createPsdLayers(deps) {
     for (let pixelIndex = 0; pixelIndex < depthPixels.length; pixelIndex += 1) {
       const imageIndex = pixelIndex * 4;
       if (!maskPixels[pixelIndex]) {
-        imageData.data[imageIndex + 3] = 0;
+        imageData.data[imageIndex] = 0;
+        imageData.data[imageIndex + 1] = 0;
+        imageData.data[imageIndex + 2] = 0;
+        imageData.data[imageIndex + 3] = 255;
         continue;
       }
 
@@ -447,9 +804,9 @@ export function createPsdLayers(deps) {
         imageData.data[imageIndex + 1] = depth;
         imageData.data[imageIndex + 2] = depth;
       } else {
-        imageData.data[imageIndex] = 0;
+        imageData.data[imageIndex] = depth;
         imageData.data[imageIndex + 1] = depth;
-        imageData.data[imageIndex + 2] = 0;
+        imageData.data[imageIndex + 2] = depth;
       }
       imageData.data[imageIndex + 3] = 255;
     }
@@ -461,14 +818,6 @@ export function createPsdLayers(deps) {
   function getCanvasImageData(canvas) {
     const context = canvas.getContext("2d", { willReadFrequently: true });
     return context.getImageData(0, 0, canvas.width, canvas.height);
-  }
-  
-  function intersectBinaryMasks(maskA, maskB) {
-    const output = new Uint8Array(maskA.length);
-    for (let i = 0; i < maskA.length; i += 1) {
-      output[i] = maskA[i] && maskB[i] ? 1 : 0;
-    }
-    return output;
   }
   
   function mergePsdFaceFeatureLayers(layerSources, imageWidth, imageHeight, options = {}) {
@@ -928,14 +1277,14 @@ export function createPsdLayers(deps) {
     }
   }
   
-  function extractLayerMaskPixels(rgbaPixels) {
+  function extractLayerMaskPixels(rgbaPixels, minAlpha = 1) {
     const maskPixels = new Uint8Array(rgbaPixels.length >> 2);
     for (let i = 0, p = 0; i < rgbaPixels.length; i += 4, p += 1) {
-      maskPixels[p] = rgbaPixels[i + 3] > 0 ? 1 : 0;
+      maskPixels[p] = rgbaPixels[i + 3] >= minAlpha ? 1 : 0;
     }
     return maskPixels;
   }
-  
+
   function extractLayerRelativeDepthPixels(rgbaPixels) {
     const depthPixels = new Uint8Array(rgbaPixels.length >> 2);
     for (let i = 0, p = 0; i < rgbaPixels.length; i += 4, p += 1) {
@@ -2071,35 +2420,6 @@ export function createPsdLayers(deps) {
     return nextTail;
   }
   
-  function flattenPsdLayers(layers, output = []) {
-    for (let i = 0; i < layers.length; i += 1) {
-      const layer = layers[i];
-      if (layer.hidden) {
-        continue;
-      }
-  
-      if (layer.children && layer.children.length) {
-        flattenPsdLayers(layer.children, output);
-        continue;
-      }
-  
-      if (!layer.canvas) {
-        continue;
-      }
-  
-      output.push({
-        name: layer.name || "",
-        left: layer.left || 0,
-        top: layer.top || 0,
-        width: layer.canvas.width,
-        height: layer.canvas.height,
-        canvas: layer.canvas,
-      });
-    }
-  
-    return output;
-  }
-  
   function extractDepthPixelsFromCanvas(canvas, options = {}) {
     const ignoreAlpha = !!options.ignoreAlpha;
     const minAlpha = options.minAlpha == null ? (ignoreAlpha ? 0 : 1) : options.minAlpha;
@@ -2108,8 +2428,7 @@ export function createPsdLayers(deps) {
     const pixels = new Uint8Array(canvas.width * canvas.height);
   
     for (let i = 0, p = 0; i < imageData.data.length; i += 4, p += 1) {
-      const alpha = imageData.data[i + 3];
-      if (alpha < minAlpha || (!ignoreAlpha && alpha === 0)) {
+      if (!ignoreAlpha && imageData.data[i + 3] < minAlpha) {
         pixels[p] = 0;
         continue;
       }
@@ -2159,8 +2478,7 @@ export function createPsdLayers(deps) {
           sourceHeight - 1,
         );
         const srcIndex = (sy * sourceWidth + sx) * 4;
-        const alpha = depthImageData.data[srcIndex + 3];
-        if (alpha < minAlpha || (!ignoreAlpha && alpha === 0)) {
+        if (!ignoreAlpha && depthImageData.data[srcIndex + 3] < minAlpha) {
           continue;
         }
         pixels[y * targetWidth + x] = depthImageData.data[srcIndex];
@@ -2169,125 +2487,7 @@ export function createPsdLayers(deps) {
   
     return pixels;
   }
-  
-  function sampleLayerRgbaToTargetLayer(imageData, sourceLayer, targetLayer) {
-    const targetWidth = targetLayer.width || (targetLayer.canvas ? targetLayer.canvas.width : 0);
-    const targetHeight = targetLayer.height || (targetLayer.canvas ? targetLayer.canvas.height : 0);
-    const sourceWidth = imageData.width;
-    const sourceHeight = imageData.height;
-    const sampled = new Uint8ClampedArray(targetWidth * targetHeight * 4);
-    const sourceLeft = sourceLayer.left || 0;
-    const sourceTop = sourceLayer.top || 0;
-    const sourceLayerWidth = sourceLayer.width || sourceWidth;
-    const sourceLayerHeight = sourceLayer.height || sourceHeight;
-    const targetLeft = targetLayer.left || 0;
-    const targetTop = targetLayer.top || 0;
-  
-    for (let y = 0; y < targetHeight; y += 1) {
-      for (let x = 0; x < targetWidth; x += 1) {
-        const globalX = targetLeft + x + 0.5;
-        const globalY = targetTop + y + 0.5;
-        const sourceLocalX = globalX - sourceLeft;
-        const sourceLocalY = globalY - sourceTop;
-        if (
-          sourceLocalX < 0 ||
-          sourceLocalY < 0 ||
-          sourceLocalX >= sourceLayerWidth ||
-          sourceLocalY >= sourceLayerHeight
-        ) {
-          continue;
-        }
-        const sx = clamp(
-          Math.round((sourceLocalX * sourceWidth) / Math.max(1, sourceLayerWidth) - 0.5),
-          0,
-          sourceWidth - 1,
-        );
-        const sy = clamp(
-          Math.round((sourceLocalY * sourceHeight) / Math.max(1, sourceLayerHeight) - 0.5),
-          0,
-          sourceHeight - 1,
-        );
-        const srcIndex = (sy * sourceWidth + sx) * 4;
-        const dstIndex = (y * targetWidth + x) * 4;
-        sampled[dstIndex] = imageData.data[srcIndex];
-        sampled[dstIndex + 1] = imageData.data[srcIndex + 1];
-        sampled[dstIndex + 2] = imageData.data[srcIndex + 2];
-        sampled[dstIndex + 3] = imageData.data[srcIndex + 3];
-      }
-    }
-  
-    return sampled;
-  }
-  
-  function repairDirectDepthEdgePixels(sourceDepthPixels, rgbaPixels, maskPixels, width, height) {
-    const depthPixels = sourceDepthPixels.slice();
-    const targetMask = new Uint8Array(depthPixels.length);
-    const queue = new Int32Array(depthPixels.length);
-    const queued = new Uint8Array(depthPixels.length);
-    let head = 0;
-    let tail = 0;
-  
-    for (let i = 0; i < depthPixels.length; i += 1) {
-      if (!maskPixels[i]) {
-        depthPixels[i] = 0;
-        continue;
-      }
-      const alpha = rgbaPixels[i * 4 + 3];
-      if (alpha < 254) {
-        targetMask[i] = 1;
-        depthPixels[i] = 0;
-      }
-    }
-  
-    for (let i = 0; i < depthPixels.length; i += 1) {
-      if (!targetMask[i] || depthPixels[i] > 0) {
-        continue;
-      }
-      if (sampleMaskedMedianDepth(depthPixels, maskPixels, width, height, i) > 0) {
-        queue[tail++] = i;
-        queued[i] = 1;
-      }
-    }
-  
-    while (head < tail) {
-      const index = queue[head++];
-      const fillDepth = sampleMaskedMedianDepth(depthPixels, maskPixels, width, height, index);
-      if (fillDepth <= 0) {
-        continue;
-      }
-      depthPixels[index] = fillDepth;
-      tail = enqueueMaskedGapNeighbors(queue, queued, depthPixels, targetMask, width, height, index, tail);
-    }
-  
-    return depthPixels;
-  }
-  
-  function sampleMaskedMedianDepth(depthPixels, maskPixels, width, height, index) {
-    const x = index % width;
-    const y = Math.floor(index / width);
-    const values = [];
-  
-    for (let dy = -1; dy <= 1; dy += 1) {
-      for (let dx = -1; dx <= 1; dx += 1) {
-        if (dx === 0 && dy === 0) {
-          continue;
-        }
-        const sx = x + dx;
-        const sy = y + dy;
-        if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
-          continue;
-        }
-        const sampleIndex = sy * width + sx;
-        if (!maskPixels[sampleIndex] || depthPixels[sampleIndex] <= 0) {
-          continue;
-        }
-        values.push(depthPixels[sampleIndex]);
-      }
-    }
-  
-    return values.length ? medianOfNumbers(values) : 0;
-  }
-  
+
   function createCanvasFromImageData(imageData) {
     const canvas = document.createElement("canvas");
     canvas.width = imageData.width;

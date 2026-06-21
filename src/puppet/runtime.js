@@ -241,16 +241,6 @@ export function createPuppetRuntime({
 
     if (!renderState.puppetRig || renderState.puppetRigSignature !== rigSignature) {
       let rigData = createRigDataForSwap(layerMeshEntries, renderState.puppetSwapLeftRightMapping);
-      if (rigData) {
-        const currentPenalty = computeFlipPenalty(rigData.fit?.points);
-        const flippedRigData = createRigDataForSwap(layerMeshEntries, !renderState.puppetSwapLeftRightMapping);
-        const flippedPenalty = computeFlipPenalty(flippedRigData?.fit?.points);
-        if (flippedRigData && flippedPenalty + 1 < currentPenalty) {
-          renderState.puppetSwapLeftRightMapping = !renderState.puppetSwapLeftRightMapping;
-          onSwapChanged?.(renderState.puppetSwapLeftRightMapping);
-          rigData = flippedRigData;
-        }
-      }
       if (!rigData || !rigData.template.length) {
         renderState.puppetRig = null;
         renderState.puppetBindingsByLayer = [];

@@ -25,6 +25,7 @@ export function createShaders(invalidDepthThreshold) {
     fragmentShader: `
       uniform sampler2D uColorTexture;
       uniform sampler2D uSegmentMaskTexture;
+      uniform float uOpacity;
       varying vec2 vUv;
       varying float vDepthMask;
 
@@ -34,6 +35,7 @@ export function createShaders(invalidDepthThreshold) {
         }
 
         vec4 color = texture2D(uColorTexture, vUv);
+        color.a *= uOpacity;
         gl_FragColor = color;
       }
     `,
@@ -48,6 +50,7 @@ export function createShaders(invalidDepthThreshold) {
     staticFragmentShader: `
       uniform sampler2D uColorTexture;
       uniform sampler2D uSegmentMaskTexture;
+      uniform float uOpacity;
       varying vec2 vUv;
 
       void main() {
@@ -55,6 +58,7 @@ export function createShaders(invalidDepthThreshold) {
           discard;
         }
         vec4 color = texture2D(uColorTexture, vUv);
+        color.a *= uOpacity;
         gl_FragColor = color;
       }
     `,
@@ -113,13 +117,14 @@ export function createShaders(invalidDepthThreshold) {
       uniform sampler2D uDepthTexture;
       uniform float uDepthScale;
       uniform float uInvertDepth;
+      uniform float uUseDepthMask;
       varying vec2 vUv;
       varying float vDepthMask;
 
       void main() {
         vUv = uv;
         float rawDepth = texture2D(uDepthTexture, uv).r;
-        vDepthMask = step(${invalidDepthThresholdValue}, rawDepth);
+        vDepthMask = mix(1.0, step(${invalidDepthThresholdValue}, rawDepth), uUseDepthMask);
         float depthValue = mix(rawDepth, 1.0 - rawDepth, uInvertDepth);
         vec3 displaced = position;
         displaced.z += depthValue * uDepthScale * vDepthMask;
@@ -129,6 +134,7 @@ export function createShaders(invalidDepthThreshold) {
     psdLayerFragmentShader: `
       uniform sampler2D uColorTexture;
       uniform sampler2D uMaskTexture;
+      uniform float uOpacity;
       varying vec2 vUv;
       varying float vDepthMask;
 
@@ -140,12 +146,14 @@ export function createShaders(invalidDepthThreshold) {
         if (color.a < 0.01) {
           discard;
         }
+        color.a *= uOpacity;
         gl_FragColor = color;
       }
     `,
     staticPsdLayerFragmentShader: `
       uniform sampler2D uColorTexture;
       uniform sampler2D uMaskTexture;
+      uniform float uOpacity;
       varying vec2 vUv;
 
       void main() {
@@ -156,6 +164,7 @@ export function createShaders(invalidDepthThreshold) {
         if (color.a < 0.01) {
           discard;
         }
+        color.a *= uOpacity;
         gl_FragColor = color;
       }
     `,

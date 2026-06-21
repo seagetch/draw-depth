@@ -4,6 +4,8 @@ export function createPsdExport(deps) {
     renderState,
     statusEl,
     buildPreparedPsdLayerEntries,
+    flattenPsdLayers,
+    getCanvasImageData,
   } = deps
 
   async function saveCurrentPsdDepthAsPsd() {
@@ -14,14 +16,15 @@ export function createPsdExport(deps) {
       throw new Error("PSD writer is not available.");
     }
   
-    statusEl.textContent = "Saving Midori-full-depth.psd...";
+    const filename = renderState.currentPsdExportName || "depth.psd";
+    statusEl.textContent = `Saving ${filename}...`;
   
     const preparedLayers = buildPreparedPsdLayerEntries();
     const exportDocument = buildPsdDepthExportDocument(renderState.psdColorDocument, preparedLayers);
     const buffer = agPsd.writePsd(exportDocument, { generateThumbnail: true });
-    triggerArrayBufferDownload(buffer, "Midori-full-depth.psd");
+    const saveResult = await saveArrayBufferToData(buffer, filename);
   
-    statusEl.textContent = "Saved Midori-full-depth.psd";
+    statusEl.textContent = `Saved ${saveResult.filename}`;
   }
   
   function buildPsdDepthExportDocument(psdDocument, preparedLayers) {
@@ -46,7 +49,11 @@ export function createPsdExport(deps) {
     for (let i = 0; i < sourceLayers.length; i += 1) {
       const sourceLayer = sourceLayers[i];
       const preparedInfo = preparedBySourceIndex[i];
-      const canvas = createPsdExportDepthCanvas(sourceLayer, preparedInfo ? preparedInfo.layer : null);
+      const canvas = createPsdExportDepthCanvas(
+        sourceLayer,
+        preparedInfo ? preparedInfo.layer : null,
+        preparedInfo ? preparedInfo.visibilityIndex : -1,
+      );
       const mask = createPsdExportLayerMask(sourceLayer);
       children.push({
         name: sourceLayer.name || `Layer ${i + 1}`,
@@ -79,7 +86,7 @@ export function createPsdExport(deps) {
     };
   }
   
-  function createPsdExportDepthCanvas(sourceLayer, preparedLayer) {
+  function createPsdExportDepthCanvas(sourceLayer, preparedLayer, layerIndex) {
     const canvas = document.createElement("canvas");
     canvas.width = sourceLayer.width;
     canvas.height = sourceLayer.height;
@@ -103,7 +110,13 @@ export function createPsdExport(deps) {
             preparedLocalY < preparedLayer.height
           ) {
             const preparedIndex = preparedLocalY * preparedLayer.width + preparedLocalX;
-            depth = preparedLayer.depthPixels[preparedIndex] || 0;
+            const exportDepthPixels = preparedLayer.baseDepthPixels || preparedLayer.depthPixels;
+            const baseDepth = exportDepthPixels[preparedIndex] || 0;
+            if (baseDepth > 0) {
+              const depthScale = layerIndex >= 0 ? (renderState.psdLayerDepthScales[layerIndex] ?? 1) : 1;
+              const depthOffset = layerIndex >= 0 ? (renderState.psdLayerDepthOffsets[layerIndex] ?? 0) : 0;
+              depth = Math.max(1, Math.min(255, Math.round(baseDepth * depthScale + depthOffset)));
+            }
           }
         }
   
@@ -147,16 +160,19 @@ export function createPsdExport(deps) {
     };
   }
   
-  function triggerArrayBufferDownload(buffer, filename) {
-    const blob = new Blob([buffer], { type: "application/octet-stream" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = filename;
-    anchor.click();
-    setTimeout(() => {
-      URL.revokeObjectURL(url);
-    }, 1000);
+  async function saveArrayBufferToData(buffer, filename) {
+    const response = await fetch(`/api/save-depth-psd?filename=${encodeURIComponent(filename)}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+      },
+      body: buffer,
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.ok) {
+      throw new Error(result.error || `Failed to save ${filename}`);
+    }
+    return result;
   }
 
   return {

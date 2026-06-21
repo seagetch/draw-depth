@@ -49,6 +49,16 @@ export function createSceneBuilder(deps) {
       }
       renderState.psdLayerMeshes = [];
     }
+
+    if (renderState.psdLayerDebugMeshes.length) {
+      for (let i = 0; i < renderState.psdLayerDebugMeshes.length; i += 1) {
+        const entry = renderState.psdLayerDebugMeshes[i];
+        scene.remove(entry.mesh);
+        entry.mesh.geometry.dispose();
+        entry.mesh.material.dispose();
+      }
+      renderState.psdLayerDebugMeshes = [];
+    }
   }
   
   function buildPsdLayerMeshes() {
@@ -56,6 +66,7 @@ export function createSceneBuilder(deps) {
     const usePuppetDeform = !!renderState.puppetEnabled;
     const useSurfaceSmooth = surfaceSmoothEl.checked;
     const bakeDepth = useSurfaceSmooth || usePuppetDeform;
+    const fadeBaseMeshes = !!renderState.generatedMeshDebugEnabled;
     for (let i = 0; i < layers.length; i += 1) {
       const layer = layers[i];
       if (!renderState.psdLayerVisibility[i]) {
@@ -78,16 +89,20 @@ export function createSceneBuilder(deps) {
         uniforms: {
           uColorTexture: { value: layer.colorTexture },
           uMaskTexture: { value: layer.maskTexture },
+          uOpacity: { value: fadeBaseMeshes ? 0.1 : 1 },
           ...(bakeDepth ? {} : {
             uDepthTexture: { value: layer.depthTexture },
             uDepthScale: { value: Number(depthScaleEl.value) },
             uInvertDepth: { value: invertDepthEl.checked ? 1 : 0 },
+            uUseDepthMask: { value: 1 },
           }),
         },
         vertexShader: bakeDepth ? staticVertexShader : psdLayerVertexShader,
         fragmentShader: bakeDepth ? staticPsdLayerFragmentShader : psdLayerFragmentShader,
         side: THREE.DoubleSide,
         transparent: true,
+        opacity: fadeBaseMeshes ? 0.1 : 1,
+        depthTest: true,
         depthWrite: true,
       });
       const mesh = new THREE.Mesh(geometry, material);
@@ -101,6 +116,19 @@ export function createSceneBuilder(deps) {
         depthTexture: layer.depthTexture,
         maskTexture: layer.maskTexture,
       });
+
+      if (renderState.generatedMeshDebugEnabled && renderState.generatedMeshDebugData) {
+        const debugLayer = renderState.generatedMeshDebugData.layersByIndex?.[i]
+          || renderState.generatedMeshDebugData.layersByName.get(layer.name);
+        const debugMesh = createGeneratedMeshDebugMesh(debugLayer, i);
+        if (debugMesh) {
+          scene.add(debugMesh);
+          renderState.psdLayerDebugMeshes.push({
+            mesh: debugMesh,
+            layerIndex: i,
+          });
+        }
+      }
     }
     if (meshEditRuntime) {
       meshEditRuntime.applyToEntries(renderState.psdLayerMeshes);
@@ -109,6 +137,58 @@ export function createSceneBuilder(deps) {
     if (puppetRuntime) {
       puppetRuntime.sync(renderState.psdLayerMeshes);
     }
+  }
+
+  function createGeneratedMeshDebugMesh(debugLayer, layerIndex) {
+    const vertices = debugLayer?.mesh?.vertices;
+    const faces = debugLayer?.mesh?.faces;
+    if (!vertices || !vertices.length || !faces || !faces.length) {
+      return null;
+    }
+
+    const positions = new Float32Array(vertices.length * 3);
+    const aspect = renderState.imageWidth / Math.max(1, renderState.imageHeight);
+    const depthScale = Number(depthScaleEl.value);
+    const invertDepth = !!invertDepthEl.checked;
+    for (let i = 0; i < vertices.length; i += 1) {
+      const vertex = vertices[i];
+      const base = i * 3;
+      const rawDepth = THREE.MathUtils.clamp(-vertex[2], 0, 1);
+      const depthValue = invertDepth ? 1 - rawDepth : rawDepth;
+      positions[base] = vertex[0] * aspect;
+      positions[base + 1] = vertex[1];
+      positions[base + 2] = depthValue * depthScale;
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    const indices = new Uint32Array(faces.length * 3);
+    for (let i = 0; i < faces.length; i += 1) {
+      const face = faces[i];
+      const base = i * 3;
+      indices[base] = face[0];
+      indices[base + 1] = face[1];
+      indices[base + 2] = face[2];
+    }
+    geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+    geometry.computeVertexNormals();
+    const hue = (layerIndex * 0.097) % 1;
+    const color = new THREE.Color().setHSL(hue, 0.95, 0.55);
+    const material = new THREE.MeshBasicMaterial({
+      color,
+      depthTest: true,
+      depthWrite: true,
+      transparent: false,
+      opacity: 1,
+      side: THREE.DoubleSide,
+      wireframe: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.renderOrder = layerIndex;
+    return mesh;
   }
   
   function buildPreparedPsdLayerEntries() {
@@ -122,7 +202,7 @@ export function createSceneBuilder(deps) {
       const baseDepthPixels = layer.baseDepthPixels || layer.depthPixels;
       const effectiveDepthPixels = new Uint8Array(baseDepthPixels.length);
       const renderDepthMask = new Uint8Array(baseDepthPixels.length);
-      const effectiveMaskPixels = layer.maskPixels;
+      const effectiveMaskPixels = layer.surfaceMaskPixels || layer.maskPixels;
       const depthScale = renderState.psdLayerDepthScales[layerIndex] ?? 1;
       const depthOffset = renderState.psdLayerDepthOffsets[layerIndex] ?? 0;
   
@@ -149,14 +229,17 @@ export function createSceneBuilder(deps) {
           }
   
           const globalIndex = globalY * renderState.imageWidth + globalX;
-          let effectiveDepth = clamp(Math.round(baseDepth * depthScale + depthOffset), 1, 255);
+          const scaledDepth = clamp(Math.round(baseDepth * depthScale + depthOffset), 1, 255);
+          let sortDepth = invertDepthEl.checked ? 255 - scaledDepth : scaledDepth;
           const upperLimit = upperDepthLimit[globalIndex];
-          if (!layer.hasDirectDepth && upperLimit <= 255) {
-            effectiveDepth = Math.min(effectiveDepth, Math.max(1, upperLimit - 1));
+          if (upperLimit <= 255) {
+            const limitedDepth = Math.max(1, upperLimit - 1);
+            sortDepth = Math.min(sortDepth, limitedDepth);
           }
+          const effectiveDepth = invertDepthEl.checked ? 255 - sortDepth : sortDepth;
   
           effectiveDepthPixels[localIndex] = effectiveDepth;
-        renderDepthMask[localIndex] = 1;
+          renderDepthMask[localIndex] = 1;
         }
       }
   
@@ -180,9 +263,8 @@ export function createSceneBuilder(deps) {
             }
   
             const globalIndex = globalY * renderState.imageWidth + globalX;
-            if (!layer.hasDirectDepth) {
-              upperDepthLimit[globalIndex] = Math.min(upperDepthLimit[globalIndex], effectiveDepth);
-            }
+            const sortDepth = invertDepthEl.checked ? 255 - effectiveDepth : effectiveDepth;
+            upperDepthLimit[globalIndex] = Math.min(upperDepthLimit[globalIndex], sortDepth);
           }
         }
       }
@@ -215,7 +297,7 @@ export function createSceneBuilder(deps) {
         depthPreviewUrl,
       };
     }
-  
+
     return preparedLayers;
   }
   

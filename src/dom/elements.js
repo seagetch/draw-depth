@@ -2,6 +2,7 @@ export function getViewerElements(doc = document) {
   return {
     app: doc.querySelector("#app"),
     statusEl: doc.querySelector("#status"),
+    modelSelectEl: doc.querySelector("#modelSelect"),
     depthScaleEl: doc.querySelector("#depthScale"),
     depthScaleValueEl: doc.querySelector("#depthScaleValue"),
     meshDetailEl: doc.querySelector("#meshDetail"),
@@ -12,6 +13,7 @@ export function getViewerElements(doc = document) {
     sourceModeEl: doc.querySelector("#sourceMode"),
     contourRepairEl: doc.querySelector("#contourRepair"),
     surfaceSmoothEl: doc.querySelector("#surfaceSmooth"),
+    generatedMeshDebugEnabledEl: doc.querySelector("#generatedMeshDebugEnabled"),
     depthModeEl: doc.querySelector("#depthMode"),
     gridSpecModeEl: doc.querySelector("#gridSpecMode"),
     gridXEl: doc.querySelector("#gridX"),
