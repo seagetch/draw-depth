@@ -10,12 +10,12 @@ import {
   segmentMinAnchorPixels,
   segmentMinAnchorRatio,
 } from "./constants.js";
-import { createAppActions } from "./actions.js?v=20260409_1";
+import { createAppActions } from "./actions.js?v=20260622_1";
 import { createAppResources } from "./resources.js";
-import { createRenderState } from "./state.js?v=20260411_5";
-import { createDepthCore } from "../depth/core.js?v=20260621_2";
-import { wireControls } from "../dom/controls.js?v=20260411_3";
-import { getViewerElements } from "../dom/elements.js?v=20260411_3";
+import { createRenderState } from "./state.js?v=20260622_1";
+import { createDepthCore } from "../depth/core.js?v=20260622_1";
+import { wireControls } from "../dom/controls.js?v=20260622_1";
+import { getViewerElements } from "../dom/elements.js?v=20260622_1";
 import { createPuppetPanel } from "../dom/puppetPanel.js?v=20260411_2";
 import { createSegmentPanel } from "../dom/segmentPanel.js?v=20260410_2";
 import {
@@ -26,15 +26,15 @@ import {
 import { createImageLoaders } from "../io/imageLoader.js";
 import { revokeObjectUrl as revokeObjectUrlState } from "../io/objectUrls.js";
 import { updatePsdDebugPanel as updatePsdDebugPanelView } from "../psd/debug.js?v=20260621_7";
-import { createPsdExport } from "../psd/export.js?v=20260621_1";
-import { createPsdLayers } from "../psd/layers.js?v=20260621_15";
-import { createPsdLoader } from "../psd/loader.js?v=20260621_11";
-import { createPuppetRuntime } from "../puppet/runtime.js?v=20260411_14";
-import { PUPPET_BONE_IDS } from "../puppet/layerBinding.js?v=20260411_2";
+import { createPsdExport } from "../psd/export.js?v=20260622_2";
+import { createPsdLayers } from "../psd/layers.js?v=20260622_3";
+import { createPsdLoader } from "../psd/loader.js?v=20260622_1";
+import { createPuppetRuntime } from "../puppet/runtime.js?v=20260622_1";
+import { PUPPET_BONE_IDS } from "../puppet/layerBinding.js?v=20260622_1";
 import { createMeshEditRuntime } from "../meshEdit/runtime.js?v=20260411_2";
 import { initializePsdSupport } from "../psd/psdSupport.js";
 import { createGeometryHelpers } from "../scene/geometry.js?v=20260621_12";
-import { createSceneBuilder } from "../scene/meshBuilder.js?v=20260621_22";
+import { createSceneBuilder } from "../scene/meshBuilder.js?v=20260622_1";
 import { createSceneRuntime } from "../scene/runtime.js?v=20260621_3";
 import { createShaders } from "../scene/shaders.js?v=20260621_1";
 import { createThreeContext, updateViewerCameraProjection } from "../scene/threeContext.js?v=20260621_1";
@@ -54,6 +54,8 @@ export function createApp() {
     modelSelectEl,
     depthScaleEl,
     depthScaleValueEl,
+    globalDepthScaleEl,
+    globalDepthScaleValueEl,
     meshDetailEl,
     meshDetailValueEl,
     depthDiscontinuityEl,
@@ -164,6 +166,8 @@ export function createApp() {
     createMaskedGridDepthPixels,
     createDepthTextureResources,
     createBinaryMaskTexture,
+    scaleDepthValueAroundCenter,
+    applyGlobalDepthScale,
   } = depthCore;
   const geometry = createGeometryHelpers({
     THREE,
@@ -221,6 +225,7 @@ export function createApp() {
     repairDepthDiscontinuities,
     clamp,
     disposeAdjustedDepthTexture,
+    applyGlobalDepthScale,
   });
   const {
     applySegmentDepthAdjustments,
@@ -268,6 +273,7 @@ export function createApp() {
     createDepthTextureResources,
     createBinaryMaskTexture,
     clamp,
+    scaleDepthValueAroundCenter,
     buildPsdLayerGeometry,
     createPsdDepthPreviewUrl,
     puppetRuntime,
@@ -386,6 +392,7 @@ export function createApp() {
     renderState,
     elements: {
       depthScaleEl,
+      globalDepthScaleEl,
       invertDepthEl,
       meshDetailEl,
       surfaceSmoothEl,
@@ -634,6 +641,8 @@ export function createApp() {
       statusEl,
       depthScaleEl,
       depthScaleValueEl,
+      globalDepthScaleEl,
+      globalDepthScaleValueEl,
       meshDetailEl,
       meshDetailValueEl,
       depthDiscontinuityEl,

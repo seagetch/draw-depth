@@ -7,6 +7,7 @@ export function createSegmentDepthRuntime(deps) {
     repairDepthDiscontinuities,
     clamp,
     disposeAdjustedDepthTexture,
+    applyGlobalDepthScale,
   } = deps
 
   function applySegmentDepthAdjustments() {
@@ -31,7 +32,12 @@ export function createSegmentDepthRuntime(deps) {
       adjustedPixels[index] = clamp(Math.round(shifted), 1, 255);
     }
   
-    const finalPixels = adjustedPixels;
+    const scaled = applyGlobalDepthScale(
+      adjustedPixels,
+      renderState.globalDepthScale,
+    );
+    const finalPixels = scaled.pixels;
+    renderState.globalDepthCentroid = scaled.centroid;
   
     const adjusted = createDepthTextureResources(
       renderState.imageWidth,

@@ -18,6 +18,7 @@ export function createPsdLayers(deps) {
     kernelSizeEl,
     interpModeEl,
   } = elements
+  const surfaceAlphaMin = 255;
 
   function flattenPsdLayers(layers, output = []) {
     for (let i = 0; i < layers.length; i += 1) {
@@ -73,7 +74,7 @@ export function createPsdLayers(deps) {
   
       const colorImageData = getCanvasImageData(colorLayer.canvas);
       const colorMaskPixels = extractLayerMaskPixels(colorImageData.data);
-      const colorSurfaceMaskPixels = extractLayerMaskPixels(colorImageData.data);
+      const colorSurfaceMaskPixels = extractLayerMaskPixels(colorImageData.data, surfaceAlphaMin);
       const depthLayer = depthLayerLookup
         ? takeMatchedPsdLayer(depthLayerLookup, colorLayer, i)
         : (depthLayers && depthLayers[i] ? depthLayers[i] : null);
@@ -86,8 +87,8 @@ export function createPsdLayers(deps) {
           depthLayer,
           colorLayer,
           {
-            ignoreAlpha: !!depthPsd,
-            minAlpha: depthPsd ? 0 : 1,
+            ignoreAlpha: false,
+            minAlpha: 1,
           },
         )
         : (depthPsd ? null : null);
@@ -893,24 +894,59 @@ export function createPsdLayers(deps) {
     if (exactMatches && exactMatches.length) {
       return exactMatches.shift().layer;
     }
+
+    const colorName = normalizePsdLayerName(colorLayer.name || "");
+    let bestNamedEntries = null;
+    let bestNamedEntryIndex = -1;
+    let bestNamedScore = -1;
+
+    if (colorName) {
+      for (const entries of lookup.values()) {
+        for (let i = 0; i < entries.length; i += 1) {
+          const entry = entries[i];
+          if (normalizePsdLayerName(entry.layer.name || "") !== colorName) {
+            continue;
+          }
+          const score = scorePsdLayerMatch(colorLayer, entry.layer, fallbackIndex, entry.index);
+          if (score > bestNamedScore) {
+            bestNamedScore = score;
+            bestNamedEntries = entries;
+            bestNamedEntryIndex = i;
+          }
+        }
+      }
+    }
+
+    if (bestNamedEntries && bestNamedEntryIndex >= 0) {
+      return bestNamedEntries.splice(bestNamedEntryIndex, 1)[0].layer;
+    }
   
     let bestEntries = null;
     let bestEntryIndex = -1;
     let bestScore = -1;
+    let bestOverlap = 0;
   
     for (const entries of lookup.values()) {
       for (let i = 0; i < entries.length; i += 1) {
         const entry = entries[i];
+        if (colorName || normalizePsdLayerName(entry.layer.name || "")) {
+          continue;
+        }
+        const overlap = estimatePsdLayerRectOverlap(colorLayer, entry.layer);
+        if (overlap <= 0) {
+          continue;
+        }
         const score = scorePsdLayerMatch(colorLayer, entry.layer, fallbackIndex, entry.index);
         if (score > bestScore) {
           bestScore = score;
+          bestOverlap = overlap;
           bestEntries = entries;
           bestEntryIndex = i;
         }
       }
     }
   
-    if (bestEntries && bestEntryIndex >= 0 && bestScore > 0) {
+    if (bestEntries && bestEntryIndex >= 0 && bestOverlap > 0) {
       return bestEntries.splice(bestEntryIndex, 1)[0].layer;
     }
   
@@ -1269,6 +1305,7 @@ export function createPsdLayers(deps) {
     colorTexture.needsUpdate = true;
     targetLayer.colorTexture = colorTexture;
     targetLayer.maskPixels = extractLayerMaskPixels(targetLayer.colorImageData.data);
+    targetLayer.surfaceMaskPixels = extractLayerMaskPixels(targetLayer.colorImageData.data, surfaceAlphaMin);
     if (mergeDepth && targetLayer.depthImageData) {
       targetLayer.directDepthPixels = extractDepthPixelsFromCanvas(createCanvasFromImageData(targetLayer.depthImageData));
       targetLayer.depthMaskPixels = extractLayerMaskPixels(targetLayer.depthImageData.data);

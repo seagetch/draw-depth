@@ -1,3 +1,3 @@
-import { createApp } from "./app/createApp.js?v=20260621_43";
+import { createApp } from "./app/createApp.js?v=20260622_2";
 
 createApp();

@@ -18,6 +18,8 @@ export function createRenderState() {
     meshDepthTexture: null,
     meshDepthPixels: null,
     meshGapMask: null,
+    globalDepthScale: 1,
+    globalDepthCentroid: 0,
     imageWidth: 0,
     imageHeight: 0,
     rasterImageWidth: 0,

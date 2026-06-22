@@ -5,6 +5,8 @@ export function getViewerElements(doc = document) {
     modelSelectEl: doc.querySelector("#modelSelect"),
     depthScaleEl: doc.querySelector("#depthScale"),
     depthScaleValueEl: doc.querySelector("#depthScaleValue"),
+    globalDepthScaleEl: doc.querySelector("#globalDepthScale"),
+    globalDepthScaleValueEl: doc.querySelector("#globalDepthScaleValue"),
     meshDetailEl: doc.querySelector("#meshDetail"),
     meshDetailValueEl: doc.querySelector("#meshDetailValue"),
     depthDiscontinuityEl: doc.querySelector("#depthDiscontinuity"),

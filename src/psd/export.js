@@ -54,13 +54,11 @@ export function createPsdExport(deps) {
         preparedInfo ? preparedInfo.layer : null,
         preparedInfo ? preparedInfo.visibilityIndex : -1,
       );
-      const mask = createPsdExportLayerMask(sourceLayer);
       children.push({
         name: sourceLayer.name || `Layer ${i + 1}`,
         left: sourceLayer.left || 0,
         top: sourceLayer.top || 0,
         canvas,
-        mask,
         hidden: preparedInfo ? !renderState.psdLayerVisibility[preparedInfo.visibilityIndex] : false,
       });
     }
@@ -92,6 +90,7 @@ export function createPsdExport(deps) {
     canvas.height = sourceLayer.height;
     const context = canvas.getContext("2d", { willReadFrequently: true });
     const output = context.createImageData(canvas.width, canvas.height);
+    const sourceImageData = sourceLayer.colorImageData || getCanvasImageData(sourceLayer.canvas);
   
     for (let y = 0; y < sourceLayer.height; y += 1) {
       const globalY = sourceLayer.top + y;
@@ -99,6 +98,7 @@ export function createPsdExport(deps) {
         const localIndex = y * sourceLayer.width + x;
         const rgbaIndex = localIndex * 4;
         let depth = 0;
+        const sourceAlpha = getSourceLayerAlpha(sourceImageData, localIndex);
         if (preparedLayer) {
           const globalX = sourceLayer.left + x;
           const preparedLocalX = globalX - preparedLayer.left;
@@ -110,13 +110,13 @@ export function createPsdExport(deps) {
             preparedLocalY < preparedLayer.height
           ) {
             const preparedIndex = preparedLocalY * preparedLayer.width + preparedLocalX;
-            const exportDepthPixels = preparedLayer.baseDepthPixels || preparedLayer.depthPixels;
-            const baseDepth = exportDepthPixels[preparedIndex] || 0;
-            if (baseDepth > 0) {
-              const depthScale = layerIndex >= 0 ? (renderState.psdLayerDepthScales[layerIndex] ?? 1) : 1;
-              const depthOffset = layerIndex >= 0 ? (renderState.psdLayerDepthOffsets[layerIndex] ?? 0) : 0;
-              depth = Math.max(1, Math.min(255, Math.round(baseDepth * depthScale + depthOffset)));
-            }
+            const exportDepthPixels = preparedLayer.depthPixels || preparedLayer.baseDepthPixels;
+            const hasDepth = preparedLayer.renderDepthMask
+              ? preparedLayer.renderDepthMask[preparedIndex]
+              : (exportDepthPixels[preparedIndex] > 0 ? 1 : 0);
+            depth = hasDepth
+              ? Math.round(((exportDepthPixels[preparedIndex] || 0) * sourceAlpha) / 255)
+              : 0;
           }
         }
   
@@ -130,34 +130,9 @@ export function createPsdExport(deps) {
     context.putImageData(output, 0, 0);
     return canvas;
   }
-  
-  function createPsdExportLayerMask(sourceLayer) {
-    const width = sourceLayer.width || 0;
-    const height = sourceLayer.height || 0;
-    if (width <= 0 || height <= 0) {
-      return undefined;
-    }
-  
-    const sourceImageData = sourceLayer.colorImageData || getCanvasImageData(sourceLayer.canvas);
-    const maskImageData = new ImageData(width, height);
-  
-    for (let i = 0, p = 0; p < width * height; i += 4, p += 1) {
-      const alpha = sourceImageData.data[i + 3];
-      maskImageData.data[i] = alpha;
-      maskImageData.data[i + 1] = alpha;
-      maskImageData.data[i + 2] = alpha;
-      maskImageData.data[i + 3] = 255;
-    }
-  
-    return {
-      top: sourceLayer.top || 0,
-      left: sourceLayer.left || 0,
-      bottom: (sourceLayer.top || 0) + height,
-      right: (sourceLayer.left || 0) + width,
-      defaultColor: 0,
-      disabled: false,
-      imageData: maskImageData,
-    };
+
+  function getSourceLayerAlpha(sourceImageData, localIndex) {
+    return sourceImageData?.data?.[localIndex * 4 + 3] || 0;
   }
   
   async function saveArrayBufferToData(buffer, filename) {

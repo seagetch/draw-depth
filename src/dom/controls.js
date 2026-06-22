@@ -21,6 +21,8 @@ export function wireControls(deps) {
     statusEl,
     depthScaleEl,
     depthScaleValueEl,
+    globalDepthScaleEl,
+    globalDepthScaleValueEl,
     meshDetailEl,
     meshDetailValueEl,
     depthDiscontinuityEl,
@@ -49,6 +51,10 @@ export function wireControls(deps) {
   } = elements;
 
   depthScaleValueEl.textContent = Number(depthScaleEl.value).toFixed(2);
+  if (globalDepthScaleEl && globalDepthScaleValueEl) {
+    globalDepthScaleValueEl.textContent = Number(globalDepthScaleEl.value).toFixed(1);
+    renderState.globalDepthScale = Number(globalDepthScaleEl.value);
+  }
   meshDetailValueEl.textContent = meshDetailEl.value;
   depthDiscontinuityValueEl.textContent = depthDiscontinuityEl.value;
   gridXValueEl.textContent = gridXEl.value;
@@ -72,6 +78,19 @@ export function wireControls(deps) {
         Number(depthScaleEl.value);
       renderState.psdLayerMeshes[i].mesh.position.z = 0;
     }
+  });
+
+  globalDepthScaleEl?.addEventListener("input", () => {
+    const scale = Number(globalDepthScaleEl.value);
+    globalDepthScaleValueEl.textContent = scale.toFixed(1);
+    renderState.globalDepthScale = scale;
+    if (renderState.sourceMode === "psd") {
+      buildMesh();
+      updatePsdDebugPanel();
+      return;
+    }
+    applySegmentDepthAdjustments();
+    buildMesh();
   });
 
   meshDetailEl.addEventListener("input", () => {

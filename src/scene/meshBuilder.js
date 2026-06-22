@@ -8,6 +8,7 @@ export function createSceneBuilder(deps) {
     createDepthTextureResources,
     createBinaryMaskTexture,
     clamp,
+    scaleDepthValueAroundCenter,
     buildPsdLayerGeometry,
     createPsdDepthPreviewUrl,
     puppetRuntime,
@@ -196,6 +197,7 @@ export function createSceneBuilder(deps) {
     const preparedLayers = new Array(sourceLayers.length);
     const upperDepthLimit = new Uint16Array(renderState.imageWidth * renderState.imageHeight);
     upperDepthLimit.fill(256);
+    const globalDepthCenter = computePreparedPsdDepthCentroid(sourceLayers);
   
     for (let layerIndex = sourceLayers.length - 1; layerIndex >= 0; layerIndex -= 1) {
       const layer = sourceLayers[layerIndex];
@@ -229,7 +231,12 @@ export function createSceneBuilder(deps) {
           }
   
           const globalIndex = globalY * renderState.imageWidth + globalX;
-          const scaledDepth = clamp(Math.round(baseDepth * depthScale + depthOffset), 1, 255);
+          const layerDepth = clamp(Math.round(baseDepth * depthScale + depthOffset), 1, 255);
+          const scaledDepth = scaleDepthValueAroundCenter(
+            layerDepth,
+            renderState.globalDepthScale,
+            globalDepthCenter,
+          );
           let sortDepth = invertDepthEl.checked ? 255 - scaledDepth : scaledDepth;
           const upperLimit = upperDepthLimit[globalIndex];
           if (upperLimit <= 255) {
@@ -299,6 +306,50 @@ export function createSceneBuilder(deps) {
     }
 
     return preparedLayers;
+  }
+
+  function computePreparedPsdDepthCentroid(sourceLayers) {
+    let sum = 0;
+    let count = 0;
+
+    for (let layerIndex = 0; layerIndex < sourceLayers.length; layerIndex += 1) {
+      if (!renderState.psdLayerVisibility[layerIndex]) {
+        continue;
+      }
+      const layer = sourceLayers[layerIndex];
+      const baseDepthPixels = layer.baseDepthPixels || layer.depthPixels;
+      const effectiveMaskPixels = layer.surfaceMaskPixels || layer.maskPixels;
+      if (!baseDepthPixels || !effectiveMaskPixels) {
+        continue;
+      }
+      const depthScale = renderState.psdLayerDepthScales[layerIndex] ?? 1;
+      const depthOffset = renderState.psdLayerDepthOffsets[layerIndex] ?? 0;
+
+      for (let y = 0; y < layer.height; y += 1) {
+        const globalY = layer.top + y;
+        if (globalY < 0 || globalY >= renderState.imageHeight) {
+          continue;
+        }
+
+        for (let x = 0; x < layer.width; x += 1) {
+          const localIndex = y * layer.width + x;
+          if (!effectiveMaskPixels[localIndex] || baseDepthPixels[localIndex] <= 0) {
+            continue;
+          }
+
+          const globalX = layer.left + x;
+          if (globalX < 0 || globalX >= renderState.imageWidth) {
+            continue;
+          }
+
+          sum += clamp(Math.round(baseDepthPixels[localIndex] * depthScale + depthOffset), 1, 255);
+          count += 1;
+        }
+      }
+    }
+
+    renderState.globalDepthCentroid = count > 0 ? sum / count : 0;
+    return renderState.globalDepthCentroid;
   }
   
 

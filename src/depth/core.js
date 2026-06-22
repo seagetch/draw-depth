@@ -790,6 +790,62 @@ export function createDepthCore(THREE) {
   
     return { texture, pixels };
   }
+
+  function computeDepthCentroid(pixels, maskPixels = null) {
+    let sum = 0;
+    let count = 0;
+
+    for (let i = 0; i < pixels.length; i += 1) {
+      const depth = pixels[i];
+      if (depth <= 0 || (maskPixels && !maskPixels[i])) {
+        continue;
+      }
+      sum += depth;
+      count += 1;
+    }
+
+    return {
+      value: count > 0 ? sum / count : 0,
+      count,
+    };
+  }
+
+  function scaleDepthValueAroundCenter(depth, scale, center) {
+    if (depth <= 0) {
+      return 0;
+    }
+    if (!Number.isFinite(scale) || scale === 1 || center <= 0) {
+      return clamp(Math.round(depth), 1, 255);
+    }
+    return clamp(Math.round(center + (depth - center) * scale), 1, 255);
+  }
+
+  function applyGlobalDepthScale(pixels, scale, maskPixels = null) {
+    const centroid = computeDepthCentroid(pixels, maskPixels);
+    const output = new Uint8Array(pixels.length);
+
+    if (centroid.count === 0) {
+      return {
+        pixels: output,
+        centroid: 0,
+        count: 0,
+      };
+    }
+
+    for (let i = 0; i < pixels.length; i += 1) {
+      if (maskPixels && !maskPixels[i]) {
+        output[i] = 0;
+        continue;
+      }
+      output[i] = scaleDepthValueAroundCenter(pixels[i], scale, centroid.value);
+    }
+
+    return {
+      pixels: output,
+      centroid: centroid.value,
+      count: centroid.count,
+    };
+  }
   
   function createBinaryMaskTexture(width, height, maskPixels) {
     const canvas = document.createElement("canvas");
@@ -1220,5 +1276,8 @@ export function createDepthCore(THREE) {
     createMaskedGridDepthPixels,
     createDepthTextureResources,
     createBinaryMaskTexture,
+    computeDepthCentroid,
+    scaleDepthValueAroundCenter,
+    applyGlobalDepthScale,
   };
 }

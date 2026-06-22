@@ -35,26 +35,27 @@ function hasAny(name, patterns) {
 }
 
 function classifyLayer(name) {
-  if (hasAny(name, [/face/, /head/, /ear/, /bang/, /hair/])) return "head";
-  if (hasAny(name, [/neck/, /kubi/])) return "neck";
-  if (hasAny(name, [/body/, /torso/, /trunk/, /chest/, /breast/, /spine/, /waist/, /pelvis/, /hip/])) return "torso";
-  if (hasAny(name, [/shoulder/, /clavicle/])) return "shoulder";
+  if (hasAny(name, [/hand/, /wrist/, /palm/, /thumb/, /finger/])) return "hand";
   if (hasAny(name, [/upper.*arm/, /arm.*upper/])) return "upper_arm";
   if (hasAny(name, [/forearm/, /lower.*arm/, /elbow/])) return "forearm";
-  if (hasAny(name, [/hand/, /wrist/, /palm/, /thumb/, /finger/])) return "hand";
+  if (hasAny(name, [/sleeve/, /glove/])) return "sleeve";
+  if (hasAny(name, [/shoulder/, /clavicle/])) return "shoulder";
+  if (hasAny(name, [/topwear/, /innerwear/, /shirt/, /blouse/, /vest/, /apron/])) return "torso";
+  if (hasAny(name, [/bottomwear/, /skirt/, /belt/])) return "hip_accessory";
   if (hasAny(name, [/thigh/, /upper.*leg/])) return "thigh";
   if (hasAny(name, [/shin/, /calf/, /lower.*leg/, /knee/])) return "shin";
   if (hasAny(name, [/foot/, /ankle/, /boot/])) return "foot";
-  if (hasAny(name, [/sleeve/, /glove/])) return "sleeve";
+  if (hasAny(name, [/face/, /head/, /(^|[\s_-])ears?($|[\s_-])/, /earwear/, /bang/, /hair/])) return "head";
+  if (hasAny(name, [/neck/, /kubi/])) return "neck";
+  if (hasAny(name, [/body/, /torso/, /trunk/, /chest/, /breast/, /spine/, /waist/, /pelvis/, /hip/])) return "torso";
   if (hasAny(name, [/jacket/, /coat/, /hood/, /cape/, /cloak/])) return "outerwear";
-  if (hasAny(name, [/skirt/, /belt/])) return "hip_accessory";
   if (hasAny(name, [/tail/])) return "tail";
   return "unknown";
 }
 
 function classifyDeformClass(classification, name, side) {
   if (classification === "head") {
-    if (hasAny(name, [/face/, /eye/, /brow/, /nose/, /mouth/, /lip/, /tooth/, /tongue/, /ear/])) {
+    if (hasAny(name, [/face/, /eye/, /brow/, /nose/, /mouth/, /lip/, /tooth/, /tongue/, /(^|[\s_-])ears?($|[\s_-])/, /earwear/])) {
       return "rigid_face";
     }
     if (hasAny(name, [/hair/, /bang/])) {

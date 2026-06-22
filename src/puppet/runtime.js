@@ -1,7 +1,7 @@
 import { createMeshBindingWithPolicy } from "./bindWeights.js?v=20260411_5";
 import { applySkinningToGeometry, restoreRestGeometry } from "./deform.js";
 import { createPuppetOverlay } from "./overlay.js";
-import { applyLayerBindingOverride, createLayerBindingPolicy, PUPPET_BONE_IDS } from "./layerBinding.js?v=20260411_2";
+import { applyLayerBindingOverride, createLayerBindingPolicy, PUPPET_BONE_IDS } from "./layerBinding.js?v=20260622_1";
 import {
   createRigState,
   moveBoneRestTailTarget,
