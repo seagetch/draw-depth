@@ -1,10 +1,19 @@
+import { createColorCompositeFromPsd } from "../composite/colorSources.js";
+import { createDepthCompositeFromPsd, createFlatDepthCompositeFromPixels } from "../composite/depthSources.js";
+import { writeDepthDebugStats } from "../composite/debugStats.js";
+import { attachPreparedLayerEntries } from "../composite/prepareLayers.js";
+import {
+  buildCompositionDebugStatsInWorker,
+  composeWithPreviousStateInWorker,
+} from "../workers/compositeWorkerClient.js?v=20260626_4";
+
 export function createPsdLoader(deps) {
   const {
     agPsd,
     renderState,
     defaults,
     loadImagePixels,
-    createPsdLayerEntries,
+    createLayerEntries,
     disposePsdLayerTextures: disposePsdLayerTexturesExternal,
     flattenPsdLayers,
     getCanvasImageData,
@@ -45,8 +54,8 @@ export function createPsdLoader(deps) {
       return context.getImageData(0, 0, canvas.width, canvas.height);
     };
 
-  async function ensureDefaultPsdPairLoaded() {
-    if (renderState.psdLayerEntries.length) {
+  async function ensureDefaultPsdPairLoaded(options = {}) {
+    if ((renderState.layerEntries || []).length) {
       return;
     }
   
@@ -55,7 +64,7 @@ export function createPsdLoader(deps) {
       renderState.pendingPsdColorBuffer = colorBuffer;
     }
   
-    await loadPsdPair(renderState.pendingPsdColorBuffer);
+    await loadPsdPair(renderState.pendingPsdColorBuffer, options);
   }
   
   async function fetchArrayBuffer(url) {
@@ -78,27 +87,11 @@ export function createPsdLoader(deps) {
   }
   
   async function loadPsdPair(colorBuffer, options = {}) {
+    const previousLayers = renderState.layerEntries || [];
     const previousDebugLayerName = renderState.psdDebugLayerIndex >= 0
-      ? renderState.psdLayerEntries[renderState.psdDebugLayerIndex]?.name
+      ? previousLayers[renderState.psdDebugLayerIndex]?.name
       : null;
-    const previousVisibilityByName = new Map(
-      renderState.psdLayerEntries.map((layer, index) => [layer.name, !!renderState.psdLayerVisibility[index]]),
-    );
-    const previousOffsetByName = new Map(
-      renderState.psdLayerEntries.map((layer, index) => [layer.name, renderState.psdLayerDepthOffsets[index] ?? 0]),
-    );
-    const previousScaleByName = new Map(
-      renderState.psdLayerEntries.map((layer, index) => [layer.name, renderState.psdLayerDepthScales[index] ?? 1]),
-    );
-    const previousPruneByName = new Map(
-      renderState.psdLayerEntries.map((layer, index) => [layer.name, !!renderState.psdLayerOutlierPruneEnabled[index]]),
-    );
-    const previousPuppetFitByName = new Map(
-      renderState.psdLayerEntries.map((layer, index) => [layer.name, renderState.puppetLayerFitEnabled[index] ?? true]),
-    );
-    const previousPuppetBindingOverrideByName = new Map(
-      renderState.psdLayerEntries.map((layer, index) => [layer.name, renderState.puppetLayerBindingOverrides[index] ?? null]),
-    );
+    const previousGlobalDepthScale = renderState.composedSource?.globalDepthScale ?? 1;
     disposePsdLayerTexturesExternal();
     const colorPsd = agPsd.readPsd(colorBuffer);
     const scaledPsd = prepareScaledPsdDocument(colorPsd, 1280);
@@ -114,22 +107,40 @@ export function createPsdLoader(deps) {
       ? createFlattenedGrayscaleDepthPreview(depthPsd)
       : null;
     const stableDepthResult = depthPsd ? null : await ensurePsdStableDepthPixels(scaledPsd, stableDepthUrl);
-    const layerEntries = createPsdLayerEntries(
-      scaledPsd,
-      depthPsd,
-      stableDepthResult ? stableDepthResult.pixels : null,
-    );
+    const colorComposite = createColorCompositeFromPsd(scaledPsd);
+    const depthComposite = depthPsd
+      ? createDepthCompositeFromPsd(depthPsd)
+      : createFlatDepthCompositeFromPixels(
+        scaledPsd.width,
+        scaledPsd.height,
+        stableDepthResult ? stableDepthResult.pixels : new Uint8Array(scaledPsd.width * scaledPsd.height),
+        {
+          format: "raster",
+          name: "Stable depth",
+        },
+      );
+    const composedSource = await composeWithPreviousStateInWorker({
+      colorComposite,
+      depthComposite,
+      previousLayers,
+      previousGlobalDepthScale,
+      depthOverrides: renderState.depthOverrides,
+      onProgress: options.onProgress,
+    });
+    const layerEntries = await createLayerEntries(composedSource, {
+      colorDocument: scaledPsd,
+      depthDocument: depthPsd,
+      stableDepthPixels: stableDepthResult ? stableDepthResult.pixels : null,
+      onProgress: options.onProgress,
+    });
   
     renderState.psdColorDocument = scaledPsd;
     renderState.psdDepthDocument = depthPsd;
+    renderState.colorComposite = colorComposite;
+    renderState.depthComposite = depthComposite;
+    renderState.composedSource = composedSource;
     renderState.psdStableDepthPixels = stableDepthResult ? stableDepthResult.pixels : null;
-    renderState.psdLayerEntries = layerEntries;
-    renderState.psdLayerVisibility = layerEntries.map((layer) => previousVisibilityByName.get(layer.name) ?? true);
-    renderState.psdLayerDepthOffsets = layerEntries.map((layer) => previousOffsetByName.get(layer.name) ?? 0);
-    renderState.psdLayerDepthScales = layerEntries.map((layer) => previousScaleByName.get(layer.name) ?? 1);
-    renderState.psdLayerOutlierPruneEnabled = layerEntries.map((layer) => previousPruneByName.get(layer.name) ?? false);
-    renderState.puppetLayerFitEnabled = layerEntries.map((layer) => previousPuppetFitByName.get(layer.name) ?? true);
-    renderState.puppetLayerBindingOverrides = layerEntries.map((layer) => previousPuppetBindingOverrideByName.get(layer.name) ?? null);
+    renderState.layerEntries = attachPreparedLayerEntries(composedSource, layerEntries);
     renderState.psdDebugLayerIndex = previousDebugLayerName
       ? layerEntries.findIndex((layer) => layer.name === previousDebugLayerName)
       : -1;
@@ -140,28 +151,51 @@ export function createPsdLoader(deps) {
       ? depthPsd.canvas.toDataURL("image/png")
       : (stableDepthResult ? stableDepthResult.previewUrl : "");
     renderState.psdPremultipliedDepthPreviewUrl = flattenedDepthPreview ? flattenedDepthPreview.previewUrl : "";
+    options.onProgress?.({
+      stage: "debug-stats",
+      current: 0,
+      total: 1,
+      message: "building composition debug stats",
+    });
+    writeDepthDebugStats({
+      composition: await buildCompositionDebugStatsInWorker(composedSource),
+    });
+    options.onProgress?.({
+      stage: "debug-stats",
+      current: 1,
+      total: 1,
+      message: "composition debug stats ready",
+    });
     rebuildSegmentList();
     updatePsdDebugPanel();
   }
   
-  async function rebuildPsdLayerEntriesIfNeeded() {
-    if (renderState.sourceMode !== "psd") {
+  async function rebuildLayerEntriesIfNeeded(options = {}) {
+    if (renderState.colorComposite?.format !== "psd") {
+      return false;
+    }
+
+    if (hasDepthOverrides()) {
       return false;
     }
   
     if (renderState.pendingPsdColorBuffer) {
-      await loadPsdPair(renderState.pendingPsdColorBuffer);
+      await loadPsdPair(renderState.pendingPsdColorBuffer, options);
       return true;
     }
   
     if (renderState.psdColorDocument) {
       const colorBuffer = await fetchArrayBuffer(defaults.defaultPsdColorUrl);
       renderState.pendingPsdColorBuffer = colorBuffer;
-      await loadPsdPair(colorBuffer);
+      await loadPsdPair(colorBuffer, options);
       return true;
     }
   
     return false;
+  }
+
+  function hasDepthOverrides() {
+    return !!renderState.depthOverrides && Object.keys(renderState.depthOverrides).length > 0;
   }
   
   function prepareScaledPsdDocument(psd, maxHeight) {
@@ -538,7 +572,7 @@ export function createPsdLoader(deps) {
     fetchArrayBuffer,
     fetchOptionalArrayBuffer,
     loadPsdPair,
-    rebuildPsdLayerEntriesIfNeeded,
+    rebuildLayerEntriesIfNeeded,
     prepareScaledPsdDocument,
     ensurePsdStableDepthPixels
   };

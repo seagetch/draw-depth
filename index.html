@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Depth Draw Viewer</title>
+    <link rel="icon" href="data:,">
     <style>
       :root {
         color-scheme: dark;
@@ -277,6 +278,85 @@
         background: rgba(255, 255, 255, 0.03);
       }
 
+      .worker-progress {
+        display: none;
+        position: fixed;
+        top: 16px;
+        left: 50%;
+        z-index: 30;
+        width: min(560px, calc(100vw - 360px));
+        min-width: min(360px, calc(100vw - 32px));
+        padding: 10px 12px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        gap: 6px;
+        background: rgba(13, 17, 23, 0.88);
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.32);
+        transform: translateX(-50%);
+        backdrop-filter: blur(14px);
+      }
+
+      .worker-progress.is-visible {
+        display: grid;
+      }
+
+      .worker-progress .action-button {
+        width: auto;
+        min-width: 74px;
+        padding: 5px 10px;
+      }
+
+      .worker-progress-bar {
+        width: 100%;
+        height: 8px;
+        border-radius: 4px;
+        overflow: hidden;
+        background: rgba(255, 255, 255, 0.12);
+      }
+
+      .worker-progress-fill {
+        width: 0%;
+        height: 100%;
+        background: #67d9a3;
+        transition: width 120ms linear;
+      }
+
+      .settings-panel-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      .settings-panel-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .settings-panel-actions label {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      .settings-panel-collapse {
+        width: 24px;
+        height: 24px;
+        padding: 0;
+      }
+
+      .settings-panel-body {
+        display: grid;
+        gap: 8px;
+      }
+
+      .is-collapsed > .settings-panel-body {
+        display: none;
+      }
+
       .puppet-panel-title {
         font-size: 12px;
         color: var(--text);
@@ -382,6 +462,15 @@
   </head>
   <body>
     <div id="app"></div>
+    <div class="worker-progress" id="workerProgressPanel">
+      <div class="control-row">
+        <span id="workerProgressLabel">Working...</span>
+        <button class="action-button" id="workerCancelButton" type="button">Cancel</button>
+      </div>
+      <div class="worker-progress-bar" aria-hidden="true">
+        <div class="worker-progress-fill" id="workerProgressFill"></div>
+      </div>
+    </div>
     <section id="hud">
       <h1>Depth Draw Viewer</h1>
       <p>Raster depth maps use zero depth as invalid. PSD depth layers use their grayscale values directly.</p>
@@ -445,6 +534,10 @@
       <div class="control-row">
         <label for="contourRepair">Repair contour band</label>
         <input id="contourRepair" type="checkbox">
+      </div>
+
+      <div class="control">
+        <button class="action-button" id="alphaDepthGapFillButton" type="button">Fill alpha-depth gaps</button>
       </div>
 
       <div class="control-row">
@@ -554,73 +647,80 @@
           <div class="segment-hint">Add handle mode or Alt+click: add mesh handle | Drag: move handle | Shift+drag: depth only | Del: delete handle</div>
         </div>
       <div class="mesh-edit-panel" id="meshEditPanel">
-        <div class="segment-header" style="margin-bottom:0;">
+        <div class="settings-panel-header">
           <div class="puppet-panel-title">Mesh Edit</div>
-          <div class="segment-hint">Cmd/Ctrl+Z: undo</div>
-        </div>
-        <div class="control-row">
-          <label for="meshEditEnabled">Enable mesh edit</label>
-          <input id="meshEditEnabled" type="checkbox">
-        </div>
-        <div class="control-row">
-          <label for="meshEditAddMode">Add handle mode</label>
-          <input id="meshEditAddMode" type="checkbox">
-        </div>
-        <div class="control">
-          <div class="control-row">
-            <label for="meshEditTarget">Target</label>
+          <div class="settings-panel-actions">
+            <label for="meshEditEnabled">On <input id="meshEditEnabled" type="checkbox"></label>
+            <button class="segment-button settings-panel-collapse" id="meshEditCollapseButton" type="button" title="Collapse mesh edit panel">-</button>
           </div>
-          <select id="meshEditTarget"></select>
         </div>
-        <div class="control">
+        <div class="settings-panel-body" id="meshEditPanelBody">
           <div class="control-row">
-            <label for="meshEditRadius">Handle radius</label>
-            <output class="value" id="meshEditRadiusValue">0.18</output>
+            <label for="meshEditAddMode">Add handle mode</label>
+            <input id="meshEditAddMode" type="checkbox">
           </div>
-          <input id="meshEditRadius" type="range" min="0.03" max="0.80" step="0.01" value="0.18">
-        </div>
-        <div class="control-row" style="gap:6px;">
-          <button class="action-button" id="meshEditUndoButton" type="button">Undo</button>
-          <button class="action-button" id="meshEditRedoButton" type="button">Redo</button>
-          <button class="action-button" id="meshEditResetButton" type="button">Reset target</button>
+          <div class="control">
+            <div class="control-row">
+              <label for="meshEditTarget">Target</label>
+            </div>
+            <select id="meshEditTarget"></select>
+          </div>
+          <div class="control">
+            <div class="control-row">
+              <label for="meshEditRadius">Handle radius</label>
+              <output class="value" id="meshEditRadiusValue">0.18</output>
+            </div>
+            <input id="meshEditRadius" type="range" min="0.03" max="0.80" step="0.01" value="0.18">
+          </div>
+          <div class="control-row" style="gap:6px;">
+            <button class="action-button" id="meshEditUndoButton" type="button">Undo</button>
+            <button class="action-button" id="meshEditRedoButton" type="button">Redo</button>
+            <button class="action-button" id="meshEditResetButton" type="button">Reset target</button>
+          </div>
         </div>
       </div>
       <div class="puppet-panel" id="puppetPanel" style="display:none;">
-        <div class="segment-header" style="margin-bottom:0;">
+        <div class="settings-panel-header">
           <div class="puppet-panel-title">Puppet Controls</div>
-          <button class="segment-button" id="puppetResetBoneButton" type="button" title="Reset selected bone">R</button>
-        </div>
-        <div class="control">
-          <div class="control-row">
-            <label for="puppetBoneSelect">Bone</label>
-          </div>
-          <select id="puppetBoneSelect"></select>
-        </div>
-        <div class="control">
-          <div class="control-row">
-            <label>Target</label>
-          </div>
-          <div class="puppet-grid3">
-            <input id="puppetTargetX" type="number" step="0.01">
-            <input id="puppetTargetY" type="number" step="0.01">
-            <input id="puppetTargetZ" type="number" step="0.01">
+          <div class="settings-panel-actions">
+            <label for="puppetEnabled">On <input id="puppetEnabled" type="checkbox"></label>
+            <button class="segment-button" id="puppetResetBoneButton" type="button" title="Reset selected bone">R</button>
+            <button class="segment-button settings-panel-collapse" id="puppetCollapseButton" type="button" title="Collapse puppet panel">-</button>
           </div>
         </div>
-        <div class="control">
-          <div class="puppet-row">
-            <label for="puppetRotX">Rot X</label>
-            <input class="puppet-slider" id="puppetRotX" type="range" min="-180" max="180" step="1" value="0">
-            <output class="value" id="puppetRotXValue">0deg</output>
+        <div class="settings-panel-body" id="puppetPanelBody">
+          <div class="control">
+            <div class="control-row">
+              <label for="puppetBoneSelect">Bone</label>
+            </div>
+            <select id="puppetBoneSelect"></select>
           </div>
-          <div class="puppet-row">
-            <label for="puppetRotY">Rot Y</label>
-            <input class="puppet-slider" id="puppetRotY" type="range" min="-180" max="180" step="1" value="0">
-            <output class="value" id="puppetRotYValue">0deg</output>
+          <div class="control">
+            <div class="control-row">
+              <label>Target</label>
+            </div>
+            <div class="puppet-grid3">
+              <input id="puppetTargetX" type="number" step="0.01">
+              <input id="puppetTargetY" type="number" step="0.01">
+              <input id="puppetTargetZ" type="number" step="0.01">
+            </div>
           </div>
-          <div class="puppet-row">
-            <label for="puppetRotZ">Rot Z</label>
-            <input class="puppet-slider" id="puppetRotZ" type="range" min="-180" max="180" step="1" value="0">
-            <output class="value" id="puppetRotZValue">0deg</output>
+          <div class="control">
+            <div class="puppet-row">
+              <label for="puppetRotX">Rot X</label>
+              <input class="puppet-slider" id="puppetRotX" type="range" min="-180" max="180" step="1" value="0">
+              <output class="value" id="puppetRotXValue">0deg</output>
+            </div>
+            <div class="puppet-row">
+              <label for="puppetRotY">Rot Y</label>
+              <input class="puppet-slider" id="puppetRotY" type="range" min="-180" max="180" step="1" value="0">
+              <output class="value" id="puppetRotYValue">0deg</output>
+            </div>
+            <div class="puppet-row">
+              <label for="puppetRotZ">Rot Z</label>
+              <input class="puppet-slider" id="puppetRotZ" type="range" min="-180" max="180" step="1" value="0">
+              <output class="value" id="puppetRotZValue">0deg</output>
+            </div>
           </div>
         </div>
       </div>
@@ -646,8 +746,8 @@
         </div>
       </div>
     </section>
-    <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
-    <script src="https://unpkg.com/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="./node_modules/three/build/three.min.js"></script>
+    <script src="./node_modules/three/examples/js/controls/OrbitControls.js"></script>
     <script>
       (function () {
         const bust = Date.now().toString();

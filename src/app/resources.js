@@ -1,24 +1,27 @@
+import { getLayerVisible } from "../composite/schema.js";
+
 export function createAppResources(deps) {
   const { renderState, elements } = deps
 
   const { statusEl, depthModeEl, interpModeEl } = elements
 
   function refreshStatusCounts() {
-    if (renderState.sourceMode === "psd") {
-      const layerCount = renderState.psdLayerEntries.length;
-      const visibleLayers = renderState.psdLayerVisibility.filter(Boolean).length;
-      const triangleCount = renderState.psdLayerMeshes.reduce(
+    if ((renderState.layerEntries || []).length) {
+      const layerCount = (renderState.layerEntries || []).length;
+      const visibleLayers = (renderState.layerEntries || []).filter((_, index) => getLayerVisible(renderState, index)).length;
+      const triangleCount = renderState.layerMeshes.reduce(
         (sum, entry) => sum + (entry.mesh.geometry.index ? entry.mesh.geometry.index.count / 3 : 0),
         0,
       );
-      const vertexCount = renderState.psdLayerMeshes.reduce(
+      const vertexCount = renderState.layerMeshes.reduce(
         (sum, entry) => sum + entry.mesh.geometry.attributes.position.count,
         0,
       );
       const debugSuffix = renderState.psdDebugLayerIndex >= 0
         ? ` | debug D=kept R=pixel M=component Y=contour dark=empty`
         : "";
-      statusEl.textContent = `${renderState.imageWidth}x${renderState.imageHeight} | psd-layers ${visibleLayers}/${layerCount} | vertices ${vertexCount.toLocaleString()} | triangles ${triangleCount.toLocaleString()}${debugSuffix}`;
+      const modeLabel = renderState.composedSource?.mode || "layers";
+      statusEl.textContent = `${renderState.imageWidth}x${renderState.imageHeight} | ${modeLabel} layers ${visibleLayers}/${layerCount} | vertices ${vertexCount.toLocaleString()} | triangles ${triangleCount.toLocaleString()}${debugSuffix}`;
       return;
     }
   

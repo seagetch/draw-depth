@@ -10,14 +10,15 @@ import {
   segmentMinAnchorPixels,
   segmentMinAnchorRatio,
 } from "./constants.js";
-import { createAppActions } from "./actions.js?v=20260622_1";
+import { createAppActions } from "./actions.js?v=20260626_6";
+import { createExternalApi, startRestCommandBridge } from "./externalApi.js?v=20260626_2";
 import { createAppResources } from "./resources.js";
-import { createRenderState } from "./state.js?v=20260622_1";
+import { createRenderState } from "./state.js?v=20260623_2";
 import { createDepthCore } from "../depth/core.js?v=20260622_1";
-import { wireControls } from "../dom/controls.js?v=20260622_1";
-import { getViewerElements } from "../dom/elements.js?v=20260622_1";
-import { createPuppetPanel } from "../dom/puppetPanel.js?v=20260411_2";
-import { createSegmentPanel } from "../dom/segmentPanel.js?v=20260410_2";
+import { wireControls } from "../dom/controls.js?v=20260626_6";
+import { getViewerElements } from "../dom/elements.js?v=20260626_1";
+import { createPuppetPanel } from "../dom/puppetPanel.js?v=20260623_1";
+import { createSegmentPanel } from "../dom/segmentPanel.js?v=20260626_5";
 import {
   createSegmentThumbDataUrl,
   syncThumbs as syncThumbsView,
@@ -26,22 +27,22 @@ import {
 import { createImageLoaders } from "../io/imageLoader.js";
 import { revokeObjectUrl as revokeObjectUrlState } from "../io/objectUrls.js";
 import { updatePsdDebugPanel as updatePsdDebugPanelView } from "../psd/debug.js?v=20260621_7";
-import { createPsdExport } from "../psd/export.js?v=20260622_2";
-import { createPsdLayers } from "../psd/layers.js?v=20260622_3";
-import { createPsdLoader } from "../psd/loader.js?v=20260622_1";
-import { createPuppetRuntime } from "../puppet/runtime.js?v=20260622_1";
+import { createPsdExport } from "../psd/export.js?v=20260623_1";
+import { createPsdLayers } from "../psd/layers.js?v=20260626_5";
+import { createPsdLoader } from "../psd/loader.js?v=20260626_4";
+import { createPuppetRuntime } from "../puppet/runtime.js?v=20260623_3";
 import { PUPPET_BONE_IDS } from "../puppet/layerBinding.js?v=20260622_1";
 import { createMeshEditRuntime } from "../meshEdit/runtime.js?v=20260411_2";
 import { initializePsdSupport } from "../psd/psdSupport.js";
 import { createGeometryHelpers } from "../scene/geometry.js?v=20260621_12";
-import { createSceneBuilder } from "../scene/meshBuilder.js?v=20260622_1";
+import { createSceneBuilder } from "../scene/meshBuilder.js?v=20260623_6";
 import { createSceneRuntime } from "../scene/runtime.js?v=20260621_3";
 import { createShaders } from "../scene/shaders.js?v=20260621_1";
 import { createThreeContext, updateViewerCameraProjection } from "../scene/threeContext.js?v=20260621_1";
 import { createSegmentAnalysis } from "../segments/analysis.js";
 import { createSegmentDepthRuntime } from "../segments/segmentDepth.js";
 import { createSegmentRuntime } from "../segments/segmentRuntime.js";
-import { createMeshEditPanel } from "../dom/meshEditPanel.js?v=20260411_1";
+import { createMeshEditPanel } from "../dom/meshEditPanel.js?v=20260623_1";
 import { loadGeneratedMeshDebugData } from "../debug/generatedMeshDebug.js?v=20260412_9";
 
 export function createApp() {
@@ -63,6 +64,11 @@ export function createApp() {
     invertDepthEl,
     sourceModeEl,
     contourRepairEl,
+    alphaDepthGapFillButtonEl,
+    workerProgressPanelEl,
+    workerProgressLabelEl,
+    workerProgressFillEl,
+    workerCancelButtonEl,
     surfaceSmoothEl,
     generatedMeshDebugEnabledEl,
     depthModeEl,
@@ -94,6 +100,7 @@ export function createApp() {
     puppetBodyMaskImageEl,
     puppetSkeletonImageEl,
     meshEditPanelEl,
+    meshEditCollapseButtonEl,
     meshEditEnabledEl,
     meshEditAddModeEl,
     meshEditTargetEl,
@@ -154,6 +161,7 @@ export function createApp() {
   });
   puppetPanel = createPuppetPanel({
     elements,
+    renderState,
     puppetRuntime,
   });
   const depthCore = createDepthCore(THREE);
@@ -245,6 +253,7 @@ export function createApp() {
       depthDiscontinuityEl,
       contourRepairEl,
       depthModeEl,
+      statusEl,
       gridSpecModeEl,
       gridXEl,
       gridYEl,
@@ -253,7 +262,7 @@ export function createApp() {
     },
   });
   const {
-    createPsdLayerEntries,
+    createLayerEntries,
     flattenPsdLayers,
     getCanvasImageData,
     createPsdDepthPreviewUrl,
@@ -279,14 +288,14 @@ export function createApp() {
     puppetRuntime,
     meshEditRuntime,
   });
-  const { clearSceneVisuals, buildPsdLayerMeshes, buildPreparedPsdLayerEntries } = sceneBuilder;
+  const { clearSceneVisuals, buildLayerMeshes, updateAdjustedLayerMeshes, buildPreparedLayerEntries } = sceneBuilder;
 
   const psdLoader = createPsdLoader({
     agPsd,
     renderState,
     defaults,
     loadImagePixels,
-    createPsdLayerEntries,
+    createLayerEntries,
     disposePsdLayerTextures: psdLoaderDispose,
     flattenPsdLayers,
     getCanvasImageData,
@@ -296,14 +305,14 @@ export function createApp() {
   const {
     ensureDefaultPsdPairLoaded,
     loadPsdPair,
-    rebuildPsdLayerEntriesIfNeeded,
+    rebuildLayerEntriesIfNeeded,
   } = psdLoader;
 
   const psdExport = createPsdExport({
     agPsd,
     renderState,
     statusEl,
-    buildPreparedPsdLayerEntries,
+    buildPreparedLayerEntries,
     flattenPsdLayers,
     getCanvasImageData,
   });
@@ -380,13 +389,22 @@ export function createApp() {
     }
     buildMesh();
     if (enabled) {
-      const visibleDebugLayers = renderState.psdLayerDebugMeshes?.length || 0;
+      const visibleDebugLayers = renderState.layerDebugMeshes?.length || 0;
       statusEl.textContent = `Generated meshes: ${visibleDebugLayers} debug overlays visible.`;
     }
     refreshStatusCounts();
   }
 
-  const { buildMesh, loadRasterModel, replaceImage, rebuildDepthModeResources } = createAppActions({
+  const {
+    buildMesh,
+    updateLayerDepthAdjustment,
+    loadRasterModel,
+    loadSourcePair,
+    replaceImage,
+    rebuildDepthModeResources,
+    runAlphaDepthGapFill,
+    startAlphaDepthGapFill,
+  } = createAppActions({
     THREE,
     scene,
     renderState,
@@ -398,6 +416,7 @@ export function createApp() {
       surfaceSmoothEl,
       sourceModeEl,
       statusEl,
+      contourRepairEl,
       depthModeEl,
       gridSpecModeEl,
       gridXEl,
@@ -409,7 +428,8 @@ export function createApp() {
     defaults,
     disposeMeshDepthTexture,
     clearSceneVisuals,
-    buildPsdLayerMeshes,
+    buildLayerMeshes,
+    updateAdjustedLayerMeshes,
     refreshStatusCounts,
     buildMaskedPlaneGeometry,
     buildRenderedBoundaryPointGeometry,
@@ -427,6 +447,9 @@ export function createApp() {
     disposeAdjustedDepthTexture,
     disposeRepairedBaseDepthTexture,
     createSegmentedGridDepthResources,
+    createMaskedGridDepthPixels,
+    createDepthTextureResources,
+    createBinaryMaskTexture,
     rebuildRepairedBaseDepth,
     meshEditRuntime,
   });
@@ -463,13 +486,74 @@ export function createApp() {
     if (!saveDepthPsdButtonEl) {
       return;
     }
-    if (renderState.sourceMode !== "psd" || !renderState.currentPsdExportName) {
+    if (!(renderState.layerEntries || []).length || !renderState.currentPsdExportName) {
       saveDepthPsdButtonEl.textContent = "Save depth PSD";
       saveDepthPsdButtonEl.disabled = true;
       return;
     }
     saveDepthPsdButtonEl.textContent = `Save ${renderState.currentPsdExportName}`;
     saveDepthPsdButtonEl.disabled = false;
+  }
+
+  function showAppProgress(label) {
+    workerProgressPanelEl?.classList.add("is-visible");
+    if (workerProgressLabelEl) {
+      workerProgressLabelEl.textContent = label;
+    }
+    if (workerProgressFillEl) {
+      workerProgressFillEl.style.width = "0%";
+    }
+  }
+
+  function updateAppProgress(progress, labelPrefix) {
+    if (!progress) {
+      return;
+    }
+    const message = progress.message ? ` ${progress.message}` : "";
+    if (progress.total == null) {
+      if (workerProgressLabelEl) {
+        workerProgressLabelEl.textContent = `${labelPrefix}${message}`;
+      }
+      statusEl.textContent = `${labelPrefix}${message}`;
+      return;
+    }
+    const current = Math.min(progress.total, progress.current ?? 0);
+    const percent = progress.total > 0 ? Math.round((current / progress.total) * 100) : 0;
+    const layer = progress.layerName ? ` ${progress.layerName}` : "";
+    if (workerProgressLabelEl) {
+      workerProgressLabelEl.textContent = `${labelPrefix}: ${current}/${progress.total}${layer}${message}`;
+    }
+    if (workerProgressFillEl) {
+      workerProgressFillEl.style.width = `${percent}%`;
+    }
+    statusEl.textContent = `${labelPrefix}: ${current}/${progress.total}${layer}${message}`;
+  }
+
+  function hideAppProgress() {
+    workerProgressPanelEl?.classList.remove("is-visible");
+  }
+
+  function waitForPaint() {
+    return new Promise((resolve) => {
+      requestAnimationFrame(() => resolve());
+    });
+  }
+
+  async function runAppProgress(label, task) {
+    showAppProgress(label);
+    updateAppProgress({ current: 0, total: 1, message: "starting" }, label);
+    try {
+      await waitForPaint();
+      const result = await task();
+      updateAppProgress({ current: 1, total: 1, message: "done" }, label);
+      return result;
+    } finally {
+      hideAppProgress();
+    }
+  }
+
+  function isCancelledError(error) {
+    return /cancel/i.test(error?.message || "");
   }
 
   renderState.currentPsdColorUrl = "";
@@ -525,6 +609,26 @@ export function createApp() {
     }
   }
 
+  async function loadModelById(modelId) {
+    const selectedModel = rasterModels.find((model) => model.id === modelId);
+    if (!selectedModel) {
+      throw new Error(`Unknown model id: ${modelId}`);
+    }
+    if (modelSelectEl) {
+      modelSelectEl.value = selectedModel.id;
+    }
+    if (selectedModel.type === "psd") {
+      await loadPsdModel(selectedModel);
+      return;
+    }
+    await loadRasterModel(selectedModel);
+    renderState.currentModel = selectedModel;
+    renderState.currentPsdColorUrl = "";
+    renderState.currentPsdDepthUrl = "";
+    renderState.currentPsdExportName = "";
+    syncPsdSaveButtonLabel();
+  }
+
   async function loadPsdModel(model) {
     if (!model?.colorUrl || (!model?.depthPsdUrl && !model?.stableDepthUrl)) {
       throw new Error("PSD model is missing color or depth URLs.");
@@ -533,39 +637,54 @@ export function createApp() {
     const colorUrl = withCacheBust(model.colorUrl);
     const depthPsdUrl = model.depthPsdUrl ? withCacheBust(model.depthPsdUrl) : null;
     const stableDepthUrl = model.stableDepthUrl ? withCacheBust(model.stableDepthUrl) : defaults.defaultPsdStableDepthUrl;
-    statusEl.textContent = `Loading ${model.label || model.id || "PSD model"}...`;
+    const label = `Loading ${model.label || model.id || "PSD model"}`;
+    statusEl.textContent = `${label}...`;
+    showAppProgress(label);
 
-    defaults.defaultPsdColorUrl = colorUrl;
-    defaults.defaultPsdDepthPsdUrl = depthPsdUrl;
-    defaults.defaultPsdStableDepthUrl = stableDepthUrl;
-    renderState.currentModel = model;
-    renderState.currentPsdColorUrl = model.colorUrl || "";
-    renderState.currentPsdDepthUrl = model.depthPsdUrl || model.stableDepthUrl || "";
-    renderState.currentPsdExportName = createPsdExportFileName(model);
-    renderState.pendingPsdColorBuffer = await fetch(colorUrl).then((response) => {
-      if (!response.ok) {
-        throw new Error(`Failed to load ${colorUrl}`);
-      }
-      return response.arrayBuffer();
-    });
-    renderState.pendingPsdDepthBuffer = null;
-    renderState.psdStableDepthPixels = null;
-    renderState.psdStableDepthWidth = 0;
-    renderState.psdStableDepthHeight = 0;
+    try {
+      defaults.defaultPsdColorUrl = colorUrl;
+      defaults.defaultPsdDepthPsdUrl = depthPsdUrl;
+      defaults.defaultPsdStableDepthUrl = stableDepthUrl;
+      renderState.currentModel = model;
+      renderState.depthOverrides = {};
+      renderState.currentPsdColorUrl = model.colorUrl || "";
+      renderState.currentPsdDepthUrl = model.depthPsdUrl || model.stableDepthUrl || "";
+      renderState.currentPsdExportName = createPsdExportFileName(model);
+      updateAppProgress({ current: 0, total: 3, message: "fetching color PSD" }, label);
+      renderState.pendingPsdColorBuffer = await fetch(colorUrl).then((response) => {
+        if (!response.ok) {
+          throw new Error(`Failed to load ${colorUrl}`);
+        }
+        return response.arrayBuffer();
+      });
+      updateAppProgress({ current: 1, total: 3, message: "loading depth source" }, label);
+      renderState.pendingPsdDepthBuffer = null;
+      renderState.psdStableDepthPixels = null;
+      renderState.psdStableDepthWidth = 0;
+      renderState.psdStableDepthHeight = 0;
 
-    await loadPsdPair(renderState.pendingPsdColorBuffer, { depthPsdUrl, stableDepthUrl });
-    renderState.sourceMode = "psd";
-    sourceModeEl.value = "psd";
-    renderState.meshEditHandlesByTarget = {};
-    renderState.meshEditHistory = [];
-    renderState.meshEditHistoryIndex = -1;
-    syncViewerModeUi();
-    rebuildSegmentList();
-    buildMesh();
-    updatePsdDebugPanel();
-    syncThumbs();
-    meshEditPanel?.sync();
-    syncPsdSaveButtonLabel();
+      await loadPsdPair(renderState.pendingPsdColorBuffer, {
+        depthPsdUrl,
+        stableDepthUrl,
+        onProgress: (progress) => updateAppProgress(progress, label),
+      });
+      updateAppProgress({ current: 2, total: 3, message: "building view" }, label);
+      renderState.sourceMode = "psd";
+      sourceModeEl.value = "psd";
+      renderState.meshEditHandlesByTarget = {};
+      renderState.meshEditHistory = [];
+      renderState.meshEditHistoryIndex = -1;
+      syncViewerModeUi();
+      rebuildSegmentList();
+      buildMesh();
+      updatePsdDebugPanel();
+      syncThumbs();
+      meshEditPanel?.sync();
+      syncPsdSaveButtonLabel();
+      updateAppProgress({ current: 3, total: 3, message: "loaded" }, label);
+    } finally {
+      hideAppProgress();
+    }
   }
 
   modelSelectEl?.addEventListener("change", async () => {
@@ -586,7 +705,7 @@ export function createApp() {
       syncPsdSaveButtonLabel();
     } catch (error) {
       console.error(error);
-      statusEl.textContent = `Failed: ${error.message}`;
+      statusEl.textContent = isCancelledError(error) ? "Cancelled." : `Failed: ${error.message}`;
     }
   });
 
@@ -596,11 +715,13 @@ export function createApp() {
     segmentDepthOffsetStep,
     segmentDepthScaleStep,
     buildMesh,
+    updateLayerDepthAdjustment,
     refreshStatusCounts,
     updateSegmentMaskTexture,
     updatePsdDebugPanel,
-    rebuildPsdLayerEntriesIfNeeded,
+    rebuildLayerEntriesIfNeeded,
     applySegmentDepthAdjustments,
+    runUiProgress: runAppProgress,
     puppetBoneIds: PUPPET_BONE_IDS,
     setLayerBindingPrimary: (layerIndex, primaryBoneId) => {
       puppetRuntime.setLayerBindingPrimary(layerIndex, primaryBoneId);
@@ -615,6 +736,7 @@ export function createApp() {
   meshEditPanel = createMeshEditPanel({
     elements: {
       meshEditPanelEl,
+      meshEditCollapseButtonEl,
       meshEditEnabledEl,
       meshEditAddModeEl,
       meshEditTargetEl,
@@ -650,6 +772,11 @@ export function createApp() {
       invertDepthEl,
       sourceModeEl,
       contourRepairEl,
+      alphaDepthGapFillButtonEl,
+      workerProgressPanelEl,
+      workerProgressLabelEl,
+      workerProgressFillEl,
+      workerCancelButtonEl,
       surfaceSmoothEl,
       generatedMeshDebugEnabledEl,
       depthModeEl,
@@ -673,7 +800,10 @@ export function createApp() {
     syncViewerModeUi,
     syncThumbs,
     buildMesh,
-    rebuildPsdLayerEntriesIfNeeded,
+    updateLayerDepthAdjustment,
+    runAlphaDepthGapFill,
+    startAlphaDepthGapFill,
+    rebuildLayerEntriesIfNeeded,
     rebuildDepthModeResources,
     applySegmentDepthAdjustments,
     rebuildSegmentList: () => rebuildSegmentList(),
@@ -700,6 +830,29 @@ export function createApp() {
     updatePsdDebugPanel();
     meshEditPanel?.sync();
     await loadRasterModelCatalog();
+    const externalApi = createExternalApi({
+      THREE,
+      renderState,
+      elements,
+      renderer,
+      scene,
+      camera,
+      controls,
+      getModels: () => rasterModels,
+      loadModelById,
+      loadSourcePair,
+      buildMesh,
+      updateLayerDepthAdjustment,
+      runAlphaDepthGapFill,
+      rebuildLayerEntriesIfNeeded,
+      rebuildDepthModeResources,
+      applySegmentDepthAdjustments,
+      updatePsdDebugPanel,
+      saveCurrentPsdDepthAsPsd,
+      createBinaryMaskTexture,
+    });
+    globalThis.__depthDrawApi = externalApi;
+    globalThis.__depthDrawRestBridge = startRestCommandBridge(externalApi);
     puppetRuntime.attachInteraction();
     meshEditRuntime.attachInteraction();
     onResize();
@@ -707,8 +860,9 @@ export function createApp() {
   }
 
   function psdLoaderDispose() {
-    for (let i = 0; i < renderState.psdLayerEntries.length; i += 1) {
-      const layer = renderState.psdLayerEntries[i];
+    const layerEntries = renderState.layerEntries || [];
+    for (let i = 0; i < layerEntries.length; i += 1) {
+      const layer = layerEntries[i];
       if (layer.colorTexture) {
         layer.colorTexture.dispose();
       }
@@ -722,7 +876,11 @@ export function createApp() {
         layer.debugTexture.dispose();
       }
     }
-    renderState.psdLayerEntries = [];
+    renderState.layerEntries = [];
+    renderState.preparedLayerEntries = [];
+    renderState.composedSource = null;
+    renderState.colorComposite = null;
+    renderState.depthComposite = null;
   }
 
   return { renderState };

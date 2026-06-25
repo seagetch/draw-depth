@@ -876,7 +876,8 @@ export function createDepthCore(THREE) {
       return;
     }
   
-    if (renderState.sourceMode !== "psd" || renderState.psdDebugLayerIndex < 0) {
+    const layerEntries = renderState.layerEntries || [];
+    if (!layerEntries.length || renderState.psdDebugLayerIndex < 0) {
       psdDebugPanelEl.classList.remove("is-visible");
       psdDebugImageEl.removeAttribute("src");
       if (psdDepthImageEl) {
@@ -885,7 +886,7 @@ export function createDepthCore(THREE) {
       return;
     }
   
-    const layer = renderState.psdLayerEntries[renderState.psdDebugLayerIndex];
+    const layer = layerEntries[renderState.psdDebugLayerIndex];
     if (!layer || !layer.debugPreviewUrl) {
       psdDebugPanelEl.classList.remove("is-visible");
       psdDebugImageEl.removeAttribute("src");

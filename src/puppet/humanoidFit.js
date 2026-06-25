@@ -223,14 +223,14 @@ function partInnerTopAnchor(partFit, side, fallback) {
 
 export function fitHumanoidSkeleton(context) {
   const {
-    psdLayerEntries,
+    layerEntries,
     imageWidth,
     imageHeight,
     puppetLayerFitEnabled,
     puppetLayerBindingOverrides,
     puppetSwapLeftRightMapping = false,
   } = context;
-  const descriptors = buildLayerDescriptors(psdLayerEntries, imageWidth, imageHeight, {
+  const descriptors = buildLayerDescriptors(layerEntries, imageWidth, imageHeight, {
     puppetLayerFitEnabled,
     puppetLayerBindingOverrides,
     puppetSwapLeftRightMapping,

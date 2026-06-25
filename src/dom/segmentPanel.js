@@ -1,3 +1,17 @@
+import {
+  getLayerDepthOffset,
+  getLayerDepthScale,
+  getLayerOutlierPruneEnabled,
+  getLayerPuppetBindingOverride,
+  getLayerPuppetFitEnabled,
+  getLayerVisible,
+  setLayerDepthOffset,
+  setLayerDepthScale,
+  setLayerOutlierPruneEnabled,
+  setLayerPuppetFitEnabled,
+  setLayerVisible,
+} from "../composite/schema.js";
+
 export function createSegmentPanel(deps) {
   const {
     elements,
@@ -5,17 +19,27 @@ export function createSegmentPanel(deps) {
     segmentDepthOffsetStep,
     segmentDepthScaleStep,
     buildMesh,
+    updateLayerDepthAdjustment,
     refreshStatusCounts,
     updateSegmentMaskTexture,
     updatePsdDebugPanel,
-    rebuildPsdLayerEntriesIfNeeded,
+    rebuildLayerEntriesIfNeeded,
     applySegmentDepthAdjustments,
+    runUiProgress,
     puppetBoneIds = [],
     setLayerBindingPrimary,
     onError,
   } = deps;
 
   const { segmentListEl } = elements;
+
+  function hasLayerControls() {
+    return renderState.colorComposite?.format === "psd" || (renderState.layerEntries || []).length > 1;
+  }
+
+  function getLayerEntries() {
+    return renderState.layerEntries || [];
+  }
 
   function groupPsdLayerEntries(layers) {
     const groups = [];
@@ -72,8 +96,8 @@ export function createSegmentPanel(deps) {
     const checkboxes = segmentListEl.querySelectorAll('input[type="checkbox"]');
     checkboxes.forEach((checkbox) => {
       const index = Number(checkbox.dataset.segmentIndex);
-      checkbox.checked = renderState.sourceMode === "psd"
-        ? renderState.psdLayerVisibility[index]
+      checkbox.checked = hasLayerControls()
+        ? getLayerVisible(renderState, index)
         : renderState.segmentVisibility[index];
     });
   }
@@ -82,9 +106,9 @@ export function createSegmentPanel(deps) {
     const labels = segmentListEl.querySelectorAll("[data-segment-metrics]");
     labels.forEach((label) => {
       const index = Number(label.dataset.segmentMetrics);
-      if (renderState.sourceMode === "psd") {
+      if (hasLayerControls()) {
         label.textContent =
-          `o${renderState.psdLayerDepthOffsets[index]} s${renderState.psdLayerDepthScales[index].toFixed(2)}`;
+          `o${getLayerDepthOffset(renderState, index)} s${getLayerDepthScale(renderState, index).toFixed(2)}`;
       } else {
         label.textContent =
           `o${renderState.segmentDepthOffsets[index]} s${renderState.segmentDepthScales[index].toFixed(2)}`;
@@ -113,7 +137,7 @@ export function createSegmentPanel(deps) {
     puppetSelects.forEach((select) => {
       const index = Number(select.dataset.segmentPuppetPrimary);
       const binding = renderState.puppetLayerBindings[index];
-      const override = renderState.puppetLayerBindingOverrides[index];
+      const override = getLayerPuppetBindingOverride(renderState, index);
       select.value = override?.primaryBoneId || binding?.primaryBoneId || "";
       select.title = override?.primaryBoneId
         ? "Manual puppet binding override"
@@ -132,7 +156,7 @@ export function createSegmentPanel(deps) {
     const pruneButtons = segmentListEl.querySelectorAll('[data-segment-action="prune-toggle"]');
     pruneButtons.forEach((button) => {
       const index = Number(button.dataset.segmentIndex);
-      const active = !!renderState.psdLayerOutlierPruneEnabled[index];
+      const active = getLayerOutlierPruneEnabled(renderState, index);
       button.title = active ? "Disable outlier segment prune" : "Enable outlier segment prune";
       button.style.background = active ? "rgba(255, 200, 120, 0.28)" : "rgba(255, 255, 255, 0.05)";
     });
@@ -140,7 +164,7 @@ export function createSegmentPanel(deps) {
     const rigButtons = segmentListEl.querySelectorAll('[data-segment-action="rig-toggle"]');
     rigButtons.forEach((button) => {
       const index = Number(button.dataset.segmentIndex);
-      const active = renderState.puppetLayerFitEnabled[index] ?? true;
+      const active = getLayerPuppetFitEnabled(renderState, index);
       button.textContent = active ? "R" : "X";
       button.title = active ? "Exclude from puppet fit" : "Include in puppet fit";
       button.style.background = active ? "rgba(100, 210, 140, 0.25)" : "rgba(255, 120, 120, 0.28)";
@@ -151,7 +175,7 @@ export function createSegmentPanel(deps) {
       const groupTitle = button.dataset.groupTitle || "";
       const groupIndexes = [...segmentListEl.querySelectorAll(`.segment-item[data-group-title="${CSS.escape(groupTitle)}"]`)]
         .map((row) => Number(row.dataset.segmentIndex));
-      const enabledCount = groupIndexes.filter((index) => renderState.puppetLayerFitEnabled[index] ?? true).length;
+      const enabledCount = groupIndexes.filter((index) => getLayerPuppetFitEnabled(renderState, index)).length;
       const allEnabled = enabledCount === groupIndexes.length;
       const noneEnabled = enabledCount === 0;
       button.textContent = allEnabled ? "R" : (noneEnabled ? "X" : "~");
@@ -172,28 +196,32 @@ export function createSegmentPanel(deps) {
     if (!groupIndexes.length) {
       return;
     }
-    const shouldEnable = groupIndexes.some((index) => !(renderState.puppetLayerFitEnabled[index] ?? true));
+    const shouldEnable = groupIndexes.some((index) => !getLayerPuppetFitEnabled(renderState, index));
     for (let i = 0; i < groupIndexes.length; i += 1) {
-      renderState.puppetLayerFitEnabled[groupIndexes[i]] = shouldEnable;
+      setLayerPuppetFitEnabled(renderState, groupIndexes[i], shouldEnable);
     }
     syncSegmentAdjustmentLabels();
-    buildMesh();
+    runPanelProgress("Rebuilding mesh", () => {
+      buildMesh();
+    });
   }
 
   function applySegmentToggle(segmentIndex, invertOthers) {
-    if (renderState.sourceMode === "psd") {
+    if (hasLayerControls()) {
       if (invertOthers) {
-        const nextTargetState = !renderState.psdLayerVisibility[segmentIndex];
-        renderState.psdLayerVisibility = renderState.psdLayerVisibility.map((_, index) => (
-          index === segmentIndex ? nextTargetState : !nextTargetState
-        ));
+        const nextTargetState = !getLayerVisible(renderState, segmentIndex);
+        getLayerEntries().forEach((_, index) => {
+          setLayerVisible(renderState, index, index === segmentIndex ? nextTargetState : !nextTargetState);
+        });
       } else {
-        renderState.psdLayerVisibility[segmentIndex] = !renderState.psdLayerVisibility[segmentIndex];
+        setLayerVisible(renderState, segmentIndex, !getLayerVisible(renderState, segmentIndex));
       }
 
       syncSegmentCheckboxes();
-      buildMesh();
-      refreshStatusCounts();
+      runPanelProgress("Rebuilding mesh", () => {
+        buildMesh();
+        refreshStatusCounts();
+      });
       return;
     }
 
@@ -207,22 +235,31 @@ export function createSegmentPanel(deps) {
     }
 
     syncSegmentCheckboxes();
-    updateSegmentMaskTexture();
-    refreshStatusCounts();
+    runPanelProgress("Updating segment visibility", () => {
+      updateSegmentMaskTexture();
+      refreshStatusCounts();
+    });
   }
 
   function applySegmentDepthAdjustment(action, segmentIndex) {
-    if (action === "debug-toggle" && renderState.sourceMode === "psd") {
+    if (action === "debug-toggle" && hasLayerControls()) {
       renderState.psdDebugLayerIndex = renderState.psdDebugLayerIndex === segmentIndex ? -1 : segmentIndex;
       syncSegmentAdjustmentLabels();
-      buildMesh();
+      runPanelProgress("Rebuilding debug view", () => {
+        buildMesh();
+      });
       return;
     }
 
-    if (action === "prune-toggle" && renderState.sourceMode === "psd") {
-      renderState.psdLayerOutlierPruneEnabled[segmentIndex] = !renderState.psdLayerOutlierPruneEnabled[segmentIndex];
+    if (action === "prune-toggle" && hasLayerControls()) {
+      setLayerOutlierPruneEnabled(
+        renderState,
+        segmentIndex,
+        !getLayerOutlierPruneEnabled(renderState, segmentIndex),
+      );
       syncSegmentAdjustmentLabels();
-      rebuildPsdLayerEntriesIfNeeded().then((reloaded) => {
+      runPanelProgress("Rebuilding layers", async () => {
+        const reloaded = await rebuildLayerEntriesIfNeeded();
         if (reloaded) {
           rebuildSegmentList();
         }
@@ -231,42 +268,85 @@ export function createSegmentPanel(deps) {
       return;
     }
 
-    if (action === "rig-toggle" && renderState.sourceMode === "psd") {
-      renderState.puppetLayerFitEnabled[segmentIndex] = !(renderState.puppetLayerFitEnabled[segmentIndex] ?? true);
+    if (action === "rig-toggle" && hasLayerControls()) {
+      setLayerPuppetFitEnabled(renderState, segmentIndex, !getLayerPuppetFitEnabled(renderState, segmentIndex));
       syncSegmentAdjustmentLabels();
-      buildMesh();
+      runPanelProgress("Rebuilding mesh", () => {
+        buildMesh();
+      });
       return;
     }
 
-    const offsets = renderState.sourceMode === "psd"
-      ? renderState.psdLayerDepthOffsets
-      : renderState.segmentDepthOffsets;
-    const scales = renderState.sourceMode === "psd"
-      ? renderState.psdLayerDepthScales
-      : renderState.segmentDepthScales;
-
-    if (action === "offset-down") {
-      offsets[segmentIndex] -= segmentDepthOffsetStep;
+    if (hasLayerControls()) {
+      if (action === "offset-down") {
+        setLayerDepthOffset(renderState, segmentIndex, getLayerDepthOffset(renderState, segmentIndex) - segmentDepthOffsetStep);
+      } else if (action === "offset-up") {
+        setLayerDepthOffset(renderState, segmentIndex, getLayerDepthOffset(renderState, segmentIndex) + segmentDepthOffsetStep);
+      } else if (action === "scale-down") {
+        setLayerDepthScale(
+          renderState,
+          segmentIndex,
+          Math.max(0.1, Number((getLayerDepthScale(renderState, segmentIndex) - segmentDepthScaleStep).toFixed(2))),
+        );
+      } else if (action === "scale-up") {
+        setLayerDepthScale(
+          renderState,
+          segmentIndex,
+          Number((getLayerDepthScale(renderState, segmentIndex) + segmentDepthScaleStep).toFixed(2)),
+        );
+      }
+    } else if (action === "offset-down") {
+      renderState.segmentDepthOffsets[segmentIndex] -= segmentDepthOffsetStep;
     } else if (action === "offset-up") {
-      offsets[segmentIndex] += segmentDepthOffsetStep;
+      renderState.segmentDepthOffsets[segmentIndex] += segmentDepthOffsetStep;
     } else if (action === "scale-down") {
-      scales[segmentIndex] = Math.max(0.1, Number((scales[segmentIndex] - segmentDepthScaleStep).toFixed(2)));
+      renderState.segmentDepthScales[segmentIndex] = Math.max(0.1, Number((renderState.segmentDepthScales[segmentIndex] - segmentDepthScaleStep).toFixed(2)));
     } else if (action === "scale-up") {
-      scales[segmentIndex] = Number((scales[segmentIndex] + segmentDepthScaleStep).toFixed(2));
+      renderState.segmentDepthScales[segmentIndex] = Number((renderState.segmentDepthScales[segmentIndex] + segmentDepthScaleStep).toFixed(2));
     }
 
     syncSegmentAdjustmentLabels();
-    if (renderState.sourceMode !== "psd") {
-      applySegmentDepthAdjustments();
+    if (hasLayerControls() && ["offset-down", "offset-up", "scale-down", "scale-up"].includes(action)) {
+      if (typeof updateLayerDepthAdjustment === "function") {
+        runPanelProgress("Updating layer depth", () => {
+          updateLayerDepthAdjustment(segmentIndex);
+        });
+      } else {
+        runPanelProgress("Rebuilding mesh", () => {
+          buildMesh();
+        });
+      }
+      return;
     }
-    buildMesh();
+    if (!hasLayerControls()) {
+      runPanelProgress("Rebuilding segment depth", () => {
+        applySegmentDepthAdjustments();
+        buildMesh();
+      });
+      return;
+    }
+    runPanelProgress("Rebuilding mesh", () => {
+      buildMesh();
+    });
+  }
+
+  function runPanelProgress(label, task) {
+    if (typeof runUiProgress === "function") {
+      return runUiProgress(label, task).catch(onError);
+    }
+    try {
+      return Promise.resolve(task());
+    } catch (error) {
+      onError?.(error);
+      return Promise.resolve(null);
+    }
   }
 
   function rebuildSegmentList() {
     segmentListEl.textContent = "";
 
-    if (renderState.sourceMode === "psd") {
-      const groups = groupPsdLayerEntries(renderState.psdLayerEntries);
+    if (hasLayerControls()) {
+      const groups = groupPsdLayerEntries(getLayerEntries());
       groups.forEach((group) => {
         const groupEl = document.createElement("div");
         groupEl.className = "segment-group";
@@ -289,7 +369,7 @@ export function createSegmentPanel(deps) {
 
           const checkbox = document.createElement("input");
           checkbox.type = "checkbox";
-          checkbox.checked = renderState.psdLayerVisibility[index];
+          checkbox.checked = getLayerVisible(renderState, index);
           checkbox.dataset.segmentIndex = String(index);
           checkbox.tabIndex = -1;
           checkbox.style.pointerEvents = "none";

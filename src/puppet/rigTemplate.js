@@ -250,7 +250,7 @@ function normalizeHumanoidPoints(points, imageWidth, imageHeight) {
 export function createHumanoidRigData(context) {
   const {
     layerMeshEntries,
-    psdLayerEntries,
+    layerEntries,
     imageWidth,
     imageHeight,
     puppetLayerFitEnabled,
@@ -258,12 +258,12 @@ export function createHumanoidRigData(context) {
     puppetSwapLeftRightMapping = false,
   } = context;
   const bounds = computeAggregateBounds(layerMeshEntries);
-  if (!bounds || !psdLayerEntries?.length || !imageWidth || !imageHeight) {
+  if (!bounds || !layerEntries?.length || !imageWidth || !imageHeight) {
     return null;
   }
 
   const fit = fitHumanoidSkeleton({
-    psdLayerEntries,
+    layerEntries,
     imageWidth,
     imageHeight,
     puppetLayerFitEnabled,

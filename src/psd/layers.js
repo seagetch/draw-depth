@@ -1,3 +1,21 @@
+import {
+  flattenCompositeLayers,
+  getCanvasImageData as getCompositeCanvasImageData,
+} from "../composite/colorSources.js";
+import {
+  buildLayerContourBandMask as buildLayerContourBandMaskGeneric,
+} from "../composite/depthCleanup.js";
+import {
+  computeMaskedDepthStats as computeMaskedDepthStatsGeneric,
+  writeDepthDebugStats as writeDepthDebugStatsGeneric,
+} from "../composite/debugStats.js";
+import { getLayerOutlierPruneEnabled } from "../composite/schema.js";
+import {
+  buildLayerLookup,
+  takeMatchedLayer,
+} from "../composite/layerMatch.js";
+import { runCompositeWorker } from "../workers/compositeWorkerClient.js?v=20260626_4";
+
 export function createPsdLayers(deps) {
   const {
     THREE,
@@ -12,6 +30,7 @@ export function createPsdLayers(deps) {
     depthDiscontinuityEl,
     contourRepairEl,
     depthModeEl,
+    statusEl,
     gridSpecModeEl,
     gridXEl,
     gridYEl,
@@ -21,38 +40,24 @@ export function createPsdLayers(deps) {
   const surfaceAlphaMin = 255;
 
   function flattenPsdLayers(layers, output = []) {
-    for (let i = 0; i < layers.length; i += 1) {
-      const layer = layers[i];
-      if (layer.hidden) {
-        continue;
-      }
-
-      if (layer.children && layer.children.length) {
-        flattenPsdLayers(layer.children, output);
-        continue;
-      }
-
-      if (!layer.canvas) {
-        continue;
-      }
-
-      output.push({
-        name: layer.name || "",
-        left: layer.left || 0,
-        top: layer.top || 0,
-        width: layer.canvas.width,
-        height: layer.canvas.height,
-        canvas: layer.canvas,
-      });
-    }
-
-    return output;
+    return flattenCompositeLayers(layers, output);
   }
 
-  function createPsdLayerEntries(colorPsd, depthPsd, stableDepthPixels) {
+  async function createLayerEntries(source, options = {}) {
+    const emitProgress = typeof options.onProgress === "function"
+      ? options.onProgress
+      : () => {};
+    const composedSource = source?.colorSource && source?.depthSource ? source : null;
+    const colorPsd = composedSource?.colorSource?.document || options.colorDocument || source;
+    const depthPsd = composedSource?.depthSource?.format === "psd"
+      ? composedSource.depthSource.document
+      : options.depthDocument || null;
+    const stableDepthPixels = composedSource?.depthSource?.format === "psd"
+      ? null
+      : (composedSource?.depthSource?.layers?.[0]?.pixels || options.stableDepthPixels || null);
     const colorLayers = flattenPsdLayers(colorPsd.children || []);
     const depthLayers = depthPsd ? flattenPsdLayers(depthPsd.children || []) : null;
-    const depthLayerLookup = depthLayers ? buildPsdLayerLookup(depthLayers) : null;
+    const depthLayerLookup = depthLayers ? buildLayerLookup(depthLayers) : null;
     if (!depthPsd && !stableDepthPixels) {
       throw new Error("Midori-depth-st.png could not be loaded.");
     }
@@ -62,6 +67,14 @@ export function createPsdLayers(deps) {
   
     for (let i = 0; i < colorLayers.length; i += 1) {
       const colorLayer = colorLayers[i];
+      emitProgress({
+        stage: "read-layers",
+        current: i,
+        total: colorLayers.length,
+        layerIndex: i,
+        layerName: colorLayer?.name || "",
+        message: "reading layer pixels",
+      });
       if (colorLayer.width <= 0 || colorLayer.height <= 0) {
         continue;
       }
@@ -74,9 +87,12 @@ export function createPsdLayers(deps) {
   
       const colorImageData = getCanvasImageData(colorLayer.canvas);
       const colorMaskPixels = extractLayerMaskPixels(colorImageData.data);
-      const colorSurfaceMaskPixels = extractLayerMaskPixels(colorImageData.data, surfaceAlphaMin);
+      const strictSurfaceMaskPixels = extractLayerMaskPixels(colorImageData.data, surfaceAlphaMin);
+      const colorSurfaceMaskPixels = hasAnyMaskPixel(strictSurfaceMaskPixels)
+        ? strictSurfaceMaskPixels
+        : colorMaskPixels;
       const depthLayer = depthLayerLookup
-        ? takeMatchedPsdLayer(depthLayerLookup, colorLayer, i)
+        ? takeMatchedLayer(depthLayerLookup, colorLayer, i)
         : (depthLayers && depthLayers[i] ? depthLayers[i] : null);
       const depthImageData = depthLayer
         ? getCanvasImageData(depthLayer.canvas)
@@ -151,6 +167,14 @@ export function createPsdLayers(deps) {
         directDepthPixels: depthPixels,
         depthMaskPixels: maskPixels,
       });
+      emitProgress({
+        stage: "read-layers",
+        current: i + 1,
+        total: colorLayers.length,
+        layerIndex: i,
+        layerName: colorLayer?.name || "",
+        message: "layer pixels ready",
+      });
     }
   
     const mergedLayerSources = mergePsdFaceFeatureLayers(
@@ -162,7 +186,7 @@ export function createPsdLayers(deps) {
   
     const visibleLayerMap = depthPsd || !stableDepthPixels
       ? null
-      : buildVisiblePsdLayerMap(
+      : await buildVisiblePsdLayerMap(
         colorPsd.width,
         colorPsd.height,
         mergedLayerSources,
@@ -172,8 +196,21 @@ export function createPsdLayers(deps) {
   
     for (let i = 0; i < mergedLayerSources.length; i += 1) {
       const layer = mergedLayerSources[i];
+      emitProgress({
+        stage: "layer-depth",
+        current: i,
+        total: mergedLayerSources.length,
+        layerIndex: i,
+        layerName: layer?.name || "",
+        message: "preparing layer depth",
+      });
+      if (statusEl) {
+        statusEl.textContent = `PSD layer processing: ${i + 1}/${mergedLayerSources.length} ${layer.name || ""}`;
+      }
       const maskPixels = extractLayerMaskPixels(layer.colorImageData.data);
-      const surfaceMaskPixels = layer.surfaceMaskPixels || maskPixels;
+      const surfaceMaskPixels = hasAnyMaskPixel(layer.surfaceMaskPixels)
+        ? layer.surfaceMaskPixels
+        : maskPixels;
       if (depthPsd) {
         const rawDepthPixels = (layer.directDepthPixels || new Uint8Array(layer.width * layer.height)).slice();
         const pruneResult = {
@@ -182,7 +219,15 @@ export function createPsdLayers(deps) {
           debugScore: new Uint8Array(rawDepthPixels.length),
         };
         if (contourRepairEl.checked) {
-          const contourBandMask = buildLayerContourBandMask(maskPixels, layer.width, layer.height, 2);
+          emitProgress({
+            stage: "depth-cleanup",
+            current: i,
+            total: mergedLayerSources.length,
+            layerIndex: i,
+            layerName: layer?.name || "",
+            message: "building contour mask",
+          });
+          const contourBandMask = await buildLayerContourBandMask(maskPixels, layer.width, layer.height, 2);
           for (let p = 0; p < rawDepthPixels.length; p += 1) {
             if (contourBandMask[p]) {
               rawDepthPixels[p] = 0;
@@ -190,7 +235,15 @@ export function createPsdLayers(deps) {
             }
           }
         }
-        const erodedPositiveMask = erodePositiveDepthMask(rawDepthPixels, layer.width, layer.height, 1);
+        emitProgress({
+          stage: "depth-cleanup",
+          current: i,
+          total: mergedLayerSources.length,
+          layerIndex: i,
+          layerName: layer?.name || "",
+          message: "eroding positive depth",
+        });
+        const erodedPositiveMask = await erodePositiveDepthMask(rawDepthPixels, layer.width, layer.height, 1);
         let removedDepthPixels = 0;
         for (let p = 0; p < rawDepthPixels.length; p += 1) {
           if (maskPixels[p] && rawDepthPixels[p] > 0 && !erodedPositiveMask[p]) {
@@ -199,7 +252,15 @@ export function createPsdLayers(deps) {
             removedDepthPixels += 1;
           }
         }
-        const inpaintResult = inpaintMaskedLayerDepth(rawDepthPixels, maskPixels, layer.width, layer.height);
+        emitProgress({
+          stage: "depth-cleanup",
+          current: i,
+          total: mergedLayerSources.length,
+          layerIndex: i,
+          layerName: layer?.name || "",
+          message: "inpainting layer depth",
+        });
+        const inpaintResult = await inpaintMaskedLayerDepth(rawDepthPixels, maskPixels, layer.width, layer.height);
         pendingLayers.push({
           layer,
           hasDirectDepth: true,
@@ -210,10 +271,26 @@ export function createPsdLayers(deps) {
           inpaintFilledMask: inpaintResult.filledMask,
           inpaintedDepthPixels: inpaintResult.pixels,
         });
+        emitProgress({
+          stage: "layer-depth",
+          current: i + 1,
+          total: mergedLayerSources.length,
+          layerIndex: i,
+          layerName: layer?.name || "",
+          message: "layer depth ready",
+        });
         continue;
       }
   
-      const seededDepthPixels = seedPsdLayerDepthPixels(
+      emitProgress({
+        stage: "depth-split",
+        current: i,
+        total: mergedLayerSources.length,
+        layerIndex: i,
+        layerName: layer?.name || "",
+        message: "seeding layer depth",
+      });
+      const seededDepthPixels = await seedPsdLayerDepthPixels(
         layer,
         i,
         colorPsd.width,
@@ -223,7 +300,15 @@ export function createPsdLayers(deps) {
         maskPixels,
         mergedLayerSources,
       );
-      const pruneResult = prunePsdForeignDepthSeeds(
+      emitProgress({
+        stage: "depth-prune",
+        current: i,
+        total: mergedLayerSources.length,
+        layerIndex: i,
+        layerName: layer?.name || "",
+        message: "pruning foreign depth",
+      });
+      const pruneResult = await prunePsdForeignDepthSeeds(
         seededDepthPixels,
         layer,
         i,
@@ -236,7 +321,15 @@ export function createPsdLayers(deps) {
       );
       const depthPixels = pruneResult.pixels;
       if (contourRepairEl.checked) {
-        const contourBandMask = buildLayerContourBandMask(maskPixels, layer.width, layer.height, 2);
+        emitProgress({
+          stage: "depth-cleanup",
+          current: i,
+          total: mergedLayerSources.length,
+          layerIndex: i,
+          layerName: layer?.name || "",
+          message: "building contour mask",
+        });
+        const contourBandMask = await buildLayerContourBandMask(maskPixels, layer.width, layer.height, 2);
         for (let p = 0; p < depthPixels.length; p += 1) {
           if (contourBandMask[p]) {
             depthPixels[p] = 0;
@@ -245,7 +338,15 @@ export function createPsdLayers(deps) {
         }
       }
   
-      const erodedPositiveMask = erodePositiveDepthMask(depthPixels, layer.width, layer.height, 1);
+      emitProgress({
+        stage: "depth-cleanup",
+        current: i,
+        total: mergedLayerSources.length,
+        layerIndex: i,
+        layerName: layer?.name || "",
+        message: "eroding positive depth",
+      });
+      const erodedPositiveMask = await erodePositiveDepthMask(depthPixels, layer.width, layer.height, 1);
       let removedDepthPixels = 0;
       for (let p = 0; p < depthPixels.length; p += 1) {
         if (maskPixels[p] && depthPixels[p] > 0 && !erodedPositiveMask[p]) {
@@ -255,7 +356,15 @@ export function createPsdLayers(deps) {
         }
       }
   
-      if (renderState.psdLayerOutlierPruneEnabled[i]) {
+      if (getLayerOutlierPruneEnabled(composedSource, i)) {
+        emitProgress({
+          stage: "depth-prune",
+          current: i,
+          total: mergedLayerSources.length,
+          layerIndex: i,
+          layerName: layer?.name || "",
+          message: "pruning outlier clusters",
+        });
         pruneOutlierSeedDepthClusters(
           depthPixels,
           pruneResult.debugState,
@@ -267,7 +376,15 @@ export function createPsdLayers(deps) {
         );
       }
   
-      const inpaintResult = inpaintMaskedLayerDepth(depthPixels, maskPixels, layer.width, layer.height);
+      emitProgress({
+        stage: "depth-cleanup",
+        current: i,
+        total: mergedLayerSources.length,
+        layerIndex: i,
+        layerName: layer?.name || "",
+        message: "inpainting layer depth",
+      });
+      const inpaintResult = await inpaintMaskedLayerDepth(depthPixels, maskPixels, layer.width, layer.height);
       pendingLayers.push({
         layer,
         maskPixels,
@@ -275,6 +392,14 @@ export function createPsdLayers(deps) {
         removedDepthPixels,
         inpaintFilledMask: inpaintResult.filledMask,
         inpaintedDepthPixels: inpaintResult.pixels,
+      });
+      emitProgress({
+        stage: "layer-depth",
+        current: i + 1,
+        total: mergedLayerSources.length,
+        layerIndex: i,
+        layerName: layer?.name || "",
+        message: "layer depth ready",
       });
     }
   
@@ -285,6 +410,14 @@ export function createPsdLayers(deps) {
     for (let i = 0; i < pendingLayers.length; i += 1) {
       const pending = pendingLayers[i];
       const { layer, maskPixels, pruneResult } = pending;
+      emitProgress({
+        stage: "finalize-layers",
+        current: i,
+        total: pendingLayers.length,
+        layerIndex: i,
+        layerName: layer?.name || "",
+        message: "building layer textures",
+      });
       const surfaceMaskPixels = pending.surfaceMaskPixels || maskPixels;
       const smoothedDepthPixels = pending.inpaintedDepthPixels;
       const finalDepthPixels = pending.hasDirectDepth || depthModeEl.value === "raw"
@@ -331,11 +464,13 @@ export function createPsdLayers(deps) {
   
       entries.push({
         name: layer.name,
+        sourceIndex: layer.sourceIndices?.[0] ?? layer.sourceIndex,
         sourceIndices: layer.sourceIndices ? layer.sourceIndices.slice() : [layer.sourceIndex],
         left: layer.left,
         top: layer.top,
         width: layer.width,
         height: layer.height,
+        colorImageData: layer.colorImageData,
         colorTexture: layer.colorTexture,
         depthTexture,
         maskTexture,
@@ -349,6 +484,8 @@ export function createPsdLayers(deps) {
         depthAlphaLeakPixels: layer.depthAlphaLeakPixels || 0,
         depthPreviewUrl,
         inpaintFilledMask: pending.inpaintFilledMask,
+        depthModeSourcePixels: smoothedDepthPixels.slice(),
+        directDepthPixels: layer.directDepthPixels ? layer.directDepthPixels.slice() : smoothedDepthPixels.slice(),
         baseDepthPixels: finalDepthPixels.slice(),
         depthPixels: finalDepthPixels,
         renderDepthMask,
@@ -357,6 +494,14 @@ export function createPsdLayers(deps) {
         surfaceMaskPixels,
         removedDepthPixels: pending.removedDepthPixels,
         visible: true,
+      });
+      emitProgress({
+        stage: "finalize-layers",
+        current: i + 1,
+        total: pendingLayers.length,
+        layerIndex: i,
+        layerName: layer?.name || "",
+        message: "layer textures ready",
       });
     }
 
@@ -420,94 +565,11 @@ export function createPsdLayers(deps) {
   }
 
   function computeMaskedDepthStats(depthPixels, maskPixels, width, height) {
-    let masked = 0;
-    let zero = 0;
-    let min = 255;
-    let max = 0;
-    let adjacentMax = 0;
-    let adjacentMaxAt = null;
-    const adjacentDeltas = [];
-
-    for (let y = 0; y < height; y += 1) {
-      for (let x = 0; x < width; x += 1) {
-        const index = y * width + x;
-        if (maskPixels && !maskPixels[index]) {
-          continue;
-        }
-        const depth = depthPixels[index];
-        masked += 1;
-        if (depth === 0) {
-          zero += 1;
-        }
-        if (depth < min) {
-          min = depth;
-        }
-        if (depth > max) {
-          max = depth;
-        }
-        if (x + 1 < width && (!maskPixels || maskPixels[index + 1])) {
-          const delta = Math.abs(depth - depthPixels[index + 1]);
-          if (delta > adjacentMax) {
-            adjacentMax = delta;
-            adjacentMaxAt = {
-              x,
-              y,
-              direction: "x",
-              a: depth,
-              b: depthPixels[index + 1],
-            };
-          }
-          adjacentDeltas.push(delta);
-        }
-        if (y + 1 < height && (!maskPixels || maskPixels[index + width])) {
-          const delta = Math.abs(depth - depthPixels[index + width]);
-          if (delta > adjacentMax) {
-            adjacentMax = delta;
-            adjacentMaxAt = {
-              x,
-              y,
-              direction: "y",
-              a: depth,
-              b: depthPixels[index + width],
-            };
-          }
-          adjacentDeltas.push(delta);
-        }
-      }
-    }
-
-    adjacentDeltas.sort((a, b) => a - b);
-    const p95Index = adjacentDeltas.length ? Math.floor((adjacentDeltas.length - 1) * 0.95) : 0;
-    const p99Index = adjacentDeltas.length ? Math.floor((adjacentDeltas.length - 1) * 0.99) : 0;
-    return {
-      width,
-      height,
-      masked,
-      zero,
-      zeroRatio: masked ? zero / masked : 0,
-      min: masked ? min : 0,
-      max: masked ? max : 0,
-      range: masked ? max - min : 0,
-      adjacentMax,
-      adjacentMaxAt,
-      adjacentP95: adjacentDeltas[p95Index] || 0,
-      adjacentP99: adjacentDeltas[p99Index] || 0,
-    };
+    return computeMaskedDepthStatsGeneric(depthPixels, maskPixels, width, height);
   }
 
   function writeDepthDebugStats(payload) {
-    try {
-      const serialized = JSON.stringify(payload);
-      if (typeof localStorage !== "undefined") {
-        localStorage.setItem("depthDrawDebugStats", serialized);
-      }
-      if (typeof document !== "undefined" && document.documentElement) {
-        document.documentElement.setAttribute("data-depth-draw-debug-stats", serialized);
-      }
-      console.info("[depth-draw] PSD depth debug stats", payload);
-    } catch (error) {
-      console.warn("[depth-draw] Failed to write PSD depth debug stats", error);
-    }
+    writeDepthDebugStatsGeneric(payload);
   }
 
   function pruneOutlierSeedDepthClusters(depthPixels, debugState, debugScore, maskPixels, width, height, threshold) {
@@ -516,7 +578,7 @@ export function createPsdLayers(deps) {
     const queue = new Int32Array(totalPixels);
     const components = [];
     const linkThreshold = Math.max(6, threshold * 0.2);
-    const contourMask = buildLayerContourBandMask(maskPixels, width, height, 1);
+    const contourMask = buildLayerContourBandMaskGeneric(maskPixels, width, height, 1);
     const neighbors = [
       [-1, 0],
       [1, 0],
@@ -817,8 +879,7 @@ export function createPsdLayers(deps) {
   }
   
   function getCanvasImageData(canvas) {
-    const context = canvas.getContext("2d", { willReadFrequently: true });
-    return context.getImageData(0, 0, canvas.width, canvas.height);
+    return getCompositeCanvasImageData(canvas);
   }
   
   function mergePsdFaceFeatureLayers(layerSources, imageWidth, imageHeight, options = {}) {
@@ -863,131 +924,6 @@ export function createPsdLayers(deps) {
     }
   
     return merged;
-  }
-  
-  function buildPsdLayerLookup(layers) {
-    const lookup = new Map();
-    for (let i = 0; i < layers.length; i += 1) {
-      const layer = layers[i];
-      const key = getPsdLayerMatchKey(layer);
-      if (!lookup.has(key)) {
-        lookup.set(key, []);
-      }
-      lookup.get(key).push({ layer, index: i });
-    }
-    return lookup;
-  }
-  
-  function getPsdLayerMatchKey(layer) {
-    return [
-      layer.name || "",
-      layer.left || 0,
-      layer.top || 0,
-      layer.canvas ? layer.canvas.width : (layer.width || 0),
-      layer.canvas ? layer.canvas.height : (layer.height || 0),
-    ].join("|");
-  }
-  
-  function takeMatchedPsdLayer(lookup, colorLayer, fallbackIndex) {
-    const exactKey = getPsdLayerMatchKey(colorLayer);
-    const exactMatches = lookup.get(exactKey);
-    if (exactMatches && exactMatches.length) {
-      return exactMatches.shift().layer;
-    }
-
-    const colorName = normalizePsdLayerName(colorLayer.name || "");
-    let bestNamedEntries = null;
-    let bestNamedEntryIndex = -1;
-    let bestNamedScore = -1;
-
-    if (colorName) {
-      for (const entries of lookup.values()) {
-        for (let i = 0; i < entries.length; i += 1) {
-          const entry = entries[i];
-          if (normalizePsdLayerName(entry.layer.name || "") !== colorName) {
-            continue;
-          }
-          const score = scorePsdLayerMatch(colorLayer, entry.layer, fallbackIndex, entry.index);
-          if (score > bestNamedScore) {
-            bestNamedScore = score;
-            bestNamedEntries = entries;
-            bestNamedEntryIndex = i;
-          }
-        }
-      }
-    }
-
-    if (bestNamedEntries && bestNamedEntryIndex >= 0) {
-      return bestNamedEntries.splice(bestNamedEntryIndex, 1)[0].layer;
-    }
-  
-    let bestEntries = null;
-    let bestEntryIndex = -1;
-    let bestScore = -1;
-    let bestOverlap = 0;
-  
-    for (const entries of lookup.values()) {
-      for (let i = 0; i < entries.length; i += 1) {
-        const entry = entries[i];
-        if (colorName || normalizePsdLayerName(entry.layer.name || "")) {
-          continue;
-        }
-        const overlap = estimatePsdLayerRectOverlap(colorLayer, entry.layer);
-        if (overlap <= 0) {
-          continue;
-        }
-        const score = scorePsdLayerMatch(colorLayer, entry.layer, fallbackIndex, entry.index);
-        if (score > bestScore) {
-          bestScore = score;
-          bestOverlap = overlap;
-          bestEntries = entries;
-          bestEntryIndex = i;
-        }
-      }
-    }
-  
-    if (bestEntries && bestEntryIndex >= 0 && bestOverlap > 0) {
-      return bestEntries.splice(bestEntryIndex, 1)[0].layer;
-    }
-  
-    return null;
-  }
-  
-  function scorePsdLayerMatch(colorLayer, depthLayer, fallbackColorIndex, fallbackDepthIndex) {
-    const colorName = normalizePsdLayerName(colorLayer.name || "");
-    const depthName = normalizePsdLayerName(depthLayer.name || "");
-    const overlap = estimatePsdLayerRectOverlap(colorLayer, depthLayer);
-    const exactPosition = (
-      (depthLayer.left || 0) === (colorLayer.left || 0) &&
-      (depthLayer.top || 0) === (colorLayer.top || 0)
-    ) ? 1 : 0;
-    const indexBonus = fallbackColorIndex === fallbackDepthIndex ? 0.01 : 0;
-  
-    if (colorName && depthName && colorName === depthName) {
-      return 1000000 + overlap + exactPosition + indexBonus;
-    }
-    return overlap + exactPosition + indexBonus;
-  }
-  
-  function normalizePsdLayerName(name) {
-    return String(name || "").trim().toLowerCase();
-  }
-  
-  function estimatePsdLayerRectOverlap(layerA, layerB) {
-    const left = Math.max(layerA.left || 0, layerB.left || 0);
-    const top = Math.max(layerA.top || 0, layerB.top || 0);
-    const right = Math.min(
-      (layerA.left || 0) + (layerA.width || (layerA.canvas ? layerA.canvas.width : 0)),
-      (layerB.left || 0) + (layerB.width || (layerB.canvas ? layerB.canvas.width : 0)),
-    );
-    const bottom = Math.min(
-      (layerA.top || 0) + (layerA.height || (layerA.canvas ? layerA.canvas.height : 0)),
-      (layerB.top || 0) + (layerB.height || (layerB.canvas ? layerB.canvas.height : 0)),
-    );
-    if (right <= left || bottom <= top) {
-      return 0;
-    }
-    return (right - left) * (bottom - top);
   }
   
   function shouldSymmetrizePsdLayerDepth(layerName) {
@@ -1305,7 +1241,10 @@ export function createPsdLayers(deps) {
     colorTexture.needsUpdate = true;
     targetLayer.colorTexture = colorTexture;
     targetLayer.maskPixels = extractLayerMaskPixels(targetLayer.colorImageData.data);
-    targetLayer.surfaceMaskPixels = extractLayerMaskPixels(targetLayer.colorImageData.data, surfaceAlphaMin);
+    const strictSurfaceMaskPixels = extractLayerMaskPixels(targetLayer.colorImageData.data, surfaceAlphaMin);
+    targetLayer.surfaceMaskPixels = hasAnyMaskPixel(strictSurfaceMaskPixels)
+      ? strictSurfaceMaskPixels
+      : targetLayer.maskPixels;
     if (mergeDepth && targetLayer.depthImageData) {
       targetLayer.directDepthPixels = extractDepthPixelsFromCanvas(createCanvasFromImageData(targetLayer.depthImageData));
       targetLayer.depthMaskPixels = extractLayerMaskPixels(targetLayer.depthImageData.data);
@@ -1320,6 +1259,18 @@ export function createPsdLayers(deps) {
       maskPixels[p] = rgbaPixels[i + 3] >= minAlpha ? 1 : 0;
     }
     return maskPixels;
+  }
+
+  function hasAnyMaskPixel(maskPixels) {
+    if (!maskPixels) {
+      return false;
+    }
+    for (let i = 0; i < maskPixels.length; i += 1) {
+      if (maskPixels[i]) {
+        return true;
+      }
+    }
+    return false;
   }
 
   function extractLayerRelativeDepthPixels(rgbaPixels) {
@@ -1341,401 +1292,21 @@ export function createPsdLayers(deps) {
     maskPixels,
     threshold,
   ) {
-    const filtered = sourceDepthPixels.slice();
-    const debugState = new Uint8Array(filtered.length);
-    const debugScore = new Uint8Array(filtered.length);
-    const globalSupport = collectPositiveValues(filtered);
-    const globalMedian = globalSupport.length ? medianOfNumbers(globalSupport) : 0;
-  
-    for (let i = 0; i < filtered.length; i += 1) {
-      if (!maskPixels[i]) {
-        continue;
-      }
-      debugState[i] = filtered[i] > 0 ? 2 : 1;
-    }
-  
-    for (let y = 0; y < layer.height; y += 1) {
-      for (let x = 0; x < layer.width; x += 1) {
-        const localIndex = y * layer.width + x;
-        const seedDepth = filtered[localIndex];
-        if (!maskPixels[localIndex] || seedDepth === 0) {
-          continue;
-        }
-  
-        const globalX = layer.left + x;
-        const globalY = layer.top + y;
-        const sameLayerSupport = collectPsdLocalDepthSupport(
-          filtered,
-          maskPixels,
-          layer.width,
-          layer.height,
-          x,
-          y,
-          4,
-        );
-        if (sameLayerSupport.length < 4) {
-          continue;
-        }
-  
-        const sameMedian = medianOfNumbers(sameLayerSupport);
-        const sortedSupport = sameLayerSupport.slice().sort((a, b) => a - b);
-        const q1 = percentileFromSorted(sortedSupport, 0.25);
-        const q3 = percentileFromSorted(sortedSupport, 0.75);
-        const localRange = sortedSupport[sortedSupport.length - 1] - sortedSupport[0];
-        const foreignSupport = collectPsdForeignVisibleDepthSupport(
-          imageWidth,
-          imageHeight,
-          globalX,
-          globalY,
-          4,
-          layerIndex,
-          stableDepthPixels,
-          visibleLayerMap,
-        );
-        if (foreignSupport.length < 3) {
-          continue;
-        }
-  
-        const foreignMedian = medianOfNumbers(foreignSupport);
-        const sameDistance = Math.abs(seedDepth - sameMedian);
-        const foreignDistance = Math.abs(seedDepth - foreignMedian);
-        const globalDistance = Math.abs(seedDepth - globalMedian);
-        const localThreshold = Math.max(2, Math.min(6, threshold * 0.1));
-        const bandDistance = seedDepth < q1 ? q1 - seedDepth : seedDepth > q3 ? seedDepth - q3 : 0;
-        const hasSharpLocalGradient = localRange > localThreshold * 3 && bandDistance > localThreshold;
-        const score = Math.max(sameDistance, globalDistance) - foreignDistance;
-        debugScore[localIndex] = Math.max(debugScore[localIndex], clampByte(Math.round(score * 24)));
-  
-        if (
-          (
-            (sameDistance > localThreshold && globalDistance > localThreshold) ||
-            hasSharpLocalGradient
-          ) &&
-          foreignDistance < Math.min(sameDistance, globalDistance)
-        ) {
-          filtered[localIndex] = 0;
-          debugState[localIndex] = 3;
-        }
-      }
-    }
-  
-    pruneThinForeignSeedComponents(
-      filtered,
-      debugState,
-      debugScore,
-      layer,
+    return runCompositeWorker("depthPrune", {
+      depthPixels: sourceDepthPixels,
+      layer: serializePsdWorkerLayer(layer),
       layerIndex,
       imageWidth,
       imageHeight,
       stableDepthPixels,
       visibleLayerMap,
       maskPixels,
-      globalMedian,
       threshold,
-    );
-  
-    return {
-      pixels: filtered,
-      debugState,
-      debugScore,
-    };
-  }
-  
-  function pruneThinForeignSeedComponents(
-    depthPixels,
-    debugState,
-    debugScore,
-    layer,
-    layerIndex,
-    imageWidth,
-    imageHeight,
-    stableDepthPixels,
-    visibleLayerMap,
-    maskPixels,
-    globalMedian,
-    threshold,
-  ) {
-    const totalPixels = layer.width * layer.height;
-    const visited = new Uint8Array(totalPixels);
-    const componentIds = new Int32Array(totalPixels);
-    componentIds.fill(-1);
-    const contourMask = buildLayerContourBandMask(maskPixels, layer.width, layer.height, 1);
-    const wideContourMask = buildLayerContourBandMask(maskPixels, layer.width, layer.height, 4);
-    const linkThreshold = Math.max(8, threshold * 0.35);
-    const queue = new Int32Array(totalPixels);
-    const neighbors = [
-      [-1, 0],
-      [1, 0],
-      [0, -1],
-      [0, 1],
-      [-1, -1],
-      [1, -1],
-      [-1, 1],
-      [1, 1],
-    ];
-    let componentId = 0;
-  
-    for (let start = 0; start < totalPixels; start += 1) {
-      if (visited[start] || !maskPixels[start] || depthPixels[start] === 0) {
-        continue;
-      }
-  
-      let head = 0;
-      let tail = 0;
-      queue[tail++] = start;
-      visited[start] = 1;
-      componentIds[start] = componentId;
-      const indices = [];
-      const values = [];
-      let minX = layer.width;
-      let maxX = 0;
-      let minY = layer.height;
-      let maxY = 0;
-      let contourHits = 0;
-      let wideContourHits = 0;
-  
-      while (head < tail) {
-        const index = queue[head++];
-        indices.push(index);
-        values.push(depthPixels[index]);
-        const x = index % layer.width;
-        const y = Math.floor(index / layer.width);
-        minX = Math.min(minX, x);
-        maxX = Math.max(maxX, x);
-        minY = Math.min(minY, y);
-        maxY = Math.max(maxY, y);
-        if (contourMask[index]) {
-          contourHits += 1;
-        }
-        if (wideContourMask[index]) {
-          wideContourHits += 1;
-        }
-  
-        for (let i = 0; i < neighbors.length; i += 1) {
-          const [dx, dy] = neighbors[i];
-          const sx = x + dx;
-          const sy = y + dy;
-          if (sx < 0 || sx >= layer.width || sy < 0 || sy >= layer.height) {
-            continue;
-          }
-  
-          const sampleIndex = sy * layer.width + sx;
-          if (visited[sampleIndex] || !maskPixels[sampleIndex] || depthPixels[sampleIndex] === 0) {
-            continue;
-          }
-  
-          if (Math.abs(depthPixels[sampleIndex] - depthPixels[index]) > linkThreshold) {
-            continue;
-          }
-  
-          visited[sampleIndex] = 1;
-          componentIds[sampleIndex] = componentId;
-          queue[tail++] = sampleIndex;
-        }
-      }
-  
-      const width = maxX - minX + 1;
-      const height = maxY - minY + 1;
-      const componentMedian = medianOfNumbers(values);
-      const sameLayerSupport = collectComponentExternalDepthSupport(
-        depthPixels,
-        maskPixels,
-        componentIds,
-        componentId,
-        wideContourMask,
-        layer.width,
-        layer.height,
-        minX,
-        minY,
-        maxX,
-        maxY,
-        5,
-      );
-      const foreignSupport = collectComponentForeignVisibleDepthSupport(
-        indices,
-        layer,
-        imageWidth,
-        imageHeight,
-        stableDepthPixels,
-        visibleLayerMap,
-        layerIndex,
-      );
-      const contourRatio = contourHits / indices.length;
-      const wideContourRatio = wideContourHits / indices.length;
-      const sameMedian = sameLayerSupport.length ? medianOfNumbers(sameLayerSupport) : globalMedian;
-      const foreignMedian = foreignSupport.length ? medianOfNumbers(foreignSupport) : componentMedian;
-      const sameDistance = Math.abs(componentMedian - sameMedian);
-      const foreignDistance = Math.abs(componentMedian - foreignMedian);
-      const isThin = Math.min(width, height) <= 3 || indices.length <= Math.max(width, height) * 2;
-      const isSmallish = indices.length <= Math.max(48, threshold * 8);
-      const localThreshold = Math.max(2, Math.min(6, threshold * 0.1));
-      const componentScore = sameDistance - foreignDistance;
-  
-      if (
-        foreignSupport.length >= 4 &&
-        (
-          sameDistance > localThreshold ||
-          (sameLayerSupport.length < 4 && wideContourRatio > 0.7)
-        ) &&
-        foreignDistance < sameDistance &&
-        (contourRatio >= 0.35 || wideContourRatio >= 0.7) &&
-        (isThin || isSmallish)
-      ) {
-        for (let i = 0; i < indices.length; i += 1) {
-          depthPixels[indices[i]] = 0;
-          debugState[indices[i]] = 4;
-          debugScore[indices[i]] = Math.max(debugScore[indices[i]], clampByte(Math.round(componentScore * 24)));
-        }
-      }
-  
-      componentId += 1;
-    }
+    });
   }
   
   function clampByte(value) {
     return Math.max(0, Math.min(255, value));
-  }
-  
-  function collectComponentExternalDepthSupport(
-    depthPixels,
-    maskPixels,
-    componentIds,
-    componentId,
-    contourMask,
-    width,
-    height,
-    minX,
-    minY,
-    maxX,
-    maxY,
-    radius,
-  ) {
-    const values = [];
-    const startX = Math.max(0, minX - radius);
-    const startY = Math.max(0, minY - radius);
-    const endX = Math.min(width - 1, maxX + radius);
-    const endY = Math.min(height - 1, maxY + radius);
-  
-    for (let y = startY; y <= endY; y += 1) {
-      for (let x = startX; x <= endX; x += 1) {
-        const index = y * width + x;
-        if (
-          !maskPixels[index] ||
-          depthPixels[index] === 0 ||
-          componentIds[index] === componentId ||
-          contourMask[index]
-        ) {
-          continue;
-        }
-  
-        values.push(depthPixels[index]);
-      }
-    }
-  
-    return values;
-  }
-  
-  function collectComponentForeignVisibleDepthSupport(
-    indices,
-    layer,
-    imageWidth,
-    imageHeight,
-    stableDepthPixels,
-    visibleLayerMap,
-    layerIndex,
-  ) {
-    const values = [];
-  
-    for (let i = 0; i < indices.length; i += 1) {
-      const index = indices[i];
-      const x = index % layer.width;
-      const y = Math.floor(index / layer.width);
-      const globalX = layer.left + x;
-      const globalY = layer.top + y;
-      if (globalX < 0 || globalX >= imageWidth || globalY < 0 || globalY >= imageHeight) {
-        continue;
-      }
-  
-      for (let dy = -2; dy <= 2; dy += 1) {
-        const sy = globalY + dy;
-        if (sy < 0 || sy >= imageHeight) {
-          continue;
-        }
-  
-        for (let dx = -2; dx <= 2; dx += 1) {
-          const sx = globalX + dx;
-          if (sx < 0 || sx >= imageWidth) {
-            continue;
-          }
-  
-          const globalIndex = sy * imageWidth + sx;
-          const visibleLayer = visibleLayerMap[globalIndex];
-          if (visibleLayer < 0 || visibleLayer === layerIndex) {
-            continue;
-          }
-  
-          values.push(stableDepthPixels[globalIndex]);
-        }
-      }
-    }
-  
-    return values;
-  }
-  
-  function collectPsdLocalDepthSupport(depthPixels, maskPixels, width, height, centerX, centerY, radius) {
-    const values = [];
-  
-    for (let dy = -radius; dy <= radius; dy += 1) {
-      const sy = centerY + dy;
-      if (sy < 0 || sy >= height) {
-        continue;
-      }
-  
-      for (let dx = -radius; dx <= radius; dx += 1) {
-        const sx = centerX + dx;
-        if (sx < 0 || sx >= width || sy < 0 || sy >= height || (dx === 0 && dy === 0)) {
-          continue;
-        }
-  
-        const sampleIndex = sy * width + sx;
-        const sampleDepth = depthPixels[sampleIndex];
-        if (!maskPixels[sampleIndex] || sampleDepth === 0) {
-          continue;
-        }
-  
-        values.push(sampleDepth);
-      }
-    }
-  
-    return values;
-  }
-  
-  function collectPsdForeignVisibleDepthSupport(imageWidth, imageHeight, centerX, centerY, radius, layerIndex, stableDepthPixels, visibleLayerMap) {
-    const values = [];
-  
-    for (let dy = -radius; dy <= radius; dy += 1) {
-      const sy = centerY + dy;
-      if (sy < 0 || sy >= imageHeight) {
-        continue;
-      }
-  
-      for (let dx = -radius; dx <= radius; dx += 1) {
-        const sx = centerX + dx;
-        if (sx < 0 || sx >= imageWidth || (dx === 0 && dy === 0)) {
-          continue;
-        }
-  
-        const globalIndex = sy * imageWidth + sx;
-        const visibleLayer = visibleLayerMap[globalIndex];
-        if (visibleLayer < 0 || visibleLayer === layerIndex) {
-          continue;
-        }
-  
-        values.push(stableDepthPixels[globalIndex]);
-      }
-    }
-  
-    return values;
   }
   
   function medianOfNumbers(values) {
@@ -1743,384 +1314,82 @@ export function createPsdLayers(deps) {
     return sorted[(sorted.length - 1) >> 1];
   }
   
-  function percentileFromSorted(sorted, percentile) {
-    if (!sorted.length) {
-      return 0;
-    }
-    const index = Math.max(0, Math.min(sorted.length - 1, Math.round((sorted.length - 1) * percentile)));
-    return sorted[index];
-  }
-  
-  function collectPositiveValues(values) {
-    const positive = [];
-    for (let i = 0; i < values.length; i += 1) {
-      if (values[i] > 0) {
-        positive.push(values[i]);
-      }
-    }
-    return positive;
-  }
-  
   function buildVisiblePsdLayerMap(imageWidth, imageHeight, layers) {
-    const visibleLayerMap = new Int32Array(imageWidth * imageHeight);
-    visibleLayerMap.fill(-1);
-  
-    for (let layerIndex = layers.length - 1; layerIndex >= 0; layerIndex -= 1) {
-      const layer = layers[layerIndex];
-      const maskPixels = layer.maskPixels;
-  
-      for (let y = 0; y < layer.height; y += 1) {
-        for (let x = 0; x < layer.width; x += 1) {
-          const localIndex = y * layer.width + x;
-          if (!maskPixels[localIndex]) {
-            continue;
-          }
-  
-          const globalX = layer.left + x;
-          const globalY = layer.top + y;
-          if (globalX < 0 || globalX >= imageWidth || globalY < 0 || globalY >= imageHeight) {
-            continue;
-          }
-  
-          const globalIndex = globalY * imageWidth + globalX;
-          if (visibleLayerMap[globalIndex] < 0) {
-            visibleLayerMap[globalIndex] = layerIndex;
-          }
-        }
-      }
-    }
-  
-    return visibleLayerMap;
+    return runCompositeWorker("depthSplit", {
+      operation: "buildVisibleLayerMap",
+      args: { imageWidth, imageHeight, layers: serializePsdWorkerLayers(layers) },
+    });
   }
   
-  function seedPsdLayerDepthPixels(layer, layerIndex, imageWidth, imageHeight, stableDepthPixels, visibleLayerMap, maskPixels, layers) {
-    const depthPixels = new Uint8Array(layer.width * layer.height);
-    if (!stableDepthPixels || !visibleLayerMap) {
-      return depthPixels;
-    }
-    const stableSeedMask = buildLayerContourBandMask(maskPixels, layer.width, layer.height, 2);
-  
-    for (let y = 0; y < layer.height; y += 1) {
-      for (let x = 0; x < layer.width; x += 1) {
-        const localIndex = y * layer.width + x;
-        if (!maskPixels[localIndex]) {
-          continue;
-        }
-        if (stableSeedMask[localIndex]) {
-          continue;
-        }
-  
-        const globalX = layer.left + x;
-        const globalY = layer.top + y;
-        if (globalX < 0 || globalX >= imageWidth || globalY < 0 || globalY >= imageHeight) {
-          continue;
-        }
-  
-        const globalIndex = globalY * imageWidth + globalX;
-        if (visibleLayerMap[globalIndex] === layerIndex) {
-          if (hasUpperLayerMaskNearby(layers, layerIndex, globalX, globalY, 2)) {
-            continue;
-          }
-          depthPixels[localIndex] = stableDepthPixels[globalIndex];
-        }
-      }
-    }
-  
-    return depthPixels;
+  async function seedPsdLayerDepthPixels(layer, layerIndex, imageWidth, imageHeight, stableDepthPixels, visibleLayerMap, maskPixels, layers) {
+    const stableSeedMask = await buildLayerContourBandMask(maskPixels, layer.width, layer.height, 2);
+    return runCompositeWorker("depthSplit", {
+      operation: "seedLayerDepthPixels",
+      args: {
+        layer: serializePsdWorkerLayer(layer),
+      layerIndex,
+      imageWidth,
+      imageHeight,
+      stableDepthPixels,
+      visibleLayerMap,
+      maskPixels,
+        layers: serializePsdWorkerLayers(layers),
+        options: { contourBandMask: stableSeedMask, upperMaskRadius: 2 },
+      },
+    });
   }
   
   function hasUpperLayerMaskNearby(layers, layerIndex, globalX, globalY, radius) {
-    for (let upperIndex = layerIndex + 1; upperIndex < layers.length; upperIndex += 1) {
-      const layer = layers[upperIndex];
-      if (
-        globalX < layer.left - radius ||
-        globalX >= layer.left + layer.width + radius ||
-        globalY < layer.top - radius ||
-        globalY >= layer.top + layer.height + radius
-      ) {
-        continue;
-      }
-  
-      for (let dy = -radius; dy <= radius; dy += 1) {
-        const sy = globalY + dy;
-        const localY = sy - layer.top;
-        if (localY < 0 || localY >= layer.height) {
-          continue;
-        }
-        for (let dx = -radius; dx <= radius; dx += 1) {
-          const sx = globalX + dx;
-          const localX = sx - layer.left;
-          if (localX < 0 || localX >= layer.width) {
-            continue;
-          }
-          if (layer.maskPixels[localY * layer.width + localX]) {
-            return true;
-          }
-        }
-      }
-    }
-  
-    return false;
+    return runCompositeWorker("depthSplit", {
+      operation: "hasUpperLayerMaskNearby",
+      args: { layers: serializePsdWorkerLayers(layers), layerIndex, globalX, globalY, radius },
+    });
   }
   
   function buildLayerContourBandMask(maskPixels, width, height, thickness) {
-    const contourMask = new Uint8Array(maskPixels.length);
-    const bandMask = new Uint8Array(maskPixels.length);
-  
-    for (let index = 0; index < maskPixels.length; index += 1) {
-      if (isMaskContourPixel(maskPixels, width, height, index)) {
-        contourMask[index] = 1;
-        bandMask[index] = 1;
-      }
-    }
-  
-    let frontier = contourMask;
-    for (let pass = 1; pass < thickness; pass += 1) {
-      frontier = expandMaskFrontier(maskPixels, width, height, frontier, bandMask);
-    }
-  
-    return bandMask;
-  }
-  
-  function buildPositiveDepthErodeMask(depthPixels, width, height, thickness) {
-    const positiveMask = new Uint8Array(depthPixels.length);
-    for (let i = 0; i < depthPixels.length; i += 1) {
-      positiveMask[i] = depthPixels[i] > 0 ? 1 : 0;
-    }
-  
-    let eroded = positiveMask.slice();
-    for (let pass = 0; pass < thickness; pass += 1) {
-      eroded = erodeBinaryMask(eroded, width, height);
-    }
-  
-    const removedMask = new Uint8Array(depthPixels.length);
-    for (let i = 0; i < positiveMask.length; i += 1) {
-      if (positiveMask[i] && !eroded[i]) {
-        removedMask[i] = 1;
-      }
-    }
-  
-    return removedMask;
+    return runCompositeWorker("depthCleanup", {
+      operation: "buildLayerContourBandMask",
+      args: { maskPixels, width, height, thickness },
+    });
   }
   
   function erodePositiveDepthMask(depthPixels, width, height, thickness) {
-    let mask = new Uint8Array(depthPixels.length);
-    for (let i = 0; i < depthPixels.length; i += 1) {
-      mask[i] = depthPixels[i] > 0 ? 1 : 0;
-    }
-  
-    for (let pass = 0; pass < thickness; pass += 1) {
-      mask = erodeBinaryMask(mask, width, height);
-    }
-  
-    return mask;
-  }
-  
-  function erodeBinaryMask(maskPixels, width, height) {
-    const eroded = new Uint8Array(maskPixels.length);
-    const offsets = [
-      [-1, 0],
-      [1, 0],
-      [0, -1],
-      [0, 1],
-      [-1, -1],
-      [1, -1],
-      [-1, 1],
-      [1, 1],
-    ];
-  
-    for (let index = 0; index < maskPixels.length; index += 1) {
-      if (!maskPixels[index]) {
-        continue;
-      }
-  
-      const x = index % width;
-      const y = Math.floor(index / width);
-      let keep = true;
-      for (let i = 0; i < offsets.length; i += 1) {
-        const [dx, dy] = offsets[i];
-        const sx = x + dx;
-        const sy = y + dy;
-        if (sx < 0 || sx >= width || sy < 0 || sy >= height || !maskPixels[sy * width + sx]) {
-          keep = false;
-          break;
-        }
-      }
-  
-      if (keep) {
-        eroded[index] = 1;
-      }
-    }
-  
-    return eroded;
-  }
-  
-  function isMaskContourPixel(maskPixels, width, height, index) {
-    if (!maskPixels[index]) {
-      return false;
-    }
-  
-    const x = index % width;
-    const y = Math.floor(index / width);
-    const offsets = [
-      [-1, 0],
-      [1, 0],
-      [0, -1],
-      [0, 1],
-    ];
-  
-    for (let i = 0; i < offsets.length; i += 1) {
-      const [dx, dy] = offsets[i];
-      const sx = x + dx;
-      const sy = y + dy;
-      if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
-        return true;
-      }
-  
-      if (!maskPixels[sy * width + sx]) {
-        return true;
-      }
-    }
-  
-    return false;
-  }
-  
-  function expandMaskFrontier(maskPixels, width, height, frontier, bandMask) {
-    const next = new Uint8Array(maskPixels.length);
-    const offsets = [
-      [-1, 0],
-      [1, 0],
-      [0, -1],
-      [0, 1],
-      [-1, -1],
-      [1, -1],
-      [-1, 1],
-      [1, 1],
-    ];
-  
-    for (let index = 0; index < frontier.length; index += 1) {
-      if (!frontier[index]) {
-        continue;
-      }
-  
-      const x = index % width;
-      const y = Math.floor(index / width);
-      for (let i = 0; i < offsets.length; i += 1) {
-        const [dx, dy] = offsets[i];
-        const sx = x + dx;
-        const sy = y + dy;
-        if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
-          continue;
-        }
-  
-        const sampleIndex = sy * width + sx;
-        if (!maskPixels[sampleIndex] || bandMask[sampleIndex]) {
-          continue;
-        }
-  
-        bandMask[sampleIndex] = 1;
-        next[sampleIndex] = 1;
-      }
-    }
-  
-    return next;
+    return runCompositeWorker("depthCleanup", {
+      operation: "erodePositiveDepthMask",
+      args: { depthPixels, width, height, thickness },
+    });
   }
   
   function inpaintMaskedLayerDepth(sourceDepthPixels, maskPixels, width, height) {
-    const depthPixels = sourceDepthPixels.slice();
-    const totalPixels = width * height;
-    const filledMask = new Uint8Array(totalPixels);
-    const queue = new Int32Array(totalPixels);
-    const queued = new Uint8Array(totalPixels);
-    let head = 0;
-    let tail = 0;
-  
-    for (let index = 0; index < totalPixels; index += 1) {
-      if (!maskPixels[index] || depthPixels[index] > 0) {
-        continue;
-      }
-      if (!hasPositiveMaskedNeighbor(depthPixels, maskPixels, width, height, index)) {
-        continue;
-      }
-      queue[tail++] = index;
-      queued[index] = 1;
-    }
-  
-    while (head < tail) {
-      const index = queue[head++];
-      queued[index] = 0;
-      if (!maskPixels[index] || depthPixels[index] > 0) {
-        continue;
-      }
-  
-      const fillDepth = sampleMaskedMultiscaleDepth(depthPixels, maskPixels, width, height, index);
-      if (fillDepth <= 0) {
-        continue;
-      }
-  
-      depthPixels[index] = fillDepth;
-      filledMask[index] = 1;
-      tail = enqueueMaskedGapNeighbors(queue, queued, depthPixels, maskPixels, width, height, index, tail);
-    }
-  
-    return {
-      pixels: depthPixels,
-      filledMask,
-    };
+    return runCompositeWorker("depthCleanup", {
+      operation: "inpaintMaskedLayerDepth",
+      args: { sourceDepthPixels, maskPixels, width, height },
+    });
   }
   
   function smoothMaskedPositiveDepth(sourceDepthPixels, maskPixels, width, height) {
-    const kernel = [
-      [-1, -1, 1],
-      [0, -1, 2],
-      [1, -1, 1],
-      [-1, 0, 2],
-      [0, 0, 4],
-      [1, 0, 2],
-      [-1, 1, 1],
-      [0, 1, 2],
-      [1, 1, 1],
-    ];
-    let input = sourceDepthPixels.slice();
-  
-    for (let pass = 0; pass < 3; pass += 1) {
-      const output = input.slice();
-      for (let y = 0; y < height; y += 1) {
-        for (let x = 0; x < width; x += 1) {
-          const index = y * width + x;
-          if (!maskPixels[index] || input[index] <= 0) {
-            continue;
-          }
-  
-          let weightedSum = 0;
-          let totalWeight = 0;
-          for (let i = 0; i < kernel.length; i += 1) {
-            const [dx, dy, weight] = kernel[i];
-            const sx = x + dx;
-            const sy = y + dy;
-            if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
-              continue;
-            }
-  
-            const sampleIndex = sy * width + sx;
-            const sampleDepth = input[sampleIndex];
-            if (!maskPixels[sampleIndex] || sampleDepth <= 0) {
-              continue;
-            }
-  
-            weightedSum += sampleDepth * weight;
-            totalWeight += weight;
-          }
-  
-          if (totalWeight > 0) {
-            output[index] = clampByte(Math.round(weightedSum / totalWeight));
-          }
-        }
-      }
-      input = output;
-    }
-  
-    return input;
+    return runCompositeWorker("depthCleanup", {
+      operation: "smoothMaskedPositiveDepth",
+      args: { sourceDepthPixels, maskPixels, width, height },
+    });
+  }
+
+  function serializePsdWorkerLayer(layer) {
+    return {
+      name: layer.name || "",
+      sourceIndex: layer.sourceIndex,
+      sourceIndices: layer.sourceIndices ? layer.sourceIndices.slice() : undefined,
+      left: layer.left || 0,
+      top: layer.top || 0,
+      width: layer.width || 0,
+      height: layer.height || 0,
+      maskPixels: layer.maskPixels ? layer.maskPixels.slice() : null,
+      alphaMask: layer.alphaMask ? layer.alphaMask.slice() : null,
+    };
+  }
+
+  function serializePsdWorkerLayers(layers) {
+    return (layers || []).map(serializePsdWorkerLayer);
   }
   
   function smoothSegmentedPositiveDepth(sourceDepthPixels, segmentMap, width, height, passes) {
@@ -2183,279 +1452,6 @@ export function createPsdLayers(deps) {
     return input;
   }
   
-  function hasPositiveMaskedNeighbor(depthPixels, maskPixels, width, height, index) {
-    const x = index % width;
-    const y = Math.floor(index / width);
-    const offsets = [
-      [-1, 0],
-      [1, 0],
-      [0, -1],
-      [0, 1],
-      [-1, -1],
-      [1, -1],
-      [-1, 1],
-      [1, 1],
-    ];
-  
-    for (let i = 0; i < offsets.length; i += 1) {
-      const [dx, dy] = offsets[i];
-      const sx = x + dx;
-      const sy = y + dy;
-      if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
-        continue;
-      }
-      const sampleIndex = sy * width + sx;
-      if (maskPixels[sampleIndex] && depthPixels[sampleIndex] > 0) {
-        return true;
-      }
-    }
-  
-    return false;
-  }
-  
-  function sampleMaskedNeighborMedian(depthPixels, maskPixels, width, height, index) {
-    const x = index % width;
-    const y = Math.floor(index / width);
-    const values = [];
-    const offsets = [
-      [-1, 0],
-      [1, 0],
-      [0, -1],
-      [0, 1],
-      [-1, -1],
-      [1, -1],
-      [-1, 1],
-      [1, 1],
-    ];
-  
-    for (let i = 0; i < offsets.length; i += 1) {
-      const [dx, dy] = offsets[i];
-      const sx = x + dx;
-      const sy = y + dy;
-      if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
-        continue;
-      }
-  
-      const sampleIndex = sy * width + sx;
-      if (!maskPixels[sampleIndex] || depthPixels[sampleIndex] <= 0) {
-        continue;
-      }
-  
-      values.push(depthPixels[sampleIndex]);
-    }
-  
-    if (!values.length) {
-      return 0;
-    }
-  
-    return medianOfNumbers(values);
-  }
-  
-  function sampleMaskedMultiscaleDepth(depthPixels, maskPixels, width, height, index, contexts = null) {
-    const activeContexts = contexts || [
-      estimateMaskedDepthAtScale(depthPixels, maskPixels, width, height, index, 1, 4, 0.48),
-      estimateMaskedDepthAtScale(depthPixels, maskPixels, width, height, index, 7, 5, 0.32),
-      estimateMaskedDepthAtScale(depthPixels, maskPixels, width, height, index, 37, 5, 0.20),
-    ];
-    let weightedDepth = 0;
-    let totalWeight = 0;
-  
-    for (let i = 0; i < activeContexts.length; i += 1) {
-      const estimate = activeContexts[i];
-      if (!estimate.valid) {
-        continue;
-      }
-      const confidence = estimate.weight * estimate.confidence;
-      weightedDepth += estimate.depth * confidence;
-      totalWeight += confidence;
-    }
-  
-    if (totalWeight > 0) {
-      return clampByte(Math.round(weightedDepth / totalWeight));
-    }
-  
-    return sampleMaskedNeighborMedian(depthPixels, maskPixels, width, height, index);
-  }
-  
-  function estimateMaskedDepthAtScale(depthPixels, maskPixels, width, height, index, radius, minSamples, weight) {
-    const x0 = index % width;
-    const y0 = Math.floor(index / width);
-    const sampled = sampleMaskedSparseGridDepths(depthPixels, maskPixels, width, height, x0, y0, radius);
-    const values = sampled.values;
-    if (values.length < minSamples) {
-      return { valid: false, depth: 0, confidence: 0, weight };
-    }
-  
-    const sortedValues = values.slice().sort((a, b) => a - b);
-    const grid = sampled.grid;
-    const centerMean = values.reduce((sum, value) => sum + value, 0) / values.length;
-    for (let i = 0; i < grid.length; i += 1) {
-      if (grid[i] <= 0) {
-        grid[i] = centerMean;
-      }
-    }
-  
-    const planeDepth = estimateGridPlaneDepth(grid);
-    const medianDepth = medianOfNumbers(values);
-    const lo = percentileFromSorted(sortedValues, 0.2);
-    const hi = percentileFromSorted(sortedValues, 0.8);
-    const robustDepth = clamp(Math.round(planeDepth * 0.7 + medianDepth * 0.3), lo, hi);
-  
-    return {
-      valid: true,
-      depth: robustDepth,
-      confidence: clamp(values.length / 9, 0, 1),
-      weight,
-    };
-  }
-  
-  function sampleMaskedSparseGridDepths(depthPixels, maskPixels, width, height, x0, y0, radius) {
-    const grid = new Float32Array(9);
-    const values = [];
-    let cursor = 0;
-    const searchRadius = Math.max(1, Math.floor(radius / 3));
-  
-    for (let gy = -1; gy <= 1; gy += 1) {
-      for (let gx = -1; gx <= 1; gx += 1) {
-        const targetX = clamp(Math.round(x0 + gx * radius), 0, width - 1);
-        const targetY = clamp(Math.round(y0 + gy * radius), 0, height - 1);
-        const sampledDepth = sampleNearestMaskedDepth(
-          depthPixels,
-          maskPixels,
-          width,
-          height,
-          targetX,
-          targetY,
-          searchRadius,
-        );
-        grid[cursor] = sampledDepth;
-        if (sampledDepth > 0) {
-          values.push(sampledDepth);
-        }
-        cursor += 1;
-      }
-    }
-  
-    return { grid, values };
-  }
-  
-  function sampleNearestMaskedDepth(depthPixels, maskPixels, width, height, targetX, targetY, searchRadius) {
-    let bestDepth = 0;
-    let bestDistanceSq = Infinity;
-  
-    for (let dy = -searchRadius; dy <= searchRadius; dy += 1) {
-      const y = targetY + dy;
-      if (y < 0 || y >= height) {
-        continue;
-      }
-      for (let dx = -searchRadius; dx <= searchRadius; dx += 1) {
-        const x = targetX + dx;
-        if (x < 0 || x >= width) {
-          continue;
-        }
-  
-        const index = y * width + x;
-        const depth = depthPixels[index];
-        if (!maskPixels[index] || depth <= 0) {
-          continue;
-        }
-  
-        const distanceSq = dx * dx + dy * dy;
-        if (distanceSq < bestDistanceSq) {
-          bestDistanceSq = distanceSq;
-          bestDepth = depth;
-        }
-      }
-    }
-  
-    return bestDepth;
-  }
-  
-  function estimateGridPlaneDepth(grid) {
-    const tl = grid[0];
-    const tc = grid[1];
-    const tr = grid[2];
-    const ml = grid[3];
-    const mc = grid[4];
-    const mr = grid[5];
-    const bl = grid[6];
-    const bc = grid[7];
-    const br = grid[8];
-  
-    const gradX = (tr + 2 * mr + br) - (tl + 2 * ml + bl);
-    const gradY = (bl + 2 * bc + br) - (tl + 2 * tc + tr);
-    return mc + (gradX + gradY) * 0.125;
-  }
-  
-  function sampleMaskedNeighborDepth(depthPixels, maskPixels, width, height, index) {
-    const x = index % width;
-    const y = Math.floor(index / width);
-    const offsets = [
-      [-1, 0, 1],
-      [1, 0, 1],
-      [0, -1, 1],
-      [0, 1, 1],
-      [-1, -1, Math.SQRT2],
-      [1, -1, Math.SQRT2],
-      [-1, 1, Math.SQRT2],
-      [1, 1, Math.SQRT2],
-    ];
-  
-    let weightedSum = 0;
-    let totalWeight = 0;
-  
-    for (let i = 0; i < offsets.length; i += 1) {
-      const [dx, dy, distance] = offsets[i];
-      const sx = x + dx;
-      const sy = y + dy;
-      if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
-        continue;
-      }
-      const sampleIndex = sy * width + sx;
-      if (!maskPixels[sampleIndex] || depthPixels[sampleIndex] <= 0) {
-        continue;
-      }
-      const weight = 1 / distance;
-      weightedSum += depthPixels[sampleIndex] * weight;
-      totalWeight += weight;
-    }
-  
-    return totalWeight > 0 ? Math.max(1, Math.min(255, Math.round(weightedSum / totalWeight))) : 0;
-  }
-  
-  function enqueueMaskedGapNeighbors(queue, queued, depthPixels, maskPixels, width, height, index, tail) {
-    const x = index % width;
-    const y = Math.floor(index / width);
-    const offsets = [
-      [-1, 0],
-      [1, 0],
-      [0, -1],
-      [0, 1],
-      [-1, -1],
-      [1, -1],
-      [-1, 1],
-      [1, 1],
-    ];
-  
-    let nextTail = tail;
-  
-    for (let i = 0; i < offsets.length; i += 1) {
-      const [dx, dy] = offsets[i];
-      const sx = x + dx;
-      const sy = y + dy;
-      if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
-        continue;
-      }
-      const sampleIndex = sy * width + sx;
-      if (!maskPixels[sampleIndex] || depthPixels[sampleIndex] > 0 || queued[sampleIndex]) {
-        continue;
-      }
-      queue[nextTail++] = sampleIndex;
-      queued[sampleIndex] = 1;
-    }
-  
-    return nextTail;
-  }
   
   function extractDepthPixelsFromCanvas(canvas, options = {}) {
     const ignoreAlpha = !!options.ignoreAlpha;
@@ -2535,7 +1531,7 @@ export function createPsdLayers(deps) {
   }
 
   return {
-    createPsdLayerEntries,
+    createLayerEntries,
     pruneOutlierSeedDepthClusters,
     createPsdDebugTexture,
     createPsdDepthPreviewUrl,

@@ -11,7 +11,7 @@ export function syncThumbs(elements, renderState, defaults) {
     defaultSegmentUrl,
   } = defaults;
 
-  if (renderState.sourceMode === "psd") {
+  if (renderState.colorComposite?.format === "psd") {
     colorThumbEl.src = renderState.psdColorPreviewUrl || defaultColorUrl;
     depthThumbEl.src = renderState.psdDepthPreviewUrl || defaultDepthUrl;
     segmentThumbEl.src = "";
@@ -24,9 +24,9 @@ export function syncThumbs(elements, renderState, defaults) {
 }
 
 export function syncViewerModeUi(elements, renderState) {
-  const isPsd = renderState.sourceMode === "psd";
+  const isLayeredSource = (renderState.layerEntries || []).length > 1 || renderState.colorComposite?.format === "psd";
   elements.segmentHudEl.style.display = "";
-  elements.segmentThumbButtonEl.parentElement.style.display = isPsd ? "none" : "";
+  elements.segmentThumbButtonEl.parentElement.style.display = isLayeredSource ? "none" : "";
 }
 
 export function createSegmentThumbDataUrl(rgbPixels, width, height) {

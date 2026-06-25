@@ -1,3 +1,5 @@
+import { getGlobalDepthScale } from "../composite/schema.js";
+
 export function createSegmentDepthRuntime(deps) {
   const {
     renderState,
@@ -34,10 +36,12 @@ export function createSegmentDepthRuntime(deps) {
   
     const scaled = applyGlobalDepthScale(
       adjustedPixels,
-      renderState.globalDepthScale,
+      getGlobalDepthScale(renderState),
     );
     const finalPixels = scaled.pixels;
-    renderState.globalDepthCentroid = scaled.centroid;
+    if (renderState.composedSource) {
+      renderState.composedSource.globalDepthCentroid = scaled.centroid;
+    }
   
     const adjusted = createDepthTextureResources(
       renderState.imageWidth,

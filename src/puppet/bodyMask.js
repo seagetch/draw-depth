@@ -80,15 +80,15 @@ function computeMaskedLayerBounds(layer) {
   };
 }
 
-export function buildLayerDescriptors(psdLayerEntries, imageWidth, imageHeight, options = {}) {
+export function buildLayerDescriptors(layerEntries, imageWidth, imageHeight, options = {}) {
   const {
     puppetLayerFitEnabled = [],
     puppetLayerBindingOverrides = [],
     puppetSwapLeftRightMapping = false,
   } = options;
   const descriptors = [];
-  for (let i = 0; i < psdLayerEntries.length; i += 1) {
-    const layer = psdLayerEntries[i];
+  for (let i = 0; i < layerEntries.length; i += 1) {
+    const layer = layerEntries[i];
     const bounds = computeMaskedLayerBounds(layer);
     if (!bounds) {
       continue;

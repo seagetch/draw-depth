@@ -1,30 +1,86 @@
+import { getLayerVisible } from "../composite/schema.js";
+
 export function createPsdExport(deps) {
   const {
     agPsd,
     renderState,
     statusEl,
-    buildPreparedPsdLayerEntries,
+    buildPreparedLayerEntries,
     flattenPsdLayers,
     getCanvasImageData,
   } = deps
 
-  async function saveCurrentPsdDepthAsPsd() {
-    if (renderState.sourceMode !== "psd" || !renderState.psdColorDocument) {
-      throw new Error("PSD pair mode is not active.");
+  async function saveCurrentPsdDepthAsPsd(options = {}) {
+    if (!(renderState.layerEntries || []).length) {
+      throw new Error("No layer source is active.");
     }
     if (typeof agPsd === "undefined" || typeof agPsd.writePsd !== "function") {
       throw new Error("PSD writer is not available.");
     }
   
-    const filename = renderState.currentPsdExportName || "depth.psd";
+    const filename = options.filename || renderState.currentPsdExportName || "depth.psd";
     statusEl.textContent = `Saving ${filename}...`;
   
-    const preparedLayers = buildPreparedPsdLayerEntries();
-    const exportDocument = buildPsdDepthExportDocument(renderState.psdColorDocument, preparedLayers);
+    const preparedLayers = buildPreparedLayerEntries();
+    const exportDocument = renderState.psdColorDocument
+      ? buildPsdDepthExportDocument(renderState.psdColorDocument, preparedLayers)
+      : buildRasterDepthExportDocument(preparedLayers);
     const buffer = agPsd.writePsd(exportDocument, { generateThumbnail: true });
     const saveResult = await saveArrayBufferToData(buffer, filename);
   
     statusEl.textContent = `Saved ${saveResult.filename}`;
+    return saveResult;
+  }
+
+  function buildRasterDepthExportDocument(preparedLayers) {
+    const width = renderState.imageWidth || preparedLayers[0]?.width || 1;
+    const height = renderState.imageHeight || preparedLayers[0]?.height || 1;
+    const children = preparedLayers.map((layer, index) => ({
+      name: layer.name || `Layer ${index + 1}`,
+      left: layer.left || 0,
+      top: layer.top || 0,
+      canvas: createRasterExportDepthCanvas(layer),
+      hidden: !getLayerVisible(renderState, index),
+    }));
+
+    const compositeCanvas = document.createElement("canvas");
+    compositeCanvas.width = width;
+    compositeCanvas.height = height;
+    const compositeContext = compositeCanvas.getContext("2d", { willReadFrequently: true });
+    compositeContext.clearRect(0, 0, width, height);
+    for (let i = children.length - 1; i >= 0; i -= 1) {
+      const layer = children[i];
+      if (!layer.hidden && layer.canvas) {
+        compositeContext.drawImage(layer.canvas, layer.left || 0, layer.top || 0);
+      }
+    }
+
+    return {
+      width,
+      height,
+      canvas: compositeCanvas,
+      children,
+    };
+  }
+
+  function createRasterExportDepthCanvas(layer) {
+    const canvas = document.createElement("canvas");
+    canvas.width = layer.width;
+    canvas.height = layer.height;
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    const output = context.createImageData(canvas.width, canvas.height);
+    const depthPixels = layer.depthPixels || layer.baseDepthPixels || new Uint8Array(layer.width * layer.height);
+    const mask = layer.renderDepthMask || layer.maskPixels || layer.surfaceMaskPixels;
+    for (let i = 0; i < depthPixels.length; i += 1) {
+      const depth = mask && !mask[i] ? 0 : (depthPixels[i] || 0);
+      const rgbaIndex = i * 4;
+      output.data[rgbaIndex] = depth;
+      output.data[rgbaIndex + 1] = depth;
+      output.data[rgbaIndex + 2] = depth;
+      output.data[rgbaIndex + 3] = 255;
+    }
+    context.putImageData(output, 0, 0);
+    return canvas;
   }
   
   function buildPsdDepthExportDocument(psdDocument, preparedLayers) {
@@ -59,7 +115,7 @@ export function createPsdExport(deps) {
         left: sourceLayer.left || 0,
         top: sourceLayer.top || 0,
         canvas,
-        hidden: preparedInfo ? !renderState.psdLayerVisibility[preparedInfo.visibilityIndex] : false,
+        hidden: preparedInfo ? !getLayerVisible(renderState, preparedInfo.visibilityIndex) : false,
       });
     }
   

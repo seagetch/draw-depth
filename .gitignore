@@ -5,3 +5,4 @@ node_modules/
 server-*.out
 server-*.err
 tmp-playwright-*.png
+workspace/

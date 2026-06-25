@@ -69,22 +69,23 @@ export function updatePsdDebugPanel(elements, renderState) {
     psdDebugPanelEl,
     null,
     "psdThinSurfaceImage",
-    "PSD thin alpha surface mask",
+    "Layer thin alpha surface mask",
   );
   const psdColorAlphaImageEl = ensureDebugImage(
     psdDebugPanelEl,
     null,
     "psdColorAlphaImage",
-    "PSD color layer alpha map",
+    "Layer color alpha map",
   );
   const psdDepthAlphaImageEl = ensureDebugImage(
     psdDebugPanelEl,
     null,
     "psdDepthAlphaImage",
-    "PSD depth alpha leak map",
+    "Layer depth alpha leak map",
   );
 
-  const hasLayerDebug = renderState.sourceMode === "psd" && renderState.psdDebugLayerIndex >= 0;
+  const layerEntries = renderState.layerEntries || [];
+  const hasLayerDebug = layerEntries.length > 0 && renderState.psdDebugLayerIndex >= 0;
   const hasPuppetDebug = !!(renderState.puppetDebugBodyMaskUrl || renderState.puppetDebugSkeletonUrl);
 
   if (!hasLayerDebug && !hasPuppetDebug) {
@@ -99,7 +100,7 @@ export function updatePsdDebugPanel(elements, renderState) {
     return;
   }
 
-  const layer = hasLayerDebug ? renderState.psdLayerEntries[renderState.psdDebugLayerIndex] : null;
+  const layer = hasLayerDebug ? layerEntries[renderState.psdDebugLayerIndex] : null;
   if (layer && layer.debugPreviewUrl) {
     setDebugImageSource(psdDebugImageEl, layer.debugPreviewUrl);
     setDebugImageSource(psdDepthImageEl, layer.currentDepthPreviewUrl || layer.depthPreviewUrl || "");
@@ -121,7 +122,7 @@ export function updatePsdDebugPanel(elements, renderState) {
 
   const titleParts = [];
   if (layer && layer.debugPreviewUrl) {
-    titleParts.push(`PSD debug: ${layer.name || `Layer ${renderState.psdDebugLayerIndex + 1}`} | removed ${layer.removedDepthPixels || 0}px`);
+    titleParts.push(`Layer debug: ${layer.name || `Layer ${renderState.psdDebugLayerIndex + 1}`} | removed ${layer.removedDepthPixels || 0}px`);
     if (layer.thinSurfacePixels) {
       titleParts.push(`thin alpha surface excluded ${layer.thinSurfacePixels}px`);
     }

@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node scripts/serve.js",
     "dev": "node scripts/serve.js",
+    "depth-api": "node scripts/depth-draw-cli.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {

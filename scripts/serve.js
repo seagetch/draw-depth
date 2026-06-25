@@ -25,6 +25,10 @@ const mimeTypes = new Map([
 
 const imageExtensions = new Set([".jpg", ".jpeg", ".png", ".webp"]);
 const psdExtension = ".psd";
+let nextCommandId = 1;
+const pendingCommands = [];
+const commandResults = new Map();
+const waitingClients = [];
 
 function send(response, statusCode, body, contentType = "text/plain; charset=utf-8") {
   response.writeHead(statusCode, {
@@ -44,6 +48,54 @@ function readRequestBody(request) {
     request.on("data", (chunk) => chunks.push(chunk));
     request.on("error", reject);
     request.on("end", () => resolve(Buffer.concat(chunks)));
+  });
+}
+
+function readJsonBody(request) {
+  return readRequestBody(request).then((body) => {
+    if (!body.length) {
+      return {};
+    }
+    return JSON.parse(body.toString("utf8"));
+  });
+}
+
+function enqueueAppCommand(action, args) {
+  const id = String(nextCommandId++);
+  const command = {
+    id,
+    action,
+    args: args || {},
+    createdAt: Date.now(),
+  };
+  pendingCommands.push(command);
+  flushWaitingClients();
+  return command;
+}
+
+function flushWaitingClients() {
+  while (pendingCommands.length && waitingClients.length) {
+    const response = waitingClients.shift();
+    sendJson(response, 200, pendingCommands.shift());
+  }
+}
+
+function waitForCommandResult(commandId, timeoutMs = 60000) {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    const timer = setInterval(() => {
+      if (commandResults.has(commandId)) {
+        const result = commandResults.get(commandId);
+        commandResults.delete(commandId);
+        clearInterval(timer);
+        resolve(result);
+        return;
+      }
+      if (Date.now() - startedAt > timeoutMs) {
+        clearInterval(timer);
+        reject(new Error("Timed out waiting for browser app to process command. Open the app page in a browser."));
+      }
+    }, 50);
   });
 }
 
@@ -244,6 +296,72 @@ const server = http.createServer((request, response) => {
     } catch (error) {
       sendJson(response, 500, { error: error.message });
     }
+    return;
+  }
+
+  if (requestUrl.pathname === "/api/app-api") {
+    if (request.method !== "POST") {
+      sendJson(response, 405, { error: "Method not allowed" });
+      return;
+    }
+    readJsonBody(request)
+      .then(async (body) => {
+        const command = enqueueAppCommand(body.action, body.args);
+        const result = await waitForCommandResult(command.id, Number(body.timeoutMs) || 60000);
+        sendJson(response, result.ok ? 200 : 500, result.ok ? {
+          ok: true,
+          result: result.result,
+        } : {
+          ok: false,
+          error: result.error || "Command failed.",
+        });
+      })
+      .catch((error) => {
+        sendJson(response, 500, { ok: false, error: error.message });
+      });
+    return;
+  }
+
+  if (requestUrl.pathname === "/api/app-api/next") {
+    if (request.method !== "GET") {
+      sendJson(response, 405, { error: "Method not allowed" });
+      return;
+    }
+    if (pendingCommands.length) {
+      sendJson(response, 200, pendingCommands.shift());
+      return;
+    }
+    waitingClients.push(response);
+    setTimeout(() => {
+      const index = waitingClients.indexOf(response);
+      if (index >= 0) {
+        waitingClients.splice(index, 1);
+        sendJson(response, 200, { idle: true });
+      }
+    }, 25000);
+    return;
+  }
+
+  if (requestUrl.pathname === "/api/app-api/result") {
+    if (request.method !== "POST") {
+      sendJson(response, 405, { error: "Method not allowed" });
+      return;
+    }
+    readJsonBody(request)
+      .then((body) => {
+        if (!body.id) {
+          throw new Error("Missing command id.");
+        }
+        commandResults.set(String(body.id), {
+          ok: !!body.ok,
+          result: body.result,
+          error: body.error,
+        });
+        sendJson(response, 200, { ok: true });
+      })
+      .catch((error) => {
+        sendJson(response, 500, { ok: false, error: error.message });
+      });
     return;
   }
 

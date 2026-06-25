@@ -10,9 +10,11 @@ function setInputValue(input, value, digits = 2) {
   input.value = Number.isFinite(value) ? value.toFixed(digits) : "0.00";
 }
 
-export function createPuppetPanel({ elements, puppetRuntime }) {
+export function createPuppetPanel({ elements, renderState, puppetRuntime }) {
   const {
     puppetPanelEl,
+    puppetEnabledEl,
+    puppetCollapseButtonEl,
     puppetBoneSelectEl,
     puppetResetBoneButtonEl,
     puppetTargetXEl,
@@ -57,11 +59,25 @@ export function createPuppetPanel({ elements, puppetRuntime }) {
 
   function sync() {
     ensureBoneOptions();
+    const hasRig = !!puppetRuntime.getDebugApi().getRig();
     const selectedBoneId = puppetRuntime.getSelectedBoneId();
     const boneState = selectedBoneId ? puppetRuntime.getBoneState(selectedBoneId) : null;
+    const controlsDisabled = !renderState.puppetEnabled || !boneState;
     syncing = true;
-    puppetPanelEl.style.display = boneState ? "" : "none";
+    puppetPanelEl.style.display = hasRig ? "" : "none";
+    puppetPanelEl.classList.toggle("is-collapsed", !!renderState.puppetPanelCollapsed);
+    if (puppetEnabledEl) {
+      puppetEnabledEl.checked = !!renderState.puppetEnabled;
+    }
+    if (puppetCollapseButtonEl) {
+      puppetCollapseButtonEl.textContent = renderState.puppetPanelCollapsed ? "+" : "-";
+      puppetCollapseButtonEl.title = renderState.puppetPanelCollapsed
+        ? "Expand puppet panel"
+        : "Collapse puppet panel";
+      puppetCollapseButtonEl.setAttribute("aria-expanded", renderState.puppetPanelCollapsed ? "false" : "true");
+    }
     puppetBoneSelectEl.value = selectedBoneId || "";
+    puppetBoneSelectEl.disabled = !renderState.puppetEnabled || !hasRig;
     if (boneState) {
       setInputValue(puppetTargetXEl, boneState.worldTail.x, 3);
       setInputValue(puppetTargetYEl, boneState.worldTail.y, 3);
@@ -73,12 +89,12 @@ export function createPuppetPanel({ elements, puppetRuntime }) {
       const rotationDisabled = !!boneState.lockRotation;
       const translationDisabled = !!boneState.lockTranslation;
       [puppetRotXEl, puppetRotYEl, puppetRotZEl].forEach((input) => {
-        input.disabled = rotationDisabled;
+        input.disabled = controlsDisabled || rotationDisabled;
       });
       [puppetTargetXEl, puppetTargetYEl, puppetTargetZEl].forEach((input) => {
-        input.disabled = translationDisabled;
+        input.disabled = controlsDisabled || translationDisabled;
       });
-      puppetResetBoneButtonEl.disabled = false;
+      puppetResetBoneButtonEl.disabled = controlsDisabled;
     } else {
       [puppetRotXEl, puppetRotYEl, puppetRotZEl, puppetTargetXEl, puppetTargetYEl, puppetTargetZEl].forEach((input) => {
         input.disabled = true;
@@ -122,6 +138,14 @@ export function createPuppetPanel({ elements, puppetRuntime }) {
     });
   }
 
+  puppetCollapseButtonEl?.addEventListener("click", () => {
+    renderState.puppetPanelCollapsed = !renderState.puppetPanelCollapsed;
+    sync();
+  });
+  puppetEnabledEl?.addEventListener("change", () => {
+    puppetRuntime.setEnabled(puppetEnabledEl.checked);
+    sync();
+  });
   puppetBoneSelectEl.addEventListener("change", () => {
     if (!puppetBoneSelectEl.value) {
       return;

@@ -8,6 +8,7 @@ function ensureOption(select, value, label) {
 export function createMeshEditPanel({ elements, renderState, meshEditRuntime }) {
   const {
     meshEditPanelEl,
+    meshEditCollapseButtonEl,
     meshEditEnabledEl,
     meshEditAddModeEl,
     meshEditTargetEl,
@@ -22,8 +23,11 @@ export function createMeshEditPanel({ elements, renderState, meshEditRuntime }) 
     const previous = renderState.meshEditTargetKey || "raster:base";
     meshEditTargetEl.replaceChildren();
     ensureOption(meshEditTargetEl, "raster:base", "Raster mesh");
-    const layers = renderState.psdLayerEntries || [];
+    const layers = renderState.layerEntries || [];
     for (let i = 0; i < layers.length; i += 1) {
+      if (renderState.colorComposite?.format !== "psd" && layers.length === 1) {
+        continue;
+      }
       ensureOption(meshEditTargetEl, `psd:${i}`, `PSD: ${layers[i].name || `Layer ${i + 1}`}`);
     }
     let hasPrevious = false;
@@ -41,6 +45,14 @@ export function createMeshEditPanel({ elements, renderState, meshEditRuntime }) 
   function sync() {
     syncTargetOptions();
     meshEditPanelEl.style.display = "";
+    meshEditPanelEl.classList.toggle("is-collapsed", !!renderState.meshEditPanelCollapsed);
+    if (meshEditCollapseButtonEl) {
+      meshEditCollapseButtonEl.textContent = renderState.meshEditPanelCollapsed ? "+" : "-";
+      meshEditCollapseButtonEl.title = renderState.meshEditPanelCollapsed
+        ? "Expand mesh edit panel"
+        : "Collapse mesh edit panel";
+      meshEditCollapseButtonEl.setAttribute("aria-expanded", renderState.meshEditPanelCollapsed ? "false" : "true");
+    }
     meshEditEnabledEl.checked = !!renderState.meshEditEnabled;
     meshEditAddModeEl.checked = !!renderState.meshEditAddMode;
     meshEditTargetEl.value = renderState.meshEditTargetKey || "raster:base";
@@ -48,12 +60,19 @@ export function createMeshEditPanel({ elements, renderState, meshEditRuntime }) 
     const radius = selectedHandle?.radius ?? Number(meshEditRadiusEl.value);
     meshEditRadiusEl.value = String(radius);
     meshEditRadiusValueEl.textContent = Number(radius).toFixed(2);
-    meshEditRadiusEl.disabled = !selectedHandle;
-    meshEditUndoButtonEl.disabled = renderState.meshEditHistoryIndex <= 0;
-    meshEditRedoButtonEl.disabled = renderState.meshEditHistoryIndex >= renderState.meshEditHistory.length - 1;
-    meshEditResetButtonEl.disabled = !(renderState.meshEditHandlesByTarget?.[renderState.meshEditTargetKey]?.length);
+    const enabled = !!renderState.meshEditEnabled;
+    meshEditAddModeEl.disabled = !enabled;
+    meshEditTargetEl.disabled = !enabled;
+    meshEditRadiusEl.disabled = !enabled || !selectedHandle;
+    meshEditUndoButtonEl.disabled = !enabled || renderState.meshEditHistoryIndex <= 0;
+    meshEditRedoButtonEl.disabled = !enabled || renderState.meshEditHistoryIndex >= renderState.meshEditHistory.length - 1;
+    meshEditResetButtonEl.disabled = !enabled || !(renderState.meshEditHandlesByTarget?.[renderState.meshEditTargetKey]?.length);
   }
 
+  meshEditCollapseButtonEl?.addEventListener("click", () => {
+    renderState.meshEditPanelCollapsed = !renderState.meshEditPanelCollapsed;
+    sync();
+  });
   meshEditEnabledEl.addEventListener("change", () => {
     meshEditRuntime.setEnabled(meshEditEnabledEl.checked);
   });

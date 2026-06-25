@@ -15,6 +15,12 @@ import {
 } from "./rigState.js?v=20260411_2";
 import { createBinaryMaskPreviewUrl } from "./debugPreview.js";
 import { createHumanoidRigData } from "./rigTemplate.js?v=20260411_2";
+import {
+  getLayerPuppetBindingOverride,
+  getLayerPuppetFitEnabled,
+  setLayerPuppetBindingOverride,
+  setLayerPuppetFitEnabled,
+} from "../composite/schema.js";
 
 function buildMeshSignature(layerMeshEntries, puppetSwapLeftRightMapping) {
   return layerMeshEntries
@@ -26,10 +32,10 @@ function buildMeshSignature(layerMeshEntries, puppetSwapLeftRightMapping) {
     + `::swap=${puppetSwapLeftRightMapping ? "1" : "0"}`;
 }
 
-function buildRigSignature(psdLayerEntries, puppetLayerFitEnabled, puppetLayerBindingOverrides, imageWidth, imageHeight) {
-  return `${imageWidth}x${imageHeight}::${(psdLayerEntries || []).map((layer, index) => {
-    const enabled = puppetLayerFitEnabled?.[index] ?? true;
-    const override = puppetLayerBindingOverrides?.[index]?.primaryBoneId || "";
+function buildRigSignature(layerEntries, imageWidth, imageHeight) {
+  return `${imageWidth}x${imageHeight}::${(layerEntries || []).map((layer, index) => {
+    const enabled = layer?.puppetFitEnabled ?? true;
+    const override = layer?.puppetBindingOverride?.primaryBoneId || "";
     return `${layer.name || index}:${layer.left},${layer.top},${layer.width},${layer.height}:${enabled ? "1" : "0"}:${override}`;
   }).join("|")}`;
 }
@@ -176,27 +182,29 @@ export function createPuppetRuntime({
   }
 
   function createRigDataForSwap(layerMeshEntries, swapLeftRight) {
+    const layerEntries = renderState.layerEntries || [];
     return createHumanoidRigData({
       layerMeshEntries,
-      psdLayerEntries: renderState.psdLayerEntries,
-      puppetLayerFitEnabled: renderState.puppetLayerFitEnabled,
-      puppetLayerBindingOverrides: renderState.puppetLayerBindingOverrides,
+      layerEntries,
+      puppetLayerFitEnabled: layerEntries.map((_, index) => getLayerPuppetFitEnabled(renderState, index)),
+      puppetLayerBindingOverrides: layerEntries.map((_, index) => getLayerPuppetBindingOverride(renderState, index)),
       puppetSwapLeftRightMapping: swapLeftRight,
       imageWidth: renderState.imageWidth,
       imageHeight: renderState.imageHeight,
     });
   }
 
-  function rebuildBindings(layerMeshEntries = renderState.psdLayerMeshes, options = {}) {
+  function rebuildBindings(layerMeshEntries = renderState.layerMeshes, options = {}) {
     const { preservePolicy = false } = options;
     if (!renderState.puppetRig) {
       return;
     }
     renderState.puppetBindingsByLayer = [];
-    const nextLayerBindings = new Array(renderState.psdLayerEntries.length).fill(null);
+    const layerEntries = renderState.layerEntries || [];
+    const nextLayerBindings = new Array(layerEntries.length).fill(null);
     for (let i = 0; i < layerMeshEntries.length; i += 1) {
       const entry = layerMeshEntries[i];
-      const layer = renderState.psdLayerEntries[entry.layerIndex];
+      const layer = layerEntries[entry.layerIndex];
       const previousBinding = renderState.puppetLayerBindings?.[entry.layerIndex];
       const layerBinding = preservePolicy && previousBinding
         ? {
@@ -211,7 +219,7 @@ export function createPuppetRuntime({
         : {
           ...applyLayerBindingOverride(
             createLayerBindingPolicy(layer, { swapLeftRight: renderState.puppetSwapLeftRightMapping }),
-            renderState.puppetLayerBindingOverrides?.[entry.layerIndex] ?? null,
+            getLayerPuppetBindingOverride(renderState, entry.layerIndex),
           ),
           layerIndex: entry.layerIndex,
         };
@@ -228,9 +236,7 @@ export function createPuppetRuntime({
 
   function ensureRig(layerMeshEntries) {
     const rigSignature = buildRigSignature(
-      renderState.psdLayerEntries,
-      renderState.puppetLayerFitEnabled,
-      renderState.puppetLayerBindingOverrides,
+      renderState.layerEntries || [],
       renderState.imageWidth,
       renderState.imageHeight,
     );
@@ -280,7 +286,7 @@ export function createPuppetRuntime({
     return renderState.puppetRig;
   }
 
-  function sync(layerMeshEntries = renderState.psdLayerMeshes) {
+  function sync(layerMeshEntries = renderState.layerMeshes) {
     if (!renderState.puppetEnabled) {
       for (let i = 0; i < layerMeshEntries.length; i += 1) {
         restoreRestGeometry(layerMeshEntries[i].mesh.geometry);
@@ -514,10 +520,11 @@ export function createPuppetRuntime({
   }
 
   function setLayerFitEnabled(layerIndex, enabled) {
-    if (layerIndex < 0 || layerIndex >= renderState.psdLayerEntries.length) {
+    const layerEntries = renderState.layerEntries || [];
+    if (layerIndex < 0 || layerIndex >= layerEntries.length) {
       return false;
     }
-    renderState.puppetLayerFitEnabled[layerIndex] = !!enabled;
+    setLayerPuppetFitEnabled(renderState, layerIndex, !!enabled);
     renderState.puppetRigSignature = "";
     renderState.puppetMeshSignature = "";
     sync();
@@ -533,13 +540,14 @@ export function createPuppetRuntime({
   }
 
   function setLayerBindingPrimary(layerIndex, primaryBoneId) {
-    if (layerIndex < 0 || layerIndex >= renderState.psdLayerEntries.length) {
+    const layerEntries = renderState.layerEntries || [];
+    if (layerIndex < 0 || layerIndex >= layerEntries.length) {
       return false;
     }
     if (primaryBoneId && !PUPPET_BONE_IDS.includes(primaryBoneId)) {
       return false;
     }
-    renderState.puppetLayerBindingOverrides[layerIndex] = primaryBoneId ? { primaryBoneId } : null;
+    setLayerPuppetBindingOverride(renderState, layerIndex, primaryBoneId ? { primaryBoneId } : null);
     renderState.puppetRigSignature = "";
     renderState.puppetMeshSignature = "";
     sync();
@@ -555,7 +563,7 @@ export function createPuppetRuntime({
     }
     const updated = moveBoneRestTailTarget(THREE, renderState.puppetRig, boneId, target);
     if (updated) {
-      rebuildBindings(renderState.psdLayerMeshes, { preservePolicy: true });
+      rebuildBindings(renderState.layerMeshes, { preservePolicy: true });
       renderState.puppetSelectedBoneId = boneId;
       sync();
     }
@@ -662,7 +670,7 @@ export function createPuppetRuntime({
     }
     if (draggingRestEdit) {
       if (moveBoneRestTailTarget(THREE, renderState.puppetRig, draggingBoneId, dragPoint.clone())) {
-        rebuildBindings(renderState.psdLayerMeshes, { preservePolicy: true });
+        rebuildBindings(renderState.layerMeshes, { preservePolicy: true });
         sync();
       }
       return;
