@@ -387,6 +387,7 @@ export function createSceneBuilder(deps) {
       const effectiveMaskPixels = layer.surfaceMaskPixels || layer.maskPixels;
       const depthScale = getLayerDepthScale(renderState, layerIndex);
       const depthOffset = getLayerDepthOffset(renderState, layerIndex);
+      const shouldClampStacking = !layer.hasDirectDepth;
       let effectiveDepthPixels = shouldRebuildLayer
         ? new Uint8Array(baseDepthPixels.length)
         : preparedLayers[layerIndex]?.depthPixels;
@@ -439,7 +440,7 @@ export function createSceneBuilder(deps) {
           );
           let sortDepth = invertDepthEl.checked ? 255 - scaledDepth : scaledDepth;
           const upperLimit = upperDepthLimit[globalIndex];
-          if (upperLimit <= 255) {
+          if (shouldClampStacking && upperLimit <= 255) {
             const limitedDepth = Math.max(1, upperLimit - 1);
             sortDepth = Math.min(sortDepth, limitedDepth);
           }

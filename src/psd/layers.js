@@ -14,7 +14,7 @@ import {
   buildLayerLookup,
   takeMatchedLayer,
 } from "../composite/layerMatch.js";
-import { runCompositeWorker } from "../workers/compositeWorkerClient.js?v=20260626_4";
+import { runCompositeWorker } from "../workers/compositeWorkerClient.js?v=20260627_1";
 
 export function createPsdLayers(deps) {
   const {

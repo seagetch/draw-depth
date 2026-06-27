@@ -62,9 +62,6 @@ export function takeMatchedLayer(lookup, colorLayer, fallbackIndex) {
   for (const entries of lookup.values()) {
     for (let i = 0; i < entries.length; i += 1) {
       const entry = entries[i];
-      if (colorName || normalizeLayerName(entry.layer.name || "")) {
-        continue;
-      }
       const overlap = estimateLayerRectOverlap(colorLayer, entry.layer);
       if (overlap <= 0) {
         continue;

@@ -5,7 +5,7 @@ import { attachPreparedLayerEntries } from "../composite/prepareLayers.js";
 import {
   buildCompositionDebugStatsInWorker,
   composeWithPreviousStateInWorker,
-} from "../workers/compositeWorkerClient.js?v=20260626_4";
+} from "../workers/compositeWorkerClient.js?v=20260627_1";
 
 export function createPsdLoader(deps) {
   const {
@@ -55,7 +55,7 @@ export function createPsdLoader(deps) {
     };
 
   async function ensureDefaultPsdPairLoaded(options = {}) {
-    if ((renderState.layerEntries || []).length) {
+    if (renderState.colorComposite?.format === "psd" && (renderState.layerEntries || []).length) {
       return;
     }
   
@@ -87,11 +87,18 @@ export function createPsdLoader(deps) {
   }
   
   async function loadPsdPair(colorBuffer, options = {}) {
-    const previousLayers = renderState.layerEntries || [];
+    const canReusePreviousPsdState = renderState.colorComposite?.format === "psd";
+    const previousLayers = canReusePreviousPsdState ? (renderState.layerEntries || []) : [];
     const previousDebugLayerName = renderState.psdDebugLayerIndex >= 0
       ? previousLayers[renderState.psdDebugLayerIndex]?.name
       : null;
-    const previousGlobalDepthScale = renderState.composedSource?.globalDepthScale ?? 1;
+    const previousGlobalDepthScale = canReusePreviousPsdState
+      ? (renderState.composedSource?.globalDepthScale ?? 1)
+      : 1;
+    if (!canReusePreviousPsdState) {
+      renderState.displayMeshOverrides = {};
+      renderState.preparedLayerEntries = [];
+    }
     disposePsdLayerTexturesExternal();
     const colorPsd = agPsd.readPsd(colorBuffer);
     const scaledPsd = prepareScaledPsdDocument(colorPsd, 1280);

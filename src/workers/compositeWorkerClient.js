@@ -5,7 +5,7 @@ const CANCELLED_ERROR_MESSAGE = "Worker task cancelled.";
 
 function getWorker() {
   if (!worker) {
-    worker = new Worker(new URL("./compositeWorker.js?v=20260626_5", import.meta.url), { type: "module" });
+    worker = new Worker(new URL("./compositeWorker.js?v=20260627_1", import.meta.url), { type: "module" });
     worker.addEventListener("message", (event) => {
       const { id, ok, result, error } = event.data || {};
       const pending = pendingTasks.get(id);
@@ -144,8 +144,35 @@ function copyPlainFields(source) {
     if (isRuntimeField(key) || ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
       continue;
     }
-    if (value == null || typeof value !== "object" || Array.isArray(value)) {
-      out[key] = Array.isArray(value) ? value.slice() : value;
+    const clonedValue = clonePlainValue(value);
+    if (clonedValue !== undefined) {
+      out[key] = clonedValue;
+    }
+  }
+  return out;
+}
+
+function clonePlainValue(value) {
+  if (value == null || typeof value !== "object") {
+    return value;
+  }
+  if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
+    return undefined;
+  }
+  if (Array.isArray(value)) {
+    return value.map(clonePlainValue).filter((item) => item !== undefined);
+  }
+  if (Object.getPrototypeOf(value) !== Object.prototype) {
+    return undefined;
+  }
+  const out = {};
+  for (const [key, childValue] of Object.entries(value)) {
+    if (isRuntimeField(key)) {
+      continue;
+    }
+    const clonedValue = clonePlainValue(childValue);
+    if (clonedValue !== undefined) {
+      out[key] = clonedValue;
     }
   }
   return out;

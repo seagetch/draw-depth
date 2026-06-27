@@ -6,7 +6,7 @@ import {
   composeWithPreviousStateInWorker,
   runCompositeWorker,
   startAlphaDepthGapFillTask,
-} from "../workers/compositeWorkerClient.js?v=20260626_5";
+} from "../workers/compositeWorkerClient.js?v=20260627_1";
 
 function isPsdFilename(name) {
   return /\.psd$/i.test(name || "");
@@ -96,12 +96,15 @@ export function createAppActions(deps) {
   } = shaders;
 
   function composeWithPreviousBackendState(colorComposite, depthComposite, options = {}) {
+    const hasOption = (key) => Object.prototype.hasOwnProperty.call(options, key);
     return composeWithPreviousStateInWorker({
       colorComposite,
       depthComposite,
-      previousLayers: renderState.layerEntries || [],
-      previousGlobalDepthScale: renderState.composedSource?.globalDepthScale ?? 1,
-      depthOverrides: renderState.depthOverrides,
+      previousLayers: hasOption("previousLayers") ? options.previousLayers : (renderState.layerEntries || []),
+      previousGlobalDepthScale: hasOption("previousGlobalDepthScale")
+        ? options.previousGlobalDepthScale
+        : (renderState.composedSource?.globalDepthScale ?? 1),
+      depthOverrides: hasOption("depthOverrides") ? options.depthOverrides : renderState.depthOverrides,
       onProgress: (progress) => {
         options.onProgress?.(progress);
         if (progress?.total != null) {
@@ -115,7 +118,7 @@ export function createAppActions(deps) {
     disposeMeshDepthTexture();
     clearSceneVisuals();
 
-    if ((renderState.layerEntries || []).length) {
+    if (hasLayeredCompositeSource()) {
       syncRasterLayerEntryFromActiveDepth();
       buildLayerMeshes();
       rebuildSegmentList();
@@ -211,7 +214,7 @@ export function createAppActions(deps) {
   }
 
   function updateLayerDepthAdjustment(layerIndex) {
-    if (!(renderState.layerEntries || []).length || typeof updateAdjustedLayerMeshes !== "function") {
+    if (!hasLayeredCompositeSource() || typeof updateAdjustedLayerMeshes !== "function") {
       buildMesh();
       return;
     }
@@ -260,9 +263,13 @@ export function createAppActions(deps) {
     if (!renderState.composedSource || !(renderState.layerEntries || []).length) {
       throw new Error("Composite layers are not available.");
     }
-    const result = await alphaDepthGapFillInWorker(renderState.composedSource, {
+    const submittedSource = renderState.composedSource;
+    const result = await alphaDepthGapFillInWorker(submittedSource, {
       onProgress: options.onProgress,
     });
+    if (renderState.composedSource !== submittedSource) {
+      throw new Error("Composite source changed before alpha-depth gap fill completed.");
+    }
     for (const output of result.outputLayers || []) {
       const layer = renderState.composedSource.layers?.[output.index];
       if (!layer) {
@@ -291,10 +298,14 @@ export function createAppActions(deps) {
     if (!renderState.composedSource || !(renderState.layerEntries || []).length) {
       throw new Error("Composite layers are not available.");
     }
-    const task = startAlphaDepthGapFillTask(renderState.composedSource, {
+    const submittedSource = renderState.composedSource;
+    const task = startAlphaDepthGapFillTask(submittedSource, {
       onProgress: options.onProgress,
     });
     const promise = task.promise.then((result) => {
+      if (renderState.composedSource !== submittedSource) {
+        throw new Error("Composite source changed before alpha-depth gap fill completed.");
+      }
       for (const output of result.outputLayers || []) {
         const layer = renderState.composedSource.layers?.[output.index];
         if (!layer) {
@@ -351,7 +362,7 @@ export function createAppActions(deps) {
 
   async function rebuildLayerDepthModeResources(options = {}) {
     const layers = renderState.layerEntries || [];
-    if (!layers.length || (renderState.colorComposite?.format !== "psd" && layers.length <= 1)) {
+    if (!hasLayeredCompositeSource()) {
       return false;
     }
 
@@ -532,16 +543,23 @@ export function createAppActions(deps) {
       format: "raster",
       name: model.label || "Color",
     });
+    resetCompositeRuntimeState();
     renderState.depthOverrides = {};
     renderState.depthComposite = createFlatDepthCompositeFromPixels(imageWidth, imageHeight, depthPixels, {
       format: "raster",
       name: model.label || "Depth",
     });
-    renderState.composedSource = await composeWithPreviousBackendState(renderState.colorComposite, renderState.depthComposite);
+    renderState.composedSource = await composeWithPreviousBackendState(renderState.colorComposite, renderState.depthComposite, {
+      previousLayers: [],
+      previousGlobalDepthScale: 1,
+      depthOverrides: null,
+    });
     renderState.layerEntries = renderState.composedSource.layers;
     renderState.psdColorDocument = null;
     renderState.psdDepthDocument = null;
     renderState.psdStableDepthPixels = null;
+    renderState.psdStableDepthWidth = 0;
+    renderState.psdStableDepthHeight = 0;
     renderState.psdDebugLayerIndex = -1;
     renderState.colorTexture = colorTexture;
     renderState.sourceDepthTexture = depthTexture;
@@ -578,7 +596,11 @@ export function createAppActions(deps) {
     if (isPsdFilename(colorName)) {
       const colorBuffer = dataUrlToArrayBuffer(colorDataUrl);
       renderState.pendingPsdColorBuffer = colorBuffer;
+      resetCompositeRuntimeState();
       renderState.depthOverrides = {};
+      renderState.psdStableDepthPixels = null;
+      renderState.psdStableDepthWidth = 0;
+      renderState.psdStableDepthHeight = 0;
       const depthOptions = isPsdFilename(depthName)
         ? { depthPsdUrl: depthDataUrl, stableDepthUrl: null }
         : { depthPsdUrl: null, stableDepthUrl: depthDataUrl };
@@ -642,6 +664,11 @@ export function createAppActions(deps) {
       try {
         const buffer = await file.arrayBuffer();
         renderState.pendingPsdColorBuffer = buffer;
+        resetCompositeRuntimeState();
+        renderState.depthOverrides = {};
+        renderState.psdStableDepthPixels = null;
+        renderState.psdStableDepthWidth = 0;
+        renderState.psdStableDepthHeight = 0;
         await loadPsdPair(renderState.pendingPsdColorBuffer, {
           onProgress: options.onProgress,
         });
@@ -694,9 +721,14 @@ export function createAppActions(deps) {
           format: "raster",
           name: file.name || "Color",
         });
+        resetCompositeRuntimeState();
+        renderState.depthOverrides = {};
         if (renderState.depthComposite) {
           renderState.composedSource = await composeWithPreviousBackendState(renderState.colorComposite, renderState.depthComposite, {
             onProgress: options.onProgress,
+            previousLayers: [],
+            previousGlobalDepthScale: 1,
+            depthOverrides: null,
           });
           renderState.layerEntries = renderState.composedSource.layers;
         }
@@ -739,9 +771,14 @@ export function createAppActions(deps) {
           format: "raster",
           name: file.name || "Depth",
         });
+        resetCompositeRuntimeState();
+        renderState.depthOverrides = {};
         if (renderState.colorComposite) {
           renderState.composedSource = await composeWithPreviousBackendState(renderState.colorComposite, renderState.depthComposite, {
             onProgress: options.onProgress,
+            previousLayers: [],
+            previousGlobalDepthScale: 1,
+            depthOverrides: null,
           });
           renderState.layerEntries = renderState.composedSource.layers;
         }
@@ -813,6 +850,22 @@ export function createAppActions(deps) {
     renderState.baseDepthTexture = generated.texture;
     renderState.baseDepthPixels = generated.pixels;
     rebuildRepairedBaseDepth();
+  }
+
+  function hasLayeredCompositeSource() {
+    return renderState.colorComposite?.format === "psd" || (renderState.layerEntries || []).length > 1;
+  }
+
+  function resetCompositeRuntimeState() {
+    renderState.layerEntries = [];
+    renderState.preparedLayerEntries = [];
+    renderState.composedSource = null;
+    renderState.displayMeshOverrides = {};
+    renderState.puppetRig = null;
+    renderState.puppetRigSignature = "";
+    renderState.puppetMeshSignature = "";
+    renderState.puppetLayerBindings = [];
+    renderState.puppetBindingsByLayer = [];
   }
 
   return {

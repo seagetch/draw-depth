@@ -1,5 +1,5 @@
 import { getGlobalDepthScale, setGlobalDepthScale } from "../composite/schema.js";
-import { cancelCompositeWorkerTasks } from "../workers/compositeWorkerClient.js?v=20260626_4";
+import { cancelCompositeWorkerTasks } from "../workers/compositeWorkerClient.js?v=20260627_1";
 
 export function wireControls(deps) {
   const {
@@ -63,6 +63,21 @@ export function wireControls(deps) {
     return /cancel/i.test(error?.message || "");
   }
 
+  function updateLayerMeshUniform(uniformName, value) {
+    let needsRebuild = false;
+    for (let i = 0; i < renderState.layerMeshes.length; i += 1) {
+      const entry = renderState.layerMeshes[i];
+      const uniforms = entry.mesh?.material?.uniforms;
+      if (uniforms?.[uniformName]) {
+        uniforms[uniformName].value = value;
+      } else {
+        needsRebuild = true;
+      }
+      entry.mesh.position.z = 0;
+    }
+    return needsRebuild;
+  }
+
   depthScaleValueEl.textContent = Number(depthScaleEl.value).toFixed(2);
   if (globalDepthScaleEl && globalDepthScaleValueEl) {
     setGlobalDepthScale(renderState, Number(globalDepthScaleEl.value));
@@ -91,10 +106,13 @@ export function wireControls(deps) {
     if (renderState.edgePointMaterial) {
       renderState.edgePointMaterial.uniforms.uDepthScale.value = Number(depthScaleEl.value);
     }
-    for (let i = 0; i < renderState.layerMeshes.length; i += 1) {
-      renderState.layerMeshes[i].mesh.material.uniforms.uDepthScale.value =
-        Number(depthScaleEl.value);
-      renderState.layerMeshes[i].mesh.position.z = 0;
+    if (updateLayerMeshUniform("uDepthScale", Number(depthScaleEl.value))) {
+      runUiProgress("Rebuilding mesh", () => {
+        buildMesh();
+      }).catch((error) => {
+        console.error(error);
+        statusEl.textContent = `Failed: ${error.message}`;
+      });
     }
   });
 
@@ -170,8 +188,13 @@ export function wireControls(deps) {
     if (renderState.edgePointMaterial) {
       renderState.edgePointMaterial.uniforms.uInvertDepth.value = invertDepthEl.checked ? 1 : 0;
     }
-    for (let i = 0; i < renderState.layerMeshes.length; i += 1) {
-      renderState.layerMeshes[i].mesh.material.uniforms.uInvertDepth.value = invertDepthEl.checked ? 1 : 0;
+    if (updateLayerMeshUniform("uInvertDepth", invertDepthEl.checked ? 1 : 0)) {
+      runUiProgress("Rebuilding mesh", () => {
+        buildMesh();
+      }).catch((error) => {
+        console.error(error);
+        statusEl.textContent = `Failed: ${error.message}`;
+      });
     }
   });
 

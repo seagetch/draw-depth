@@ -647,6 +647,9 @@ export function createApp() {
       defaults.defaultPsdStableDepthUrl = stableDepthUrl;
       renderState.currentModel = model;
       renderState.depthOverrides = {};
+      renderState.displayMeshOverrides = {};
+      renderState.preparedLayerEntries = [];
+      renderState.composedSource = null;
       renderState.currentPsdColorUrl = model.colorUrl || "";
       renderState.currentPsdDepthUrl = model.depthPsdUrl || model.stableDepthUrl || "";
       renderState.currentPsdExportName = createPsdExportFileName(model);

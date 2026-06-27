@@ -282,7 +282,8 @@ function resolveRequestPath(urlString) {
   const pathname = decodeURIComponent(requestUrl.pathname);
   const relativePath = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
   const resolvedPath = path.resolve(rootDir, relativePath);
-  if (!resolvedPath.startsWith(rootDir)) {
+  const rootRelativePath = path.relative(rootDir, resolvedPath);
+  if (rootRelativePath.startsWith("..") || path.isAbsolute(rootRelativePath)) {
     return null;
   }
   return resolvedPath;

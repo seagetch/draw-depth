@@ -21,6 +21,7 @@
   },
   "homepage": "https://github.com/seagetch/draw-depth#readme",
   "dependencies": {
-    "ag-psd": "^30.1.0"
+    "ag-psd": "^30.1.0",
+    "three": "0.128.0"
   }
 }

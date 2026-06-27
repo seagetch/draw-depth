@@ -533,6 +533,7 @@ export function createPuppetRuntime({
 
   function setSwapLeftRightMapping(enabled) {
     renderState.puppetSwapLeftRightMapping = !!enabled;
+    renderState.puppetRigSignature = "";
     renderState.puppetMeshSignature = "";
     onSwapChanged?.(renderState.puppetSwapLeftRightMapping);
     sync();

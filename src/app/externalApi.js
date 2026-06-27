@@ -144,7 +144,7 @@ function createColorImageDataUrl(layer, sourceLayer = null) {
   throw new Error("Layer color image is not available.");
 }
 
-function serializeMeshEntry(entry) {
+function serializeMeshEntry(entry, options = {}) {
   if (!entry?.mesh?.geometry) {
     return null;
   }
@@ -158,11 +158,52 @@ function serializeMeshEntry(entry) {
     targetKey: entry.targetKey,
     geometryId: geometry.id,
     vertexCount: position?.count || 0,
-    positions: position ? Array.from(position.array) : [],
+    positions: position ? Array.from(createExportPositionArray(entry, options)) : [],
     uvs: uv ? Array.from(uv.array) : [],
     normals: normal ? Array.from(normal.array) : [],
     indices: index ? Array.from(index.array) : [],
   };
+}
+
+function createExportPositionArray(entry, options = {}) {
+  const geometry = entry.mesh.geometry;
+  const position = geometry.getAttribute("position");
+  const source = position?.array;
+  if (!source) {
+    return [];
+  }
+  const positions = new Float32Array(source);
+  const uniforms = entry.mesh.material?.uniforms;
+  const layer = options.layer || null;
+  const uDepthScale = uniforms?.uDepthScale?.value;
+  const shouldApplyShaderDepth = (
+    layer?.depthPixels &&
+    layer.width &&
+    layer.height &&
+    uniforms?.uDepthTexture &&
+    Number(uDepthScale) !== 0
+  );
+  if (!shouldApplyShaderDepth) {
+    return positions;
+  }
+  const uv = geometry.getAttribute("uv");
+  if (!uv?.array) {
+    throw new Error(`Layer mesh ${entry.layerIndex} is unbaked and has no UVs for depth export.`);
+  }
+  const invertDepth = Number(uniforms?.uInvertDepth?.value || 0) >= 0.5;
+  const useDepthMask = uniforms?.uUseDepthMask == null || Number(uniforms.uUseDepthMask.value) >= 0.5;
+  for (let vertexIndex = 0; vertexIndex < position.count; vertexIndex += 1) {
+    const u = Math.max(0, Math.min(0.999999, Number(uv.array[vertexIndex * 2]) || 0));
+    const v = Math.max(0, Math.min(0.999999, Number(uv.array[vertexIndex * 2 + 1]) || 0));
+    const x = Math.max(0, Math.min(layer.width - 1, Math.floor(u * layer.width)));
+    const y = Math.max(0, Math.min(layer.height - 1, Math.floor((1 - v) * layer.height)));
+    const pixelIndex = y * layer.width + x;
+    const rawDepth = (layer.depthPixels[pixelIndex] || 0) / 255;
+    const depthMask = useDepthMask && rawDepth <= 0 ? 0 : 1;
+    const depthValue = invertDepth ? 1 - rawDepth : rawDepth;
+    positions[vertexIndex * 3 + 2] += depthValue * Number(uDepthScale) * depthMask;
+  }
+  return positions;
 }
 
 function loadImageFromDataUrl(dataUrl) {
@@ -558,11 +599,13 @@ export function createExternalApi(deps) {
       if (!entry) {
         throw new Error(`Layer mesh ${index} is not available or visible.`);
       }
-      return serializeMeshEntry(entry);
+      return serializeMeshEntry(entry, { layer: renderState.layerEntries?.[index] });
     },
 
     getAllLayerMeshes() {
-      return renderState.layerMeshes.map(serializeMeshEntry).filter(Boolean);
+      return renderState.layerMeshes
+        .map((entry) => serializeMeshEntry(entry, { layer: renderState.layerEntries?.[entry.layerIndex] }))
+        .filter(Boolean);
     },
 
     captureView(options = {}) {
