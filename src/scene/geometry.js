@@ -254,7 +254,11 @@ export function createGeometryHelpers(deps) {
         positions[p++] = sx;
         positions[p++] = sy;
         positions[p++] = options.bakeDepth
-          ? getDepthDisplacementFromByte(layer.depthPixels[localIndex], options.depthScale, options.invertDepth)
+          ? getDepthDisplacementFromByte(
+            layer.depthPixels[localIndex],
+            options.depthScale,
+            options.invertDepth,
+          )
           : 0;
         uvs[t++] = u;
         uvs[t++] = 1 - v;
@@ -299,12 +303,13 @@ export function createGeometryHelpers(deps) {
         indices.push(b, c, d);
       }
     }
-  
+
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
     geometry.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
+    geometry.userData.restPositions = positions.slice();
     return geometry;
   }
   
@@ -347,7 +352,7 @@ export function createGeometryHelpers(deps) {
   
     return true;
   }
-  
+
   function isSegmentContourPixel(segmentMap, width, height, index) {
     const segmentIndex = segmentMap[index];
     if (segmentIndex < 0) {

@@ -4,6 +4,9 @@
   "description": "Minimal 3D viewer for `data/Midori-color.jpg` and `data/Midori-depth.jpg`.",
   "main": "viewer.js",
   "scripts": {
+    "start": "node scripts/serve.js",
+    "dev": "node scripts/serve.js",
+    "depth-api": "node scripts/depth-draw-cli.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
@@ -18,6 +21,7 @@
   },
   "homepage": "https://github.com/seagetch/draw-depth#readme",
   "dependencies": {
-    "ag-psd": "^30.1.0"
+    "ag-psd": "^30.1.0",
+    "three": "0.128.0"
   }
 }

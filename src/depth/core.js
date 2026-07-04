@@ -764,12 +764,13 @@ export function createDepthCore(THREE) {
     return kernel;
   }
   
-  function createDepthTextureResources(width, height, pixels) {
+  function createDepthTextureResources(width, height, pixels, options = {}) {
     const canvas = document.createElement("canvas");
     canvas.width = width;
     canvas.height = height;
     const context = canvas.getContext("2d", { willReadFrequently: true });
     const imageData = context.createImageData(width, height);
+    const alphaValue = options.opaqueAlpha ? 255 : null;
   
     for (let pixelIndex = 0; pixelIndex < pixels.length; pixelIndex += 1) {
       const rounded = pixels[pixelIndex];
@@ -777,7 +778,7 @@ export function createDepthCore(THREE) {
       imageData.data[imageIndex] = rounded;
       imageData.data[imageIndex + 1] = rounded;
       imageData.data[imageIndex + 2] = rounded;
-      imageData.data[imageIndex + 3] = rounded > 0 ? 255 : 0;
+      imageData.data[imageIndex + 3] = alphaValue ?? (rounded > 0 ? 255 : 0);
     }
   
     context.putImageData(imageData, 0, 0);
@@ -788,6 +789,62 @@ export function createDepthCore(THREE) {
     texture.needsUpdate = true;
   
     return { texture, pixels };
+  }
+
+  function computeDepthCentroid(pixels, maskPixels = null) {
+    let sum = 0;
+    let count = 0;
+
+    for (let i = 0; i < pixels.length; i += 1) {
+      const depth = pixels[i];
+      if (depth <= 0 || (maskPixels && !maskPixels[i])) {
+        continue;
+      }
+      sum += depth;
+      count += 1;
+    }
+
+    return {
+      value: count > 0 ? sum / count : 0,
+      count,
+    };
+  }
+
+  function scaleDepthValueAroundCenter(depth, scale, center) {
+    if (depth <= 0) {
+      return 0;
+    }
+    if (!Number.isFinite(scale) || scale === 1 || center <= 0) {
+      return clamp(Math.round(depth), 1, 255);
+    }
+    return clamp(Math.round(center + (depth - center) * scale), 1, 255);
+  }
+
+  function applyGlobalDepthScale(pixels, scale, maskPixels = null) {
+    const centroid = computeDepthCentroid(pixels, maskPixels);
+    const output = new Uint8Array(pixels.length);
+
+    if (centroid.count === 0) {
+      return {
+        pixels: output,
+        centroid: 0,
+        count: 0,
+      };
+    }
+
+    for (let i = 0; i < pixels.length; i += 1) {
+      if (maskPixels && !maskPixels[i]) {
+        output[i] = 0;
+        continue;
+      }
+      output[i] = scaleDepthValueAroundCenter(pixels[i], scale, centroid.value);
+    }
+
+    return {
+      pixels: output,
+      centroid: centroid.value,
+      count: centroid.count,
+    };
   }
   
   function createBinaryMaskTexture(width, height, maskPixels) {
@@ -819,7 +876,8 @@ export function createDepthCore(THREE) {
       return;
     }
   
-    if (renderState.sourceMode !== "psd" || renderState.psdDebugLayerIndex < 0) {
+    const layerEntries = renderState.layerEntries || [];
+    if (!layerEntries.length || renderState.psdDebugLayerIndex < 0) {
       psdDebugPanelEl.classList.remove("is-visible");
       psdDebugImageEl.removeAttribute("src");
       if (psdDepthImageEl) {
@@ -828,7 +886,7 @@ export function createDepthCore(THREE) {
       return;
     }
   
-    const layer = renderState.psdLayerEntries[renderState.psdDebugLayerIndex];
+    const layer = layerEntries[renderState.psdDebugLayerIndex];
     if (!layer || !layer.debugPreviewUrl) {
       psdDebugPanelEl.classList.remove("is-visible");
       psdDebugImageEl.removeAttribute("src");
@@ -1219,5 +1277,8 @@ export function createDepthCore(THREE) {
     createMaskedGridDepthPixels,
     createDepthTextureResources,
     createBinaryMaskTexture,
+    computeDepthCentroid,
+    scaleDepthValueAroundCenter,
+    applyGlobalDepthScale,
   };
 }

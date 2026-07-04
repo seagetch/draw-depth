@@ -14,8 +14,8 @@ function withCacheBust(url, cacheBustToken) {
 }
 
 export function createDefaultAssetUrls(cacheBustToken = `${Date.now()}`) {
-  const colorUrl = "./data/Midori-color.jpg";
-  const depthUrl = "./data/Midori-depth.jpg";
+  const colorUrl = "./data/Kurone-20260616.png";
+  const depthUrl = "./data/Kurone-20260616-depth.png";
   const segmentUrl = "./data/Midori-segment.jpg";
   const psdColorUrl = "./data/Midori-full.psd";
   const psdDepthPsdUrl = "./data/Midori-full-depth.psd";

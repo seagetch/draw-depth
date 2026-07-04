@@ -1,7 +1,6 @@
-export function createSceneRuntime({ renderer, scene, camera, controls }) {
+export function createSceneRuntime({ renderer, scene, camera, controls, updateViewerCameraProjection }) {
   function onResize() {
-    camera.aspect = window.innerWidth / window.innerHeight;
-    camera.updateProjectionMatrix();
+    updateViewerCameraProjection(camera, window);
     renderer.setSize(window.innerWidth, window.innerHeight);
   }
 

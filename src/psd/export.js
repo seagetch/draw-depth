@@ -1,27 +1,86 @@
+import { getLayerVisible } from "../composite/schema.js";
+
 export function createPsdExport(deps) {
   const {
     agPsd,
     renderState,
     statusEl,
-    buildPreparedPsdLayerEntries,
+    buildPreparedLayerEntries,
+    flattenPsdLayers,
+    getCanvasImageData,
   } = deps
 
-  async function saveCurrentPsdDepthAsPsd() {
-    if (renderState.sourceMode !== "psd" || !renderState.psdColorDocument) {
-      throw new Error("PSD pair mode is not active.");
+  async function saveCurrentPsdDepthAsPsd(options = {}) {
+    if (!(renderState.layerEntries || []).length) {
+      throw new Error("No layer source is active.");
     }
     if (typeof agPsd === "undefined" || typeof agPsd.writePsd !== "function") {
       throw new Error("PSD writer is not available.");
     }
   
-    statusEl.textContent = "Saving Midori-full-depth.psd...";
+    const filename = options.filename || renderState.currentPsdExportName || "depth.psd";
+    statusEl.textContent = `Saving ${filename}...`;
   
-    const preparedLayers = buildPreparedPsdLayerEntries();
-    const exportDocument = buildPsdDepthExportDocument(renderState.psdColorDocument, preparedLayers);
+    const preparedLayers = buildPreparedLayerEntries();
+    const exportDocument = renderState.psdColorDocument
+      ? buildPsdDepthExportDocument(renderState.psdColorDocument, preparedLayers)
+      : buildRasterDepthExportDocument(preparedLayers);
     const buffer = agPsd.writePsd(exportDocument, { generateThumbnail: true });
-    triggerArrayBufferDownload(buffer, "Midori-full-depth.psd");
+    const saveResult = await saveArrayBufferToData(buffer, filename);
   
-    statusEl.textContent = "Saved Midori-full-depth.psd";
+    statusEl.textContent = `Saved ${saveResult.filename}`;
+    return saveResult;
+  }
+
+  function buildRasterDepthExportDocument(preparedLayers) {
+    const width = renderState.imageWidth || preparedLayers[0]?.width || 1;
+    const height = renderState.imageHeight || preparedLayers[0]?.height || 1;
+    const children = preparedLayers.map((layer, index) => ({
+      name: layer.name || `Layer ${index + 1}`,
+      left: layer.left || 0,
+      top: layer.top || 0,
+      canvas: createRasterExportDepthCanvas(layer),
+      hidden: !getLayerVisible(renderState, index),
+    }));
+
+    const compositeCanvas = document.createElement("canvas");
+    compositeCanvas.width = width;
+    compositeCanvas.height = height;
+    const compositeContext = compositeCanvas.getContext("2d", { willReadFrequently: true });
+    compositeContext.clearRect(0, 0, width, height);
+    for (let i = children.length - 1; i >= 0; i -= 1) {
+      const layer = children[i];
+      if (!layer.hidden && layer.canvas) {
+        compositeContext.drawImage(layer.canvas, layer.left || 0, layer.top || 0);
+      }
+    }
+
+    return {
+      width,
+      height,
+      canvas: compositeCanvas,
+      children,
+    };
+  }
+
+  function createRasterExportDepthCanvas(layer) {
+    const canvas = document.createElement("canvas");
+    canvas.width = layer.width;
+    canvas.height = layer.height;
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    const output = context.createImageData(canvas.width, canvas.height);
+    const depthPixels = layer.depthPixels || layer.baseDepthPixels || new Uint8Array(layer.width * layer.height);
+    const mask = layer.renderDepthMask || layer.maskPixels || layer.surfaceMaskPixels;
+    for (let i = 0; i < depthPixels.length; i += 1) {
+      const depth = mask && !mask[i] ? 0 : (depthPixels[i] || 0);
+      const rgbaIndex = i * 4;
+      output.data[rgbaIndex] = depth;
+      output.data[rgbaIndex + 1] = depth;
+      output.data[rgbaIndex + 2] = depth;
+      output.data[rgbaIndex + 3] = 255;
+    }
+    context.putImageData(output, 0, 0);
+    return canvas;
   }
   
   function buildPsdDepthExportDocument(psdDocument, preparedLayers) {
@@ -46,15 +105,17 @@ export function createPsdExport(deps) {
     for (let i = 0; i < sourceLayers.length; i += 1) {
       const sourceLayer = sourceLayers[i];
       const preparedInfo = preparedBySourceIndex[i];
-      const canvas = createPsdExportDepthCanvas(sourceLayer, preparedInfo ? preparedInfo.layer : null);
-      const mask = createPsdExportLayerMask(sourceLayer);
+      const canvas = createPsdExportDepthCanvas(
+        sourceLayer,
+        preparedInfo ? preparedInfo.layer : null,
+        preparedInfo ? preparedInfo.visibilityIndex : -1,
+      );
       children.push({
         name: sourceLayer.name || `Layer ${i + 1}`,
         left: sourceLayer.left || 0,
         top: sourceLayer.top || 0,
         canvas,
-        mask,
-        hidden: preparedInfo ? !renderState.psdLayerVisibility[preparedInfo.visibilityIndex] : false,
+        hidden: preparedInfo ? !getLayerVisible(renderState, preparedInfo.visibilityIndex) : false,
       });
     }
   
@@ -79,12 +140,13 @@ export function createPsdExport(deps) {
     };
   }
   
-  function createPsdExportDepthCanvas(sourceLayer, preparedLayer) {
+  function createPsdExportDepthCanvas(sourceLayer, preparedLayer, layerIndex) {
     const canvas = document.createElement("canvas");
     canvas.width = sourceLayer.width;
     canvas.height = sourceLayer.height;
     const context = canvas.getContext("2d", { willReadFrequently: true });
     const output = context.createImageData(canvas.width, canvas.height);
+    const sourceImageData = sourceLayer.colorImageData || getCanvasImageData(sourceLayer.canvas);
   
     for (let y = 0; y < sourceLayer.height; y += 1) {
       const globalY = sourceLayer.top + y;
@@ -92,6 +154,7 @@ export function createPsdExport(deps) {
         const localIndex = y * sourceLayer.width + x;
         const rgbaIndex = localIndex * 4;
         let depth = 0;
+        const sourceAlpha = getSourceLayerAlpha(sourceImageData, localIndex);
         if (preparedLayer) {
           const globalX = sourceLayer.left + x;
           const preparedLocalX = globalX - preparedLayer.left;
@@ -103,7 +166,16 @@ export function createPsdExport(deps) {
             preparedLocalY < preparedLayer.height
           ) {
             const preparedIndex = preparedLocalY * preparedLayer.width + preparedLocalX;
-            depth = preparedLayer.depthPixels[preparedIndex] || 0;
+            const exportDepthPixels = preparedLayer.depthPixels || preparedLayer.baseDepthPixels || preparedLayer.directDepthPixels;
+            const sourceDepthPixels = preparedLayer.baseDepthPixels
+              || preparedLayer.depthModeSourcePixels
+              || preparedLayer.directDepthPixels
+              || exportDepthPixels;
+            const coverageMask = preparedLayer.maskPixels || preparedLayer.depthMaskPixels || preparedLayer.renderDepthMask;
+            const hasDepth = sourceAlpha > 0
+              && (!coverageMask || coverageMask[preparedIndex])
+              && ((exportDepthPixels?.[preparedIndex] || 0) > 0 || (sourceDepthPixels?.[preparedIndex] || 0) > 0);
+            depth = hasDepth ? (exportDepthPixels?.[preparedIndex] || sourceDepthPixels?.[preparedIndex] || 0) : 0;
           }
         }
   
@@ -117,46 +189,24 @@ export function createPsdExport(deps) {
     context.putImageData(output, 0, 0);
     return canvas;
   }
-  
-  function createPsdExportLayerMask(sourceLayer) {
-    const width = sourceLayer.width || 0;
-    const height = sourceLayer.height || 0;
-    if (width <= 0 || height <= 0) {
-      return undefined;
-    }
-  
-    const sourceImageData = sourceLayer.colorImageData || getCanvasImageData(sourceLayer.canvas);
-    const maskImageData = new ImageData(width, height);
-  
-    for (let i = 0, p = 0; p < width * height; i += 4, p += 1) {
-      const alpha = sourceImageData.data[i + 3];
-      maskImageData.data[i] = alpha;
-      maskImageData.data[i + 1] = alpha;
-      maskImageData.data[i + 2] = alpha;
-      maskImageData.data[i + 3] = 255;
-    }
-  
-    return {
-      top: sourceLayer.top || 0,
-      left: sourceLayer.left || 0,
-      bottom: (sourceLayer.top || 0) + height,
-      right: (sourceLayer.left || 0) + width,
-      defaultColor: 0,
-      disabled: false,
-      imageData: maskImageData,
-    };
+
+  function getSourceLayerAlpha(sourceImageData, localIndex) {
+    return sourceImageData?.data?.[localIndex * 4 + 3] || 0;
   }
   
-  function triggerArrayBufferDownload(buffer, filename) {
-    const blob = new Blob([buffer], { type: "application/octet-stream" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = filename;
-    anchor.click();
-    setTimeout(() => {
-      URL.revokeObjectURL(url);
-    }, 1000);
+  async function saveArrayBufferToData(buffer, filename) {
+    const response = await fetch(`/api/save-depth-psd?filename=${encodeURIComponent(filename)}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+      },
+      body: buffer,
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.ok) {
+      throw new Error(result.error || `Failed to save ${filename}`);
+    }
+    return result;
   }
 
   return {

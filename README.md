@@ -5,7 +5,7 @@ Minimal 3D viewer for:
 - `data/Midori-color.jpg` + `data/Midori-depth.jpg`
 - `data/Midori-color.psd` + `data/Midori-color_depth.psd`
 
-## Run
+## Setup
 
 Install dependencies once:
 
@@ -13,13 +13,29 @@ Install dependencies once:
 npm install
 ```
 
-Then start a static server in this directory:
+## Run
+
+Start the local viewer server:
 
 ```powershell
-python -m http.server 8000
+npm start
 ```
 
-Then open `http://localhost:8000/` in a browser.
+Then open:
+
+```text
+http://127.0.0.1:8000/
+```
+
+You can change the bind address and port with environment variables:
+
+```powershell
+$env:HOST = "0.0.0.0"
+$env:PORT = "8123"
+npm start
+```
+
+`npm run dev` is an alias of `npm start`.
 
 ## Notes
 
@@ -27,3 +43,4 @@ Then open `http://localhost:8000/` in a browser.
 - The fragment shader also uses `discard` for invalid depth samples
 - Higher `Mesh detail` gives a denser surface but costs more GPU time
 - `Source format = PSD pair` loads layered color/depth PSDs and renders each PSD layer as its own depth-displaced surface
+- Internally, color and depth inputs are normalized into composites before render preparation. Flat image pairs become `1:1` composites, layered PSD pairs become `N:N` composites, and layered color with one flat depth map becomes an `N:1` composite split across the color layers.

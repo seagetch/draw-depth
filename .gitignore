@@ -1,1 +1,10 @@
 node_modules/
+**/__pycache__/
+*.pyc
+*~
+server-*.out
+server-*.err
+tmp-playwright-*.png
+workspace/
+data/
+generated/

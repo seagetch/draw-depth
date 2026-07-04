@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Depth Draw Viewer</title>
+    <link rel="icon" href="data:,">
     <style>
       :root {
         color-scheme: dark;
@@ -200,6 +201,10 @@
         image-rendering: pixelated;
       }
 
+      .debug-image:not([src]) {
+        display: none;
+      }
+
       .debug-legend {
         font-size: 11px;
         color: var(--muted);
@@ -214,6 +219,16 @@
         border: 1px solid var(--line);
         border-radius: 8px;
         background: rgba(255, 255, 255, 0.04);
+        color: var(--text);
+      }
+
+      select option {
+        background: #0d1117;
+        color: var(--text);
+      }
+
+      select option:checked {
+        background: #18212b;
         color: var(--text);
       }
 
@@ -241,6 +256,131 @@
         max-height: min(34vh, 300px);
         overflow: auto;
         padding-right: 4px;
+      }
+
+      .puppet-panel {
+        display: grid;
+        gap: 8px;
+        margin: 0 0 10px;
+        padding: 10px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.03);
+      }
+
+      .mesh-edit-panel {
+        display: grid;
+        gap: 8px;
+        margin: 0 0 10px;
+        padding: 10px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.03);
+      }
+
+      .worker-progress {
+        display: none;
+        position: fixed;
+        top: 16px;
+        left: 50%;
+        z-index: 30;
+        width: min(560px, calc(100vw - 360px));
+        min-width: min(360px, calc(100vw - 32px));
+        padding: 10px 12px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        gap: 6px;
+        background: rgba(13, 17, 23, 0.88);
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.32);
+        transform: translateX(-50%);
+        backdrop-filter: blur(14px);
+      }
+
+      .worker-progress.is-visible {
+        display: grid;
+      }
+
+      .worker-progress .action-button {
+        width: auto;
+        min-width: 74px;
+        padding: 5px 10px;
+      }
+
+      .worker-progress-bar {
+        width: 100%;
+        height: 8px;
+        border-radius: 4px;
+        overflow: hidden;
+        background: rgba(255, 255, 255, 0.12);
+      }
+
+      .worker-progress-fill {
+        width: 0%;
+        height: 100%;
+        background: #67d9a3;
+        transition: width 120ms linear;
+      }
+
+      .settings-panel-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      .settings-panel-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .settings-panel-actions label {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      .settings-panel-collapse {
+        width: 24px;
+        height: 24px;
+        padding: 0;
+      }
+
+      .settings-panel-body {
+        display: grid;
+        gap: 8px;
+      }
+
+      .is-collapsed > .settings-panel-body {
+        display: none;
+      }
+
+      .puppet-panel-title {
+        font-size: 12px;
+        color: var(--text);
+      }
+
+      .puppet-row {
+        display: grid;
+        grid-template-columns: 64px 1fr auto;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .puppet-grid3 {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 6px;
+      }
+
+      .puppet-grid3 input[type="number"] {
+        min-width: 0;
+      }
+
+      .puppet-slider {
+        width: 100%;
       }
 
       .segment-item {
@@ -322,9 +462,27 @@
   </head>
   <body>
     <div id="app"></div>
+    <div class="worker-progress" id="workerProgressPanel">
+      <div class="control-row">
+        <span id="workerProgressLabel">Working...</span>
+        <button class="action-button" id="workerCancelButton" type="button">Cancel</button>
+      </div>
+      <div class="worker-progress-bar" aria-hidden="true">
+        <div class="worker-progress-fill" id="workerProgressFill"></div>
+      </div>
+    </div>
     <section id="hud">
       <h1>Depth Draw Viewer</h1>
-      <p>`depth == 0` is treated as invalid and is not rendered.</p>
+      <p>Raster depth maps use zero depth as invalid. PSD depth layers use their grayscale values directly.</p>
+
+      <div class="control">
+        <div class="control-row">
+          <label for="modelSelect">Model</label>
+        </div>
+        <select id="modelSelect">
+          <option value="">Loading models...</option>
+        </select>
+      </div>
 
       <div class="control">
         <div class="control-row">
@@ -332,6 +490,14 @@
           <output class="value" id="depthScaleValue">0.22</output>
         </div>
         <input id="depthScale" type="range" min="0.02" max="0.75" step="0.01" value="0.22">
+      </div>
+
+      <div class="control">
+        <div class="control-row">
+          <label for="globalDepthScale">Global depth scale</label>
+          <output class="value" id="globalDepthScaleValue">1.0</output>
+        </div>
+        <input id="globalDepthScale" type="range" min="0.1" max="3.0" step="0.1" value="1.0">
       </div>
 
       <div class="control">
@@ -370,13 +536,22 @@
         <input id="contourRepair" type="checkbox">
       </div>
 
+      <div class="control">
+        <button class="action-button" id="alphaDepthGapFillButton" type="button">Fill alpha-depth gaps</button>
+      </div>
+
       <div class="control-row">
         <label for="surfaceSmooth">Smooth wavy surface</label>
         <input id="surfaceSmooth" type="checkbox">
       </div>
 
+      <div class="control-row">
+        <label for="generatedMeshDebugEnabled">Show generated vertices</label>
+        <input id="generatedMeshDebugEnabled" type="checkbox">
+      </div>
+
       <div class="control">
-        <button class="action-button" id="saveDepthPsdButton" type="button">Save Midori-full-depth.psd</button>
+        <button class="action-button" id="saveDepthPsdButton" type="button">Save depth PSD</button>
       </div>
 
       <div class="control">
@@ -466,27 +641,113 @@
       <div id="status">Loading...</div>
     </section>
     <section id="segmentHud">
-      <div class="segment-header">
+        <div class="segment-header">
         <div class="segment-title">Segments</div>
-        <div class="segment-hint">Shift+click: invert target vs others</div>
+          <button class="action-button" id="puppetSwapSidesButton" type="button" style="width:auto;padding:4px 8px;font-size:11px;">Swap L/R Off</button>
+          <div class="segment-hint">Add handle mode or Alt+click: add mesh handle | Drag: move handle | Shift+drag: depth only | Del: delete handle</div>
+        </div>
+      <div class="mesh-edit-panel" id="meshEditPanel">
+        <div class="settings-panel-header">
+          <div class="puppet-panel-title">Mesh Edit</div>
+          <div class="settings-panel-actions">
+            <label for="meshEditEnabled">On <input id="meshEditEnabled" type="checkbox"></label>
+            <button class="segment-button settings-panel-collapse" id="meshEditCollapseButton" type="button" title="Collapse mesh edit panel">-</button>
+          </div>
+        </div>
+        <div class="settings-panel-body" id="meshEditPanelBody">
+          <div class="control-row">
+            <label for="meshEditAddMode">Add handle mode</label>
+            <input id="meshEditAddMode" type="checkbox">
+          </div>
+          <div class="control">
+            <div class="control-row">
+              <label for="meshEditTarget">Target</label>
+            </div>
+            <select id="meshEditTarget"></select>
+          </div>
+          <div class="control">
+            <div class="control-row">
+              <label for="meshEditRadius">Handle radius</label>
+              <output class="value" id="meshEditRadiusValue">0.18</output>
+            </div>
+            <input id="meshEditRadius" type="range" min="0.03" max="0.80" step="0.01" value="0.18">
+          </div>
+          <div class="control-row" style="gap:6px;">
+            <button class="action-button" id="meshEditUndoButton" type="button">Undo</button>
+            <button class="action-button" id="meshEditRedoButton" type="button">Redo</button>
+            <button class="action-button" id="meshEditResetButton" type="button">Reset target</button>
+          </div>
+        </div>
+      </div>
+      <div class="puppet-panel" id="puppetPanel" style="display:none;">
+        <div class="settings-panel-header">
+          <div class="puppet-panel-title">Puppet Controls</div>
+          <div class="settings-panel-actions">
+            <label for="puppetEnabled">On <input id="puppetEnabled" type="checkbox"></label>
+            <button class="segment-button" id="puppetResetBoneButton" type="button" title="Reset selected bone">R</button>
+            <button class="segment-button settings-panel-collapse" id="puppetCollapseButton" type="button" title="Collapse puppet panel">-</button>
+          </div>
+        </div>
+        <div class="settings-panel-body" id="puppetPanelBody">
+          <div class="control">
+            <div class="control-row">
+              <label for="puppetBoneSelect">Bone</label>
+            </div>
+            <select id="puppetBoneSelect"></select>
+          </div>
+          <div class="control">
+            <div class="control-row">
+              <label>Target</label>
+            </div>
+            <div class="puppet-grid3">
+              <input id="puppetTargetX" type="number" step="0.01">
+              <input id="puppetTargetY" type="number" step="0.01">
+              <input id="puppetTargetZ" type="number" step="0.01">
+            </div>
+          </div>
+          <div class="control">
+            <div class="puppet-row">
+              <label for="puppetRotX">Rot X</label>
+              <input class="puppet-slider" id="puppetRotX" type="range" min="-180" max="180" step="1" value="0">
+              <output class="value" id="puppetRotXValue">0deg</output>
+            </div>
+            <div class="puppet-row">
+              <label for="puppetRotY">Rot Y</label>
+              <input class="puppet-slider" id="puppetRotY" type="range" min="-180" max="180" step="1" value="0">
+              <output class="value" id="puppetRotYValue">0deg</output>
+            </div>
+            <div class="puppet-row">
+              <label for="puppetRotZ">Rot Z</label>
+              <input class="puppet-slider" id="puppetRotZ" type="range" min="-180" max="180" step="1" value="0">
+              <output class="value" id="puppetRotZValue">0deg</output>
+            </div>
+          </div>
+        </div>
       </div>
       <div class="segment-list" id="segmentList"></div>
       <div class="debug-panel" id="psdDebugPanel">
         <div class="debug-title" id="psdDebugTitle">PSD debug</div>
         <img class="debug-image" id="psdDebugImage" alt="PSD debug map">
         <img class="debug-image" id="psdDepthImage" alt="PSD depth grayscale">
+        <img class="debug-image" id="puppetBodyMaskImage" alt="Puppet body mask">
+        <img class="debug-image" id="puppetSkeletonImage" alt="Puppet skeletonized mask">
         <div class="debug-legend" id="psdDebugLegend">
           Blue: kept seed<br>
           Orange: pixel-pruned<br>
           Magenta: component-pruned<br>
           Cyan: cluster-pruned<br>
           Yellow: contour zeroed<br>
-          Dark: no seed / empty
+          Thin surface: magenta excluded / green kept<br>
+          Color alpha: orange A1-254 / green A255<br>
+          Depth alpha leak: red<br>
+          Dark: no seed / empty<br>
+          Puppet body mask: yellow<br>
+          Puppet skeleton: cyan
         </div>
       </div>
     </section>
-    <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
-    <script src="https://unpkg.com/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="./node_modules/three/build/three.min.js"></script>
+    <script src="./node_modules/three/examples/js/controls/OrbitControls.js"></script>
     <script>
       (function () {
         const bust = Date.now().toString();
