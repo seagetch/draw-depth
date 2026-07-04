@@ -320,8 +320,7 @@ export function createPsdLoader(deps) {
     target.__depthDrawAlphaMask = alphaMask;
 
     for (let i = 0, p = 0; i < sourceImageData.data.length; i += 4, p += 1) {
-      const alpha = sourceImageData.data[i + 3];
-      const depth = Math.round((sourceImageData.data[i] * alpha) / 255);
+      const depth = sourceImageData.data[i];
       sourceImageData.data[i] = depth;
       sourceImageData.data[i + 1] = depth;
       sourceImageData.data[i + 2] = depth;

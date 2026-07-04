@@ -166,13 +166,16 @@ export function createPsdExport(deps) {
             preparedLocalY < preparedLayer.height
           ) {
             const preparedIndex = preparedLocalY * preparedLayer.width + preparedLocalX;
-            const exportDepthPixels = preparedLayer.depthPixels || preparedLayer.baseDepthPixels;
-            const hasDepth = preparedLayer.renderDepthMask
-              ? preparedLayer.renderDepthMask[preparedIndex]
-              : (exportDepthPixels[preparedIndex] > 0 ? 1 : 0);
-            depth = hasDepth
-              ? Math.round(((exportDepthPixels[preparedIndex] || 0) * sourceAlpha) / 255)
-              : 0;
+            const exportDepthPixels = preparedLayer.depthPixels || preparedLayer.baseDepthPixels || preparedLayer.directDepthPixels;
+            const sourceDepthPixels = preparedLayer.baseDepthPixels
+              || preparedLayer.depthModeSourcePixels
+              || preparedLayer.directDepthPixels
+              || exportDepthPixels;
+            const coverageMask = preparedLayer.maskPixels || preparedLayer.depthMaskPixels || preparedLayer.renderDepthMask;
+            const hasDepth = sourceAlpha > 0
+              && (!coverageMask || coverageMask[preparedIndex])
+              && ((exportDepthPixels?.[preparedIndex] || 0) > 0 || (sourceDepthPixels?.[preparedIndex] || 0) > 0);
+            depth = hasDepth ? (exportDepthPixels?.[preparedIndex] || sourceDepthPixels?.[preparedIndex] || 0) : 0;
           }
         }
   
